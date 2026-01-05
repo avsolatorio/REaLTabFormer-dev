@@ -1,6 +1,7 @@
 """This module contains the implementation for the sampling
 algorithms used for tabular and relational data generation.
 """
+
 import logging
 import warnings
 from typing import Any, Dict, List, Optional, Union
@@ -88,7 +89,9 @@ class REaLSampler:
         # https://huggingface.co/docs/transformers/v4.24.0/en/main_classes/text_generation#transformers.generation_utils.GenerationMixin.generate.prefix_allowed_tokens_fn
         raise NotImplementedError
 
-    def _convert_to_table(self, synth_df: pd.DataFrame) -> pd.DataFrame:
+    def _convert_to_table(
+        self, synth_df: pd.DataFrame, output_cols: Optional[List[str]] = None
+    ) -> pd.DataFrame:
         # Perform additional standardization
         # processing.
         synth_df = synth_df[sorted(synth_df.columns)]
@@ -99,6 +102,9 @@ class REaLSampler:
             synth_df = synth_df[self.columns]
         except KeyError:
             pass
+
+        if output_cols is not None:
+            synth_df = synth_df[output_cols].copy()
 
         for col in self.datetime_columns:
             # Attempt to transform datetime data
@@ -122,6 +128,9 @@ class REaLSampler:
         valid_idx = set(range(len(synth_df)))
         _synth_df = []
         for c, d in self.column_dtypes.items():
+            if (output_cols is not None) and (c not in output_cols):
+                continue
+
             try:
                 series = synth_df[c]
 
@@ -195,6 +204,10 @@ class REaLSampler:
         with_missing_cols = [
             col for col, missing in self.column_has_missing.items() if missing
         ]
+
+        if output_cols is not None:
+            with_missing_cols = [c for c in with_missing_cols if c in output_cols]
+
         if with_missing_cols:
             synth_df[with_missing_cols] = (
                 synth_df[with_missing_cols]
@@ -372,6 +385,7 @@ class REaLSampler:
         vocab: Dict,
         relate_ids: Optional[List[Any]] = None,
         validator: Optional[ObservationValidator] = None,
+        output_cols: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         assert isinstance(sample_outputs, np.ndarray)
 
@@ -457,8 +471,12 @@ class REaLSampler:
         synth_df = self._recover_data_values(synth_sample)
         logging.info(f"Generation stats: {synth_df.shape[0]}")
 
-        synth_df = self._convert_to_table(synth_df)
-        synth_df = self._validate_missing(synth_df)
+        synth_df = self._convert_to_table(synth_df, output_cols=output_cols)
+
+        if output_cols is not None:
+            synth_df = synth_df[output_cols].copy()
+
+        synth_df = self._validate_missing(synth_df, output_cols=output_cols)
         synth_df = self._validate_data(synth_df, validator)
 
         if synth_df.empty:
@@ -475,10 +493,16 @@ class REaLSampler:
 
         return synth_df
 
-    def _validate_missing(self, synth_df: pd.DataFrame) -> pd.DataFrame:
+    def _validate_missing(
+        self, synth_df: pd.DataFrame, output_cols: Optional[List[str]] = None
+    ) -> pd.DataFrame:
         # Drop the rows where any one of the columns that should not have
         # a missing value have at least one.
-        return synth_df.dropna(subset=self.drop_na_cols)
+        drop_na_cols = self.drop_na_cols
+        if output_cols is not None:
+            drop_na_cols = [c for c in drop_na_cols if c in output_cols]
+
+        return synth_df.dropna(subset=drop_na_cols)
 
 
 class TabularSampler(REaLSampler):
@@ -680,10 +704,80 @@ class TabularSampler(REaLSampler):
         synth_df = synth_df.reset_index(drop="index")
 
         print(
-            f"Generated {self.invalid_gen_samples} invalid samples out of total {self.total_gen_samples} samples generated. Sampling efficiency is: {100 * (1 -  self.invalid_gen_samples / self.total_gen_samples):.4f}%"
+            f"Generated {self.invalid_gen_samples} invalid samples out of total {self.total_gen_samples} samples generated. Sampling efficiency is: {100 * (1 - self.invalid_gen_samples / self.total_gen_samples):.4f}%"
         )
 
         return synth_df
+
+    def sample_tabular_with_seed(
+        self,
+        seed_input: Union[pd.DataFrame, Dict[str, Any]],
+        gen_batch: Optional[int] = 1,
+        device: Optional[str] = "cuda",
+        constrain_tokens_gen: Optional[bool] = True,
+        validator: Optional[ObservationValidator] = None,
+        continuous_empty_limit: int = 10,
+        suppress_tokens: Optional[List[int]] = None,
+        forced_decoder_ids: Optional[List[List[int]]] = None,
+        output_cols: Optional[List[str]] = None,
+        **generate_kwargs,
+    ) -> pd.DataFrame:
+        device = torch.device(device)
+
+        if self.model.device != device:
+            self.model = self.model.to(device)
+
+        self.model.eval()
+
+        generated = self._process_seed_input(seed_input=seed_input)
+
+        generated = generated.to(self.model.device)
+
+        expected_nout = len(generated) * gen_batch
+
+        while continuous_empty_limit > 0:
+            # https://huggingface.co/docs/transformers/internal/generation_utils
+            sample_outputs = self._generate(
+                device=device,
+                as_numpy=True,
+                constrain_tokens_gen=constrain_tokens_gen,
+                inputs=generated,
+                do_sample=True,
+                max_length=self.max_length,
+                num_return_sequences=gen_batch,
+                bos_token_id=self.vocab["token2id"][SpecialTokens.BOS],
+                pad_token_id=self.vocab["token2id"][SpecialTokens.PAD],
+                eos_token_id=self.vocab["token2id"][SpecialTokens.EOS],
+                suppress_tokens=suppress_tokens,
+                forced_decoder_ids=forced_decoder_ids,
+                **generate_kwargs,
+            )
+
+            try:
+                synth_sample = self._processes_sample(
+                    sample_outputs=sample_outputs,
+                    vocab=self.vocab,
+                    validator=validator,
+                    output_cols=output_cols,
+                )
+
+                if synth_sample.shape[0] != expected_nout:
+                    raise SampleEmptyError(
+                        f"The model has generated {synth_sample.shape[0]} samples out of {expected_nout} expected samples!"
+                    )
+
+                return synth_sample
+
+            except SampleEmptyError as exc:
+                logging.warning(
+                    f"This batch returned an empty valid synth_sample! Retries left: {continuous_empty_limit}"
+                )
+                continuous_empty_limit -= 1
+
+                if continuous_empty_limit <= 0:
+                    raise SampleEmptyLimitError(
+                        f"The model has generated empty sample batches for {continuous_empty_limit} consecutive rounds!"
+                    ) from exc
 
     def predict(
         self,

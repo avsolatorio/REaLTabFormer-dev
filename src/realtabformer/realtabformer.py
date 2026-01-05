@@ -399,7 +399,7 @@ class REaLTabFormer:
         orig_samples_rounds: int = 5,
         load_from_best_mean_sensitivity: bool = False,
         target_col: str = None,
-        save_full_every_epoch: int = 5,
+        save_full_every_epoch: int = 0,
         gen_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
@@ -538,10 +538,15 @@ class REaLTabFormer:
         sensitivity_orig_frac_multiple: int = 4,
         orig_samples_rounds: int = 5,
         load_from_best_mean_sensitivity: bool = False,
-        save_full_every_epoch: int = 5,
+        save_full_every_epoch: int = 0,
         gen_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Trainer:
         assert gen_rounds >= 1
+
+        if save_full_every_epoch > 0:
+            assert save_full_every_epoch % n_critic == 0, (
+                f"save_full_every_epoch ({save_full_every_epoch}) must be a multiple of n_critic ({n_critic})"
+            )
 
         _frac = min(frac, frac_max_data / len(df))
         if frac != _frac:
@@ -810,13 +815,16 @@ class REaLTabFormer:
                 )
 
             if (
-                p_epoch
+                num_train_epochs
                 and save_full_every_epoch
-                and p_epoch % save_full_every_epoch == 0
+                and num_train_epochs % save_full_every_epoch == 0
             ):
-                full_save_dir = self.full_save_dir / f"epoch_{p_epoch:03d}"
+                full_save_dir = self.full_save_dir / f"epoch_{num_train_epochs:03d}"
                 full_save_dir.mkdir(parents=True, exist_ok=True)
-                self.save(path=full_save_dir)
+                self.save(
+                    path=full_save_dir,
+                    experiment_id=f"full_model_epoch_{num_train_epochs:03d}",
+                )
 
             print(
                 f"Critic round: {p_epoch + n_critic}, \
@@ -1412,7 +1420,12 @@ class REaLTabFormer:
             **generate_kwargs,
         )
 
-    def save(self, path: Union[str, Path], allow_overwrite: Optional[bool] = False):
+    def save(
+        self,
+        path: Union[str, Path],
+        allow_overwrite: Optional[bool] = False,
+        experiment_id: Optional[str] = None,
+    ):
         """Save REaLTabFormer Model
 
         Saves the model weights and a configuration file in the given directory.
@@ -1420,13 +1433,15 @@ class REaLTabFormer:
             path: Path where to save the model
         """
         self._check_model()
-        assert self.experiment_id is not None
+
+        experiment_id = experiment_id or self.experiment_id
+        assert experiment_id is not None
 
         if isinstance(path, str):
             path = Path(path)
 
         # Add experiment id to the save path
-        path = path / self.experiment_id
+        path = path / experiment_id
 
         config_file = path / ModelFileName.rtf_config_json
         model_file = path / ModelFileName.rtf_model_pt
@@ -1448,7 +1463,8 @@ class REaLTabFormer:
 
         # Save attributes
         rtf_attrs = self.__dict__.copy()
-        rtf_attrs.pop("model")
+        rtf_attrs.pop("model", None)
+        rtf_attrs.pop("dataset", None)
 
         # We don't need to store the `parent_config`
         # since a saved model should have the weights loaded from
@@ -1472,6 +1488,7 @@ class REaLTabFormer:
 
         rtf_attrs["checkpoints_dir"] = rtf_attrs["checkpoints_dir"].as_posix()
         rtf_attrs["samples_save_dir"] = rtf_attrs["samples_save_dir"].as_posix()
+        rtf_attrs["full_save_dir"] = rtf_attrs["full_save_dir"].as_posix()
 
         config_file.write_text(json.dumps(rtf_attrs))
 
