@@ -380,7 +380,9 @@ class REaLTabFormer:
         join_on: Optional[str] = None,
         resume_from_checkpoint: Union[bool, str] = False,
         device="cuda",
-        objective_callback: Optional[Callable[[Any, list[float]], float, bool]] = None,
+        objective_callback: Optional[
+            Callable[[Any, list[float]], tuple[float, bool]]
+        ] = None,
         num_bootstrap: int = 500,
         frac: float = 0.165,
         frac_max_data: int = 10000,
@@ -470,7 +472,6 @@ class REaLTabFormer:
                     objective_callback,
                     device=device,
                     n_critic=n_critic,
-                    n_critic_stop=n_critic_stop,
                     resume_from_checkpoint=resume_from_checkpoint,
                     save_full_every_epoch=save_full_every_epoch,
                 )
@@ -893,10 +894,9 @@ class REaLTabFormer:
     def _train_with_objective(
         self,
         df: pd.DataFrame,
-        objective_callback: Callable[[Any, list[float]], float, bool],
+        objective_callback: Callable[[Any, list[float]], tuple[float, bool]],
         device: str = "cuda",
         n_critic: int = 5,
-        n_critic_stop: int = 2,
         resume_from_checkpoint: Union[bool, str] = False,
         save_full_every_epoch: int = 0,
     ) -> Trainer:
@@ -904,11 +904,9 @@ class REaLTabFormer:
 
         Args:
             df: Pandas DataFrame containing the tabular data that will be generated during sampling.
-            objective_callback: Callable[[Any, list[float]], float, bool] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value.
+            objective_callback: Callable[[Any, list[float]], tuple[float, bool]] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value.
             device: Device where the model and the training will be run.
             n_critic: Interval between epochs to perform a discriminator assessment.
-            n_critic_stop: The number of critic rounds without improvement after which the training
-              will be stopped.
             resume_from_checkpoint: If True, resumes training from the latest checkpoint in the
               checkpoints_dir. If path, resumes the training from the given checkpoint.
             save_full_every_epoch: The number of epochs to save the full model. Only used for tabular data with objective training.
