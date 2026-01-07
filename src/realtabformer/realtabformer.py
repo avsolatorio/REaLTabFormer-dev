@@ -12,7 +12,7 @@ import time
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -380,6 +380,7 @@ class REaLTabFormer:
         join_on: Optional[str] = None,
         resume_from_checkpoint: Union[bool, str] = False,
         device="cuda",
+        objective_callback: Optional[Callable[[Any, list[float]], float, bool]] = None,
         num_bootstrap: int = 500,
         frac: float = 0.165,
         frac_max_data: int = 10000,
@@ -414,6 +415,7 @@ class REaLTabFormer:
               checkpoints_dir. If path, resumes the training from the given checkpoint.
             device: Device where the model and the training will be run.
               Use torch devices, e.g., `cpu`, `cuda`, `mps` (experimental)
+            objective_callback: If not None, the `_train_with_objective` method will be used to train the model with an objective function that will be tracked and used to stop the training. Callable[[Any, list[float]], float, bool] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value. Sensitivity training will be disabled.
             num_bootstrap: Number of Bootstrap samples
             frac: The fraction of the data used for training.
             frac_max_data: The maximum number of rows that the training data will have.
@@ -462,6 +464,16 @@ class REaLTabFormer:
             if n_critic <= 0:
                 trainer = self._fit_tabular(df, device=device)
                 trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+            elif objective_callback is not None:
+                trainer = self._train_with_objective(
+                    df,
+                    objective_callback,
+                    device=device,
+                    n_critic=n_critic,
+                    n_critic_stop=n_critic_stop,
+                    resume_from_checkpoint=resume_from_checkpoint,
+                    save_full_every_epoch=save_full_every_epoch,
+                )
             else:
                 trainer = self._train_with_sensitivity(
                     df,
@@ -875,6 +887,154 @@ class REaLTabFormer:
         self.trainer_state = json.loads(
             (loaded_model_path / "trainer_state.json").read_text()
         )
+
+        return trainer
+
+    def _train_with_objective(
+        self,
+        df: pd.DataFrame,
+        objective_callback: Callable[[Any, list[float]], float, bool],
+        device: str = "cuda",
+        n_critic: int = 5,
+        n_critic_stop: int = 2,
+        resume_from_checkpoint: Union[bool, str] = False,
+        save_full_every_epoch: int = 0,
+    ) -> Trainer:
+        """This method trains the model with an objective function that will be tracked and used to stop the training. The objective function is characterized by a target column and optionally a validation set. Without a validation set, a hold out sample is used to compute the objective function.
+
+        Args:
+            df: Pandas DataFrame containing the tabular data that will be generated during sampling.
+            objective_callback: Callable[[Any, list[float]], float, bool] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value.
+            device: Device where the model and the training will be run.
+            n_critic: Interval between epochs to perform a discriminator assessment.
+            n_critic_stop: The number of critic rounds without improvement after which the training
+              will be stopped.
+            resume_from_checkpoint: If True, resumes training from the latest checkpoint in the
+              checkpoints_dir. If path, resumes the training from the given checkpoint.
+            save_full_every_epoch: The number of epochs to save the full model. Only used for tabular data with objective training.
+        """
+
+        if save_full_every_epoch > 0:
+            assert save_full_every_epoch % n_critic == 0, (
+                f"save_full_every_epoch ({save_full_every_epoch}) must be a multiple of n_critic ({n_critic})"
+            )
+
+        trainer: Trainer = None
+
+        # # Create a hold out sample for the discriminator model
+        # hold_df = df.sample(frac=frac, random_state=self.random_state)
+        # df = df.loc[df.index.difference(hold_df.index)]
+
+        # Start training
+        logging.info("Start training...")
+
+        # Remove existing checkpoints
+        for chkp in self.checkpoints_dir.glob("checkpoint-*"):
+            shutil.rmtree(chkp, ignore_errors=True)
+
+        objective_scores = []
+        best_objective_value = np.inf
+
+        bdm_path = self.checkpoints_dir / TabularArtefact.best_disc_model
+        last_epoch_path = self.checkpoints_dir / TabularArtefact.last_epoch_model
+
+        # Remove existing artefacts in the best model dir
+        shutil.rmtree(bdm_path, ignore_errors=True)
+        bdm_path.mkdir(parents=True, exist_ok=True)
+
+        shutil.rmtree(last_epoch_path, ignore_errors=True)
+        last_epoch_path.mkdir(parents=True, exist_ok=True)
+
+        last_epoch = 0
+
+        if resume_from_checkpoint:
+            chkp_list = sorted(
+                self.checkpoints_dir.glob("checkpoint-*"), key=os.path.getmtime
+            )
+            if chkp_list:
+                # Get the most recent checkpoint based on
+                # creation time.
+                chkp = chkp_list[-1]
+                trainer_state = json.loads((chkp / "trainer_state.json").read_text())
+                last_epoch = math.ceil(trainer_state["epoch"])
+
+                trainer = self._fit_tabular(
+                    df,
+                    device=device,
+                    num_train_epochs=last_epoch,
+                    target_epochs=self.epochs,
+                )
+
+        np.random.seed(self.random_state)
+        random.seed(self.random_state)
+
+        for p_epoch in range(last_epoch, self.epochs, n_critic):
+            num_train_epochs = min(p_epoch + n_critic, self.epochs)
+            # Perform the discriminator sampling every `n_critic` epochs
+            if trainer is None:
+                trainer = self._fit_tabular(
+                    df,
+                    device=device,
+                    num_train_epochs=num_train_epochs,
+                    target_epochs=self.epochs,
+                )
+                trainer.train(resume_from_checkpoint=False)
+            else:
+                trainer = self._build_tabular_trainer(
+                    device=device,
+                    num_train_epochs=num_train_epochs,
+                    target_epochs=self.epochs,
+                )
+                trainer.train(resume_from_checkpoint=True)
+
+            objective_value, stop_training = objective_callback(self, objective_scores)
+            objective_scores.append(objective_value)
+            print(f"Objective value: {objective_value}")
+
+            if objective_value is None and not stop_training:
+                # Continue training if the model is still not
+                # able to generate stable observations.
+                continue
+
+            if objective_value < best_objective_value:
+                trainer.save_model(bdm_path.as_posix())
+                trainer.state.save_to_json((bdm_path / "trainer_state.json").as_posix())
+                best_objective_value = objective_value
+
+            if (
+                num_train_epochs
+                and save_full_every_epoch
+                and num_train_epochs % save_full_every_epoch == 0
+            ):
+                full_save_dir = self.full_save_dir / f"epoch_{num_train_epochs:03d}"
+                full_save_dir.mkdir(parents=True, exist_ok=True)
+                self.save(
+                    path=full_save_dir,
+                    experiment_id=f"full_model_epoch_{num_train_epochs:03d}",
+                )
+
+            print(
+                f"Critic round: {p_epoch + n_critic}, \
+                    best_objective_value: {best_objective_value}, \
+                    objective_value: {objective_value}"
+            )
+
+            if stop_training:
+                print("Stopping training, objective function forced stopping...")
+                break
+
+        # Save last epoch artefacts before loading the best model.
+        trainer.save_model(last_epoch_path.as_posix())
+        trainer.state.save_to_json((last_epoch_path / "trainer_state.json").as_posix())
+
+        if bdm_path.exists():
+            if (bdm_path / "pytorch_model.bin").exists() or (
+                bdm_path / "model.safetensors"
+            ).exists():
+                self.model = self.model.from_pretrained(bdm_path.as_posix())
+                self.trainer_state = json.loads(
+                    (bdm_path / "trainer_state.json").read_text()
+                )
 
         return trainer
 
