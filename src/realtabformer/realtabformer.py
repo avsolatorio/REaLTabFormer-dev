@@ -966,72 +966,80 @@ class REaLTabFormer:
         np.random.seed(self.random_state)
         random.seed(self.random_state)
 
-        for p_epoch in range(last_epoch, self.epochs, n_critic):
-            num_train_epochs = min(p_epoch + n_critic, self.epochs)
-            # Perform the discriminator sampling every `n_critic` epochs
-            if trainer is None:
-                trainer = self._fit_tabular(
-                    df,
-                    device=device,
-                    num_train_epochs=num_train_epochs,
-                    target_epochs=self.epochs,
+        try:
+            for p_epoch in range(last_epoch, self.epochs, n_critic):
+                num_train_epochs = min(p_epoch + n_critic, self.epochs)
+                # Perform the discriminator sampling every `n_critic` epochs
+                if trainer is None:
+                    trainer = self._fit_tabular(
+                        df,
+                        device=device,
+                        num_train_epochs=num_train_epochs,
+                        target_epochs=self.epochs,
+                    )
+                    trainer.train(resume_from_checkpoint=False)
+                else:
+                    trainer = self._build_tabular_trainer(
+                        device=device,
+                        num_train_epochs=num_train_epochs,
+                        target_epochs=self.epochs,
+                    )
+                    trainer.train(resume_from_checkpoint=True)
+
+                objective_value, stop_training = objective_callback(
+                    self, objective_scores, num_train_epochs
                 )
-                trainer.train(resume_from_checkpoint=False)
-            else:
-                trainer = self._build_tabular_trainer(
-                    device=device,
-                    num_train_epochs=num_train_epochs,
-                    target_epochs=self.epochs,
+                objective_scores.append(objective_value)
+                print(f"Objective value: {objective_value}")
+
+                if objective_value is None and not stop_training:
+                    # Continue training if the model is still not
+                    # able to generate stable observations.
+                    continue
+
+                if objective_value < best_objective_value:
+                    trainer.save_model(bdm_path.as_posix())
+                    trainer.state.save_to_json(
+                        (bdm_path / "trainer_state.json").as_posix()
+                    )
+                    best_objective_value = objective_value
+
+                if (
+                    num_train_epochs
+                    and save_full_every_epoch
+                    and num_train_epochs % save_full_every_epoch == 0
+                ):
+                    full_save_dir = self.get_full_save_dir(num_train_epochs)
+                    full_save_dir.mkdir(parents=True, exist_ok=True)
+                    self.save(
+                        path=full_save_dir,
+                        experiment_id=self.get_experiment_id(num_train_epochs),
+                        verbose=False,
+                    )
+
+                print(
+                    f"Critic round: {p_epoch + n_critic}, \
+                        best_objective_value: {best_objective_value}, \
+                        objective_value: {objective_value}"
                 )
-                trainer.train(resume_from_checkpoint=True)
 
-            objective_value, stop_training = objective_callback(
-                self, objective_scores, num_train_epochs
-            )
-            objective_scores.append(objective_value)
-            print(f"Objective value: {objective_value}")
+                if stop_training:
+                    print("Stopping training, objective function forced stopping...")
+                    break
+        except Exception as exception:
+            raise exception
+        finally:
+            if trainer is not None:
+                # Save last epoch artefacts before loading the best model.
+                trainer.save_model(last_epoch_path.as_posix())
+                trainer.state.save_to_json(
+                    (last_epoch_path / "trainer_state.json").as_posix()
+                )
 
-            if objective_value is None and not stop_training:
-                # Continue training if the model is still not
-                # able to generate stable observations.
-                continue
-
-            if objective_value < best_objective_value:
-                trainer.save_model(bdm_path.as_posix())
-                trainer.state.save_to_json((bdm_path / "trainer_state.json").as_posix())
-                best_objective_value = objective_value
-
-            if (
-                num_train_epochs
-                and save_full_every_epoch
-                and num_train_epochs % save_full_every_epoch == 0
+            if bdm_path.exists() and (
+                (bdm_path / "pytorch_model.bin").exists()
+                or (bdm_path / "model.safetensors").exists()
             ):
-                full_save_dir = self.get_full_save_dir(num_train_epochs)
-                full_save_dir.mkdir(parents=True, exist_ok=True)
-                self.save(
-                    path=full_save_dir,
-                    experiment_id=self.get_experiment_id(num_train_epochs),
-                    verbose=False,
-                )
-
-            print(
-                f"Critic round: {p_epoch + n_critic}, \
-                    best_objective_value: {best_objective_value}, \
-                    objective_value: {objective_value}"
-            )
-
-            if stop_training:
-                print("Stopping training, objective function forced stopping...")
-                break
-
-        # Save last epoch artefacts before loading the best model.
-        trainer.save_model(last_epoch_path.as_posix())
-        trainer.state.save_to_json((last_epoch_path / "trainer_state.json").as_posix())
-
-        if bdm_path.exists():
-            if (bdm_path / "pytorch_model.bin").exists() or (
-                bdm_path / "model.safetensors"
-            ).exists():
                 self.model = self.model.from_pretrained(bdm_path.as_posix())
                 self.trainer_state = json.loads(
                     (bdm_path / "trainer_state.json").read_text()
