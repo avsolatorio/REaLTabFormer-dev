@@ -381,7 +381,7 @@ class REaLTabFormer:
         resume_from_checkpoint: Union[bool, str] = False,
         device="cuda",
         objective_callback: Optional[
-            Callable[[Any, list[float]], tuple[float, bool]]
+            Callable[[Any, list[float], int], tuple[float, bool]]
         ] = None,
         num_bootstrap: int = 500,
         frac: float = 0.165,
@@ -417,7 +417,7 @@ class REaLTabFormer:
               checkpoints_dir. If path, resumes the training from the given checkpoint.
             device: Device where the model and the training will be run.
               Use torch devices, e.g., `cpu`, `cuda`, `mps` (experimental)
-            objective_callback: If not None, the `_train_with_objective` method will be used to train the model with an objective function that will be tracked and used to stop the training. Callable[[Any, list[float]], float, bool] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value. Sensitivity training will be disabled.
+            objective_callback: If not None, the `_train_with_objective` method will be used to train the model with an objective function that will be tracked and used to stop the training. Callable[[Any, list[float], int], tuple[float, bool]] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value. Sensitivity training will be disabled.
             num_bootstrap: Number of Bootstrap samples
             frac: The fraction of the data used for training.
             frac_max_data: The maximum number of rows that the training data will have.
@@ -516,7 +516,7 @@ class REaLTabFormer:
             self._invalid_model_type(self.model_type)
 
         try:
-            self.experiment_id = f"id{int((time.time() * 10**10)):024}"
+            self.experiment_id = self.get_experiment_id()
             torch.cuda.empty_cache()
 
             return trainer
@@ -894,7 +894,7 @@ class REaLTabFormer:
     def _train_with_objective(
         self,
         df: pd.DataFrame,
-        objective_callback: Callable[[Any, list[float]], tuple[float, bool]],
+        objective_callback: Callable[[Any, list[float], int], tuple[float, bool]],
         device: str = "cuda",
         n_critic: int = 5,
         resume_from_checkpoint: Union[bool, str] = False,
@@ -904,7 +904,7 @@ class REaLTabFormer:
 
         Args:
             df: Pandas DataFrame containing the tabular data that will be generated during sampling.
-            objective_callback: Callable[[Any, list[float]], tuple[float, bool]] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value.
+            objective_callback: Callable[[Any, list[float], int], tuple[float, bool]] that will be used to compute the objective function. The input is the model itself, the history of objective_values and the current epoch number. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value.
             device: Device where the model and the training will be run.
             n_critic: Interval between epochs to perform a discriminator assessment.
             resume_from_checkpoint: If True, resumes training from the latest checkpoint in the
@@ -985,7 +985,9 @@ class REaLTabFormer:
                 )
                 trainer.train(resume_from_checkpoint=True)
 
-            objective_value, stop_training = objective_callback(self, objective_scores)
+            objective_value, stop_training = objective_callback(
+                self, objective_scores, num_train_epochs
+            )
             objective_scores.append(objective_value)
             print(f"Objective value: {objective_value}")
 
@@ -1004,11 +1006,12 @@ class REaLTabFormer:
                 and save_full_every_epoch
                 and num_train_epochs % save_full_every_epoch == 0
             ):
-                full_save_dir = self.full_save_dir / f"epoch_{num_train_epochs:03d}"
+                full_save_dir = self.get_full_save_dir(num_train_epochs)
                 full_save_dir.mkdir(parents=True, exist_ok=True)
                 self.save(
                     path=full_save_dir,
-                    experiment_id=f"full_model_epoch_{num_train_epochs:03d}",
+                    experiment_id=self.get_experiment_id(num_train_epochs),
+                    verbose=False,
                 )
 
             print(
@@ -1035,6 +1038,20 @@ class REaLTabFormer:
                 )
 
         return trainer
+
+    def get_full_save_dir(self, epoch: int) -> Path:
+        return self.full_save_dir / f"epoch_{epoch:03d}"
+
+    def get_experiment_id(self, epoch: int = None) -> str:
+        if self.experiment_id is not None:
+            if epoch is not None:
+                raise ValueError("Experiment ID is already set, cannot set epoch.")
+
+            return self.experiment_id
+        elif epoch is None:
+            return f"id{int((time.time() * 10**10)):024}"
+        else:
+            return f"full_model_epoch_{epoch:03d}"
 
     def _set_up_relational_coder_configs(self) -> None:
         def _get_coder(coder_name) -> GPT2Config:
@@ -1583,6 +1600,7 @@ class REaLTabFormer:
         path: Union[str, Path],
         allow_overwrite: Optional[bool] = False,
         experiment_id: Optional[str] = None,
+        verbose: bool = True,
     ):
         """Save REaLTabFormer Model
 
@@ -1657,7 +1675,8 @@ class REaLTabFormer:
             # Copy the special model checkpoints for
             # tabular models.
             for artefact in TabularArtefact.artefacts():
-                print("Copying artefacts from:", artefact)
+                if verbose:
+                    print("Copying artefacts from:", artefact)
                 if (self.checkpoints_dir / artefact).exists():
                     shutil.copytree(
                         self.checkpoints_dir / artefact,

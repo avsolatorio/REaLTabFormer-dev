@@ -734,6 +734,7 @@ class TabularSampler(REaLSampler):
         generated = generated.to(self.model.device)
 
         expected_nout = len(generated) * gen_batch
+        do_sample = generate_kwargs.pop("do_sample", True)
 
         while continuous_empty_limit > 0:
             # https://huggingface.co/docs/transformers/internal/generation_utils
@@ -742,7 +743,7 @@ class TabularSampler(REaLSampler):
                 as_numpy=True,
                 constrain_tokens_gen=constrain_tokens_gen,
                 inputs=generated,
-                do_sample=True,
+                do_sample=do_sample,
                 max_length=self.max_length,
                 num_return_sequences=gen_batch,
                 bos_token_id=self.vocab["token2id"][SpecialTokens.BOS],
