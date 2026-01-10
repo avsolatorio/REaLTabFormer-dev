@@ -17,8 +17,43 @@ from transformers import (
     logging,
 )
 from transformers.optimization import get_scheduler
+import torch.nn.functional as F
 
 logger = logging.get_logger(__name__)
+
+
+def weighted_causal_lm_loss(
+    logits: torch.Tensor,  # (B, T, V)
+    labels: torch.Tensor,  # (B, T)
+    token_weights: torch.Tensor,  # (B, T) weights aligned to labels positions
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """
+    Weighted causal LM loss. Uses the standard GPT-style shift:
+    logits[:, :-1] predicts labels[:, 1:].
+    token_weights should align with labels positions (B, T),
+    and we apply weights to the *predicted* label positions (i.e., labels[:, 1:]).
+    """
+    # Shift for causal LM
+    shift_logits = logits[:, :-1, :].contiguous()  # (B, T-1, V)
+    shift_labels = labels[:, 1:].contiguous()  # (B, T-1)
+    shift_weights = token_weights[:, 1:].contiguous()  # (B, T-1)
+
+    # Flatten
+    B, Tp1, V = shift_logits.shape
+    loss_per_tok = F.cross_entropy(
+        shift_logits.view(-1, V),
+        shift_labels.view(-1),
+        reduction="none",
+        ignore_index=ignore_index,
+    ).view(B, Tp1)
+
+    # Zero-out weights where labels are ignored
+    active = (shift_labels != ignore_index).float()
+    w = shift_weights * active
+
+    denom = w.sum().clamp_min(1e-12)
+    return (loss_per_tok * w).sum() / denom
 
 
 class SaveEpochEndCallback(TrainerCallback):
@@ -127,3 +162,44 @@ class ResumableTrainer(Trainer):
             )
 
         return self.lr_scheduler
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """
+        If `token_weights` is provided in the batch, use weighted token-level loss.
+        Otherwise fall back to the model's default loss (Trainer default behavior).
+        """
+        token_weights = inputs.pop("token_weights", None)
+
+        outputs = model(**inputs)
+        logits = outputs.logits
+
+        labels = inputs.get("label_ids", None)
+        if labels is None:
+            # No label_ids => can't compute LM loss
+            loss = (
+                outputs.loss
+                if hasattr(outputs, "loss") and outputs.loss is not None
+                else None
+            )
+            if loss is None:
+                raise ValueError(
+                    "No `label_ids` in inputs and model didn't return `loss`."
+                )
+            return (loss, outputs) if return_outputs else loss
+
+        if token_weights is None:
+            # Default Hugging Face causal LM loss from the model
+            loss = outputs.loss
+            # Some models only compute loss when label_ids are passed; GPT2LMHeadModel does.
+            if loss is None:
+                # As a fallback, compute unweighted loss ourselves
+                token_weights = torch.ones_like(
+                    labels, dtype=torch.float, device=labels.device
+                )
+                loss = weighted_causal_lm_loss(logits, labels, token_weights)
+        else:
+            # Ensure float + correct device
+            token_weights = token_weights.to(device=labels.device, dtype=torch.float)
+            loss = weighted_causal_lm_loss(logits, labels, token_weights)
+
+        return (loss, outputs) if return_outputs else loss
