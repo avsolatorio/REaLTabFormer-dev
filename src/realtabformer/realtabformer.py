@@ -405,6 +405,7 @@ class REaLTabFormer:
         load_from_best_mean_sensitivity: bool = False,
         target_col: str = None,
         save_full_every_epoch: int = 0,
+        compute_loss_func: Callable | None = None,
         gen_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
@@ -478,6 +479,7 @@ class REaLTabFormer:
                     n_critic=n_critic,
                     resume_from_checkpoint=resume_from_checkpoint,
                     save_full_every_epoch=save_full_every_epoch,
+                    compute_loss_func=compute_loss_func,
                 )
             else:
                 trainer = self._train_with_sensitivity(
@@ -904,6 +906,7 @@ class REaLTabFormer:
         n_critic: int = 5,
         resume_from_checkpoint: Union[bool, str] = False,
         save_full_every_epoch: int = 0,
+        compute_loss_func: Callable | None = None,
     ) -> Trainer:
         """This method trains the model with an objective function that will be tracked and used to stop the training. The objective function is characterized by a target column and optionally a validation set. Without a validation set, a hold out sample is used to compute the objective function.
 
@@ -967,6 +970,7 @@ class REaLTabFormer:
                     num_train_epochs=last_epoch,
                     target_epochs=self.epochs,
                     field_weights=field_weights,
+                    compute_loss_func=compute_loss_func,
                 )
 
         np.random.seed(self.random_state)
@@ -983,6 +987,7 @@ class REaLTabFormer:
                         num_train_epochs=num_train_epochs,
                         target_epochs=self.epochs,
                         field_weights=field_weights,
+                        compute_loss_func=compute_loss_func,
                     )
                     trainer.train(resume_from_checkpoint=False)
                 else:
@@ -990,6 +995,7 @@ class REaLTabFormer:
                         device=device,
                         num_train_epochs=num_train_epochs,
                         target_epochs=self.epochs,
+                        compute_loss_func=compute_loss_func,
                     )
                     trainer.train(resume_from_checkpoint=True)
 
@@ -1272,6 +1278,7 @@ class REaLTabFormer:
         num_train_epochs: int = None,
         target_epochs: int = None,
         field_weights: Optional[Dict[str, float]] = None,
+        compute_loss_func: Callable | None = None,
     ) -> Trainer:
         self._extract_column_info(df)
         df, self.col_transform_data, self.orig_to_processed_col_map = process_data(
@@ -1349,6 +1356,7 @@ class REaLTabFormer:
             device=device,
             num_train_epochs=num_train_epochs,
             target_epochs=target_epochs,
+            compute_loss_func=compute_loss_func,
         )
 
     def _build_tabular_trainer(
@@ -1356,6 +1364,7 @@ class REaLTabFormer:
         device="cuda",
         num_train_epochs: int = None,
         target_epochs: int = None,
+        compute_loss_func: Callable | None = None,
     ) -> Trainer:
         device = torch.device(device)
 
@@ -1398,6 +1407,7 @@ class REaLTabFormer:
             args=TrainingArguments(**training_args_kwargs),
             data_collator=None,  # Use the default_data_collator
             callbacks=callbacks,
+            compute_loss_func=compute_loss_func,
             **self.dataset,
         )
 

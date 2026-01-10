@@ -109,6 +109,7 @@ class ResumableTrainer(Trainer):
         preprocess_logits_for_metrics: Callable[
             [torch.Tensor, torch.Tensor], torch.Tensor
         ] = None,
+        compute_loss_func: Callable | None = None,
     ):
         # Declare here for typing
         self.lr_scheduler: torch.optim.lr_scheduler.LambdaLR = None
@@ -130,6 +131,7 @@ class ResumableTrainer(Trainer):
             callbacks=callbacks,
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            compute_loss_func=compute_loss_func,
         )
         self.target_epochs = target_epochs
 
@@ -268,6 +270,7 @@ class ResumableTrainer(Trainer):
                 outputs,
                 labels,
                 num_items_in_batch=num_items_in_batch,
+                inputs=inputs,
             )
         # Default HF loss handling (label smoothing) if no custom loss function
         elif labels is not None:
