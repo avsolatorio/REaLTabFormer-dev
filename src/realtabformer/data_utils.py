@@ -415,13 +415,14 @@ def process_data(
     first_col_type=None,
     col_transform_data: Dict = None,
     target_col: str = None,
-) -> Tuple[pd.DataFrame, Dict]:
+) -> Tuple[pd.DataFrame, Dict, Dict[str, str]]:
     # This should receive a dataframe with dtypes that have already been
     # properly categorized between numeric and categorical.
     # Date type can be converted as UNIX timestamps.
     assert first_col_type in [None, ColDataType.CATEGORICAL, ColDataType.NUMERIC]
 
     df = df.copy()
+    orig_to_processed_col_map: Dict[str, str] = {}
 
     # Unify the variable for missing data
     df = df.fillna(pd.NA)
@@ -473,6 +474,8 @@ def process_data(
 
     for c in numeric_cols:
         col_name = encode_processed_column(col_idx[c], ColDataType.NUMERIC, c)
+        orig_to_processed_col_map[c] = col_name
+
         _col_transform_data = col_transform_data.get(c)
         series, transform_data = process_numeric_data(
             df[c],
@@ -494,6 +497,7 @@ def process_data(
 
     for c in datetime_cols:
         col_name = encode_processed_column(col_idx[c], ColDataType.DATETIME, c)
+        orig_to_processed_col_map[c] = col_name
 
         _col_transform_data = col_transform_data.get(c)
         series, transform_data = process_datetime_data(
@@ -531,13 +535,16 @@ def process_data(
 
     if not categorical_cols.empty:
         # Process the rest of the data, assumed to be categorical values.
+        for c in categorical_cols:
+            orig_to_processed_col_map[c] = encode_processed_column(
+                col_idx[c], ColDataType.CATEGORICAL, c
+            )
+
         processed_df = pd.concat(
             [
                 processed_df,
                 *(
-                    process_categorical_data(df[c]).rename(
-                        encode_processed_column(col_idx[c], ColDataType.CATEGORICAL, c)
-                    )
+                    process_categorical_data(df[c]).rename(orig_to_processed_col_map[c])
                     for c in categorical_cols
                 ),
             ],
@@ -564,13 +571,17 @@ def process_data(
         # Add the column name as part of the value.
         df[c] = encode_column_values(df[c])
 
-    return df, col_transform_data
+    return df, col_transform_data, orig_to_processed_col_map
 
 
 def get_token_id(
-    token: str, vocab_token2id: Dict[str, int], mask_rate: float = 0
+    token: str,
+    vocab_token2id: Dict[str, int],
+    oov_options: List[int],
+    mask_rate: float = 0,
 ) -> int:
-    token_id = vocab_token2id.get(token, vocab_token2id[SpecialTokens.UNK])
+    token_id = vocab_token2id.get(token, random.choice(oov_options))
+
     if mask_rate > 0:
         token_id = (
             vocab_token2id[SpecialTokens.RMASK]
@@ -590,28 +601,45 @@ def get_input_ids(
     return_token_type_ids: Optional[bool] = False,
     affix_bos: Optional[bool] = True,
     affix_eos: Optional[bool] = True,
+    field_weights: Optional[Dict[str, float]] = None,
 ) -> Dict:
     # Raise an assertion error while the implementation
     # is not yet ready.
     assert return_token_type_ids is False
     input_ids: List[int] = []
     token_type_ids: List[int] = []
+    token_weights: List[float] = []
 
     if affix_bos:
         input_ids.append(vocab["token2id"][SpecialTokens.BOS])
         if return_token_type_ids:
             token_type_ids.append(vocab["token2id"][SpecialTokens.SPTYPE])
+        if field_weights is not None:
+            token_weights.append(1)
 
     for k in columns:
-        input_ids.append(get_token_id(example[k], vocab["token2id"], mask_rate))
+        input_ids.append(
+            get_token_id(
+                example[k],
+                vocab["token2id"],
+                oov_options=vocab["column_token_ids"][k],
+                mask_rate=mask_rate,
+            )
+        )
         if return_token_type_ids:
             col_name = extract_processed_column(k)
             token_type_ids.append(vocab["token2id"][col_name])
+
+        if field_weights is not None:
+            col_name = extract_processed_column(k)
+            token_weights.append(field_weights.get(col_name, 1))
 
     if affix_eos:
         input_ids.append(vocab["token2id"][SpecialTokens.EOS])
         if return_token_type_ids:
             token_type_ids.append(vocab["token2id"][SpecialTokens.SPTYPE])
+        if field_weights is not None:
+            token_weights.append(1)
 
     data = dict(input_ids=input_ids)
 
@@ -620,6 +648,9 @@ def get_input_ids(
 
     if return_token_type_ids:
         data["token_type_ids"] = token_type_ids
+
+    if field_weights is not None:
+        data["token_weights"] = token_weights
 
     return data
 
@@ -630,6 +661,7 @@ def make_dataset(
     mask_rate: float = 0,
     affix_eos: bool = True,
     return_token_type_ids: bool = False,
+    field_weights: Optional[Dict[str, float]] = None,
 ) -> Dataset:
     # Load the dataframe into a HuggingFace Dataset
     training_dataset = Dataset.from_pandas(df, preserve_index=False)
@@ -645,6 +677,7 @@ def make_dataset(
             mask_rate=mask_rate,
             affix_eos=affix_eos,
             return_token_type_ids=return_token_type_ids,
+            field_weights=field_weights,
         ),
         remove_columns=training_dataset.column_names,
     )

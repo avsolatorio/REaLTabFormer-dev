@@ -257,6 +257,7 @@ class REaLTabFormer:
         # This stores the transformation
         # parameters for numeric columns.
         self.col_transform_data: Optional[Dict] = None
+        self.orig_to_processed_col_map: Dict[str, str] = {}
 
         # This is the col_transform_data
         # for the relational models's in_df.
@@ -383,6 +384,7 @@ class REaLTabFormer:
         objective_callback: Optional[
             Callable[[Any, list[float], int], tuple[float, bool]]
         ] = None,
+        field_weights: Optional[Dict[str, float]] = None,
         num_bootstrap: int = 500,
         frac: float = 0.165,
         frac_max_data: int = 10000,
@@ -418,6 +420,7 @@ class REaLTabFormer:
             device: Device where the model and the training will be run.
               Use torch devices, e.g., `cpu`, `cuda`, `mps` (experimental)
             objective_callback: If not None, the `_train_with_objective` method will be used to train the model with an objective function that will be tracked and used to stop the training. Callable[[Any, list[float], int], tuple[float, bool]] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value. Sensitivity training will be disabled.
+            field_weights: Optional[Dict[str, float]] that will be used to weight the columns of the data. The keys are the column names and the values are the weights.
             num_bootstrap: Number of Bootstrap samples
             frac: The fraction of the data used for training.
             frac_max_data: The maximum number of rows that the training data will have.
@@ -470,6 +473,7 @@ class REaLTabFormer:
                 trainer = self._train_with_objective(
                     df,
                     objective_callback,
+                    field_weights=field_weights,
                     device=device,
                     n_critic=n_critic,
                     resume_from_checkpoint=resume_from_checkpoint,
@@ -895,6 +899,7 @@ class REaLTabFormer:
         self,
         df: pd.DataFrame,
         objective_callback: Callable[[Any, list[float], int], tuple[float, bool]],
+        field_weights: Optional[Dict[str, float]] = None,
         device: str = "cuda",
         n_critic: int = 5,
         resume_from_checkpoint: Union[bool, str] = False,
@@ -961,6 +966,7 @@ class REaLTabFormer:
                     device=device,
                     num_train_epochs=last_epoch,
                     target_epochs=self.epochs,
+                    field_weights=field_weights,
                 )
 
         np.random.seed(self.random_state)
@@ -976,6 +982,7 @@ class REaLTabFormer:
                         device=device,
                         num_train_epochs=num_train_epochs,
                         target_epochs=self.epochs,
+                        field_weights=field_weights,
                     )
                     trainer.train(resume_from_checkpoint=False)
                 else:
@@ -1029,6 +1036,9 @@ class REaLTabFormer:
         except Exception as exception:
             raise exception
         finally:
+            print(
+                f"Finishing training... Last epoch={last_epoch}... Best objective value={best_objective_value}... Saving last epoch artefacts and loading best model..."
+            )
             if trainer is not None:
                 # Save last epoch artefacts before loading the best model.
                 trainer.save_model(last_epoch_path.as_posix())
@@ -1132,7 +1142,7 @@ class REaLTabFormer:
         out_df = out_df.drop(join_on, axis=1)
 
         self._extract_column_info(out_df)
-        out_df, self.col_transform_data = process_data(
+        out_df, self.col_transform_data, self.orig_to_processed_col_map = process_data(
             out_df,
             numeric_max_len=self.numeric_max_len,
             numeric_precision=self.numeric_precision,
@@ -1159,12 +1169,14 @@ class REaLTabFormer:
         self.col_idx_ids[-2] = [self.vocab["decoder"]["token2id"][SpecialTokens.EMEM]]
 
         # TODO: handle the col_transform_data from the in_df as well.
-        in_df, self.in_col_transform_data = process_data(
-            in_df,
-            numeric_max_len=self.numeric_max_len,
-            numeric_precision=self.numeric_precision,
-            numeric_nparts=self.numeric_nparts,
-            col_transform_data=self.parent_col_transform_data,
+        in_df, self.in_col_transform_data, self.orig_to_processed_col_map = (
+            process_data(
+                in_df,
+                numeric_max_len=self.numeric_max_len,
+                numeric_precision=self.numeric_precision,
+                numeric_nparts=self.numeric_nparts,
+                col_transform_data=self.parent_col_transform_data,
+            )
         )
         if self.parent_vocab is None:
             self.vocab["encoder"] = self._generate_vocab(in_df)
@@ -1259,9 +1271,10 @@ class REaLTabFormer:
         device="cuda",
         num_train_epochs: int = None,
         target_epochs: int = None,
+        field_weights: Optional[Dict[str, float]] = None,
     ) -> Trainer:
         self._extract_column_info(df)
-        df, self.col_transform_data = process_data(
+        df, self.col_transform_data, self.orig_to_processed_col_map = process_data(
             df,
             numeric_max_len=self.numeric_max_len,
             numeric_precision=self.numeric_precision,
@@ -1271,6 +1284,15 @@ class REaLTabFormer:
         self.processed_columns = df.columns.to_list()
         self.vocab = self._generate_vocab(df)
         self.tabular_col_size = df.shape[0]
+
+        # Map the column names to the field weights
+        # The fields in the field_weights are the original column names.
+        # We need to map them to the processed columns.
+        if field_weights is not None:
+            field_weights = {
+                self.orig_to_processed_col_map[col]: field_weights.get(col, 1)
+                for col in field_weights.keys()
+            }
 
         # NOTE: the index starts at zero, but should be adjusted
         # to account for the special tokens. For tabular data,
@@ -1282,7 +1304,11 @@ class REaLTabFormer:
 
         # Load the dataframe into a HuggingFace Dataset
         dataset = make_dataset(
-            df, self.vocab, mask_rate=self.mask_rate, return_token_type_ids=False
+            df,
+            self.vocab,
+            mask_rate=self.mask_rate,
+            return_token_type_ids=False,
+            field_weights=field_weights,
         )
 
         # Store the sequence length for the processed data
@@ -1439,6 +1465,7 @@ class REaLTabFormer:
             assert self.tabular_max_length is not None
             assert self.tabular_col_size is not None
             assert self.col_transform_data is not None
+            assert self.orig_to_processed_col_map is not None
 
             tabular_sampler = TabularSampler.sampler_from_model(
                 rtf_model=self, device=device
@@ -1478,6 +1505,7 @@ class REaLTabFormer:
             assert self.relational_col_size is not None
             assert self.col_transform_data is not None
             assert self.in_col_transform_data is not None
+            assert self.orig_to_processed_col_map is not None
 
             relational_sampler = RelationalSampler.sampler_from_model(
                 rtf_model=self, device=device
