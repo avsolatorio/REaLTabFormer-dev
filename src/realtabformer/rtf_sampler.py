@@ -720,8 +720,22 @@ class TabularSampler(REaLSampler):
         suppress_tokens: Optional[List[int]] = None,
         forced_decoder_ids: Optional[List[List[int]]] = None,
         output_cols: Optional[List[str]] = None,
+        return_sample_outputs: Optional[bool] = False,
         **generate_kwargs,
     ) -> pd.DataFrame:
+        """
+        Example of usage:
+        # This will return the sample outputs instead of the synthetic data. It also includes the hidden states.
+        sample_outputs = sampler.sample_tabular_with_seed(
+            o[sampler.columns[:-3]],
+            device="cuda:1",
+            do_sample=False,
+            return_sample_outputs=True,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            as_numpy=False,
+        )
+        """
         device = torch.device(device)
 
         if self.model.device != device:
@@ -735,12 +749,13 @@ class TabularSampler(REaLSampler):
 
         expected_nout = len(generated) * gen_batch
         do_sample = generate_kwargs.pop("do_sample", True)
+        as_numpy = generate_kwargs.pop("as_numpy", True)
 
         while continuous_empty_limit > 0:
             # https://huggingface.co/docs/transformers/internal/generation_utils
             sample_outputs = self._generate(
                 device=device,
-                as_numpy=True,
+                as_numpy=as_numpy,
                 constrain_tokens_gen=constrain_tokens_gen,
                 inputs=generated,
                 do_sample=do_sample,
@@ -753,6 +768,9 @@ class TabularSampler(REaLSampler):
                 forced_decoder_ids=forced_decoder_ids,
                 **generate_kwargs,
             )
+
+            if return_sample_outputs:
+                return sample_outputs
 
             try:
                 synth_sample = self._processes_sample(
