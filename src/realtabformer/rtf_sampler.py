@@ -605,7 +605,7 @@ class TabularSampler(REaLSampler):
 
         seed_input = seed_input[valid_cols]
 
-        seed_data, _ = process_data(
+        seed_data, _, _ = process_data(
             df=seed_input, col_transform_data=self.col_transform_data
         )
         seed_data = make_dataset(seed_data, self.vocab, mask_rate=0, affix_eos=False)
@@ -1112,7 +1112,7 @@ class RelationalSampler(REaLSampler):
         **generate_kwargs,
     ):
         # Let apply processing if `input_df` is given.
-        input_df, _ = process_data(
+        input_df, _, _ = process_data(
             input_df, col_transform_data=self.in_col_transform_data
         )
 

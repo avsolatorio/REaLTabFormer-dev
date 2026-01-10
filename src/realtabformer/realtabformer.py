@@ -1317,12 +1317,13 @@ class REaLTabFormer:
         # Create train-eval split if specified
         dataset = self._split_train_eval_dataset(dataset)
 
-        dataset_columns = ["input_ids", "label_ids"]
+        dataset_columns = ["input_ids", "labels"]
 
         if field_weights is not None:
             dataset_columns.append("token_weights")
 
         for split in dataset.keys():
+            dataset[split] = dataset[split].rename_column("label_ids", "labels")
             dataset[split].set_format(type="torch", columns=dataset_columns)
 
         self.dataset = dataset
