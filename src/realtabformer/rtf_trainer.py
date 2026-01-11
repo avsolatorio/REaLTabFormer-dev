@@ -19,13 +19,16 @@ from transformers import (
 from transformers.optimization import get_scheduler
 import torch.nn.functional as F
 
-from transformers.trainer import _is_peft_model
+from transformers.trainer import (
+    _is_peft_model,
+    is_accelerate_available,
+    is_sagemaker_mp_enabled,
+    OptimizerNames,
+)
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
-from accelerate import is_accelerate_available
-from accelerate import is_sagemaker_mp_enabled
-from accelerate import smp_forward_backward
-from accelerate import OptimizerNames
+if is_sagemaker_mp_enabled():
+    from transformers.trainer_pt_utils import smp_forward_backward
 
 from .grokfast import gradfilter_ma, gradfilter_ema
 

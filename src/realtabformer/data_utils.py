@@ -1,11 +1,12 @@
 import logging
 import random
 import re
+import os
 import time
 import uuid
 import warnings
 from dataclasses import dataclass, fields
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 import pandas as pd
@@ -593,70 +594,109 @@ def get_token_id(
 
 
 def get_input_ids(
-    example,
+    example: Dict[str, Any],
     vocab: Dict,
-    columns: List,
-    mask_rate: float = 0,
-    return_label_ids: Optional[bool] = True,
-    return_token_type_ids: Optional[bool] = False,
-    affix_bos: Optional[bool] = True,
-    affix_eos: Optional[bool] = True,
+    columns: List[str],
+    mask_rate: float = 0.0,
+    return_label_ids: bool = True,
+    return_token_type_ids: bool = False,
+    affix_bos: bool = True,
+    affix_eos: bool = True,
     field_weights: Optional[Dict[str, float]] = None,
-) -> Dict:
-    # Raise an assertion error while the implementation
-    # is not yet ready.
-    assert return_token_type_ids is False
-    input_ids: List[int] = []
-    token_type_ids: List[int] = []
-    token_weights: List[float] = []
+    batched: bool = False,
+) -> Dict[str, Any]:
+    assert return_token_type_ids is False, (
+        "token_type_ids not implemented in this refactor yet."
+    )
 
-    if affix_bos:
-        input_ids.append(vocab["token2id"][SpecialTokens.BOS])
-        if return_token_type_ids:
-            token_type_ids.append(vocab["token2id"][SpecialTokens.SPTYPE])
-        if field_weights is not None:
-            token_weights.append(1)
+    token2id = vocab["token2id"]
+    col_oov = vocab["column_token_ids"]
 
-    for k in columns:
-        input_ids.append(
-            get_token_id(
-                example[k],
-                vocab["token2id"],
-                oov_options=vocab["column_token_ids"][k],
+    bos_id = token2id[SpecialTokens.BOS]
+    eos_id = token2id[SpecialTokens.EOS]
+    sptype_id = token2id[SpecialTokens.SPTYPE]
+
+    def _field_weight(col_name: str) -> float:
+        if field_weights is None:
+            return 1.0
+        for wk, wv in field_weights.items():
+            if col_name.startswith(wk):
+                return float(wv)
+        return 1.0
+
+    def _build_one_row(i: int) -> Dict[str, Any]:
+        """
+        Build features for a single row at index i (works for batched inputs),
+        or for the non-batched case i is ignored and values are scalars.
+        """
+        input_ids: List[int] = []
+        token_weights: List[float] = []
+        token_type_ids: List[int] = []
+        if affix_bos:
+            input_ids.append(bos_id)
+            if return_token_type_ids:
+                token_type_ids.append(sptype_id)
+            if field_weights is not None:
+                token_weights.append(1.0)
+
+        for k in columns:
+            val = example[k][i] if batched else example[k]
+            tid = get_token_id(
+                val,
+                token2id,
+                oov_options=col_oov[k],
                 mask_rate=mask_rate,
             )
-        )
+            input_ids.append(tid)
+            if return_token_type_ids:
+                col_name = decode_processed_column(k)
+                token_type_ids.append(vocab["token2id"][col_name])
+            if field_weights is not None:
+                token_weights.append(_field_weight(k))
+
+        if affix_eos:
+            input_ids.append(eos_id)
+            if return_token_type_ids:
+                token_type_ids.append(sptype_id)
+            if field_weights is not None:
+                token_weights.append(1.0)
+
+        out: Dict[str, Any] = {"input_ids": input_ids}
+
+        if return_label_ids:
+            # copy so labels can't be mutated if input_ids changes later
+            out["label_ids"] = list(input_ids)
+
         if return_token_type_ids:
-            col_name = decode_processed_column(k)
-            token_type_ids.append(vocab["token2id"][col_name])
+            out["token_type_ids"] = token_type_ids
 
         if field_weights is not None:
-            for wk, wv in field_weights.items():
-                if k.startswith(wk):
-                    token_weights.append(wv)
-                    break
-            else:
-                token_weights.append(1)
+            out["token_weights"] = token_weights
 
-    if affix_eos:
-        input_ids.append(vocab["token2id"][SpecialTokens.EOS])
-        if return_token_type_ids:
-            token_type_ids.append(vocab["token2id"][SpecialTokens.SPTYPE])
-        if field_weights is not None:
-            token_weights.append(1)
+        return out
 
-    data = dict(input_ids=input_ids)
+    # --- Non-batched path: return single example dict with flat lists ---
+    if not batched:
+        return _build_one_row(i=0)
 
+    # --- Batched path: example[k] is a list; return list-of-list per key ---
+    # Infer batch size from the first column
+    first_col = columns[0]
+    B = len(example[first_col])
+
+    rows = [_build_one_row(i) for i in range(B)]
+
+    batched_out: Dict[str, Any] = {
+        "input_ids": [r["input_ids"] for r in rows],
+    }
     if return_label_ids:
-        data["label_ids"] = input_ids
-
+        batched_out["label_ids"] = [r["label_ids"] for r in rows]
     if return_token_type_ids:
-        data["token_type_ids"] = token_type_ids
-
+        batched_out["token_type_ids"] = [r["token_type_ids"] for r in rows]
     if field_weights is not None:
-        data["token_weights"] = token_weights
+        batched_out["token_weights"] = [r["token_weights"] for r in rows]
 
-    return data
+    return batched_out
 
 
 def make_dataset(
@@ -666,9 +706,13 @@ def make_dataset(
     affix_eos: bool = True,
     return_token_type_ids: bool = False,
     field_weights: Optional[Dict[str, float]] = None,
+    batched: bool = True,
+    batch_size: int = 2048,
+    num_proc: int | None = None,
 ) -> Dataset:
     # Load the dataframe into a HuggingFace Dataset
     training_dataset = Dataset.from_pandas(df, preserve_index=False)
+    num_proc = num_proc
 
     # Create the input_ids and label_ids columns
     logging.info("Creating the input_ids and label_ids columns...")
@@ -682,8 +726,12 @@ def make_dataset(
             affix_eos=affix_eos,
             return_token_type_ids=return_token_type_ids,
             field_weights=field_weights,
+            batched=batched,
         ),
         remove_columns=training_dataset.column_names,
+        num_proc=num_proc,
+        batch_size=batch_size,
+        batched=batched,
     )
 
 
