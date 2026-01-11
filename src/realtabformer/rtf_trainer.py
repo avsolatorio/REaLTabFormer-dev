@@ -22,6 +22,19 @@ import torch.nn.functional as F
 from transformers.trainer import _is_peft_model
 from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
 
+from accelerate import is_accelerate_available
+from accelerate import is_sagemaker_mp_enabled
+from accelerate import smp_forward_backward
+from accelerate import OptimizerNames
+
+from .grokfast import gradfilter_ma, gradfilter_ema
+
+if is_accelerate_available():
+    from accelerate.utils import (
+        DistributedType,
+    )
+    from accelerate.utils.memory import clear_device_cache
+
 logger = logging.get_logger(__name__)
 
 
@@ -183,6 +196,7 @@ class ResumableTrainer(Trainer):
             [torch.Tensor, torch.Tensor], torch.Tensor
         ] = None,
         compute_loss_func: Callable | None = None,
+        grokfast_args: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
         # Declare here for typing
@@ -210,6 +224,9 @@ class ResumableTrainer(Trainer):
             **kwargs,
         )
         self.target_epochs = target_epochs
+        self._grads = None  # Grokfast
+        self._grokfast_args = grokfast_args
+        self._grokfast_trigger = False  # Grokfast
 
     def create_scheduler(
         self, num_training_steps: int, optimizer: torch.optim.Optimizer = None
@@ -390,3 +407,107 @@ class ResumableTrainer(Trainer):
             # print(f"loss: {_loss} -> {loss}")
 
         return (loss, outputs) if return_outputs else loss
+
+    def training_step(
+        self,
+        model: nn.Module,
+        inputs: dict[str, torch.Tensor | Any],
+        num_items_in_batch: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Perform a training step on a batch of inputs.
+
+        Subclass and override to inject custom behavior.
+
+        Args:
+            model (`nn.Module`):
+                The model to train.
+            inputs (`dict[str, Union[torch.Tensor, Any]]`):
+                The inputs and targets of the model.
+
+                The dictionary will be unpacked before being fed to the model. Most models expect the targets under the
+                argument `labels`. Check your model's documentation for all accepted arguments.
+
+        Return:
+            `torch.Tensor`: The tensor with training loss on this batch.
+        """
+        # Prepare buffers for context parallelism
+
+        cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+
+        # Context manager is no-op if CP isn't enabled
+        with cp_context():
+            model.train()
+            if hasattr(self.optimizer, "train") and callable(self.optimizer.train):
+                self.optimizer.train()
+
+            inputs = self._prepare_inputs(inputs)
+            if is_sagemaker_mp_enabled():
+                loss_mb = smp_forward_backward(
+                    model, inputs, self.args.gradient_accumulation_steps
+                )
+                return loss_mb.reduce_mean().detach().to(self.args.device)
+
+            with self.compute_loss_context_manager():
+                loss = self.compute_loss(
+                    model, inputs, num_items_in_batch=num_items_in_batch
+                )
+
+            del inputs
+            if (
+                self.args.torch_empty_cache_steps is not None
+                and self.state.global_step % self.args.torch_empty_cache_steps == 0
+            ):
+                clear_device_cache()
+
+            kwargs = {}
+
+            # For LOMO optimizers you need to explicitly use the learning rate
+            if self.args.optim in [OptimizerNames.LOMO, OptimizerNames.ADALOMO]:
+                kwargs["learning_rate"] = self._get_learning_rate()
+
+            if self.args.n_gpu > 1:
+                loss = loss.mean()  # mean() to average on multi-gpu parallel training
+
+            # Finally we need to normalize the loss for reporting if GA loss bug is not fixed during compute loss
+            if (
+                not self.model_accepts_loss_kwargs or num_items_in_batch is None
+            ) and self.compute_loss_func is None:
+                # If the model does not accept loss kwargs, we need to normalize the loss by the number of gradient accumulation steps
+                loss = loss / self.current_gradient_accumulation_steps
+
+            # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
+            # https://github.com/huggingface/transformers/pull/35808
+            if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+                kwargs["scale_wrt_gas"] = False
+
+            self.accelerator.backward(loss, **kwargs)
+
+            if self._grokfast_args is not None:
+                grokfast_filter = self._grokfast_args.get("filter", "none")
+                grokfast_window_size = self._grokfast_args.get("window_size", 10)
+                grokfast_lamb = self._grokfast_args.get("lamb", 0.1)
+                grokfast_alpha = self._grokfast_args.get("alpha", 0.1)
+                if grokfast_filter == "none":
+                    pass
+                elif grokfast_filter == "ma":
+                    self._grads = gradfilter_ma(
+                        model,
+                        grads=self._grads,
+                        window_size=grokfast_window_size,
+                        lamb=grokfast_lamb,
+                        trigger=self._grokfast_trigger,
+                    )
+                elif grokfast_filter == "ema":
+                    self._grads = gradfilter_ema(
+                        model,
+                        grads=self._grads,
+                        alpha=grokfast_alpha,
+                        lamb=grokfast_lamb,
+                    )
+                else:
+                    raise ValueError(
+                        f"Invalid gradient filter type `{grokfast_filter}`"
+                    )
+
+            return loss.detach()

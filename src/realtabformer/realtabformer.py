@@ -105,6 +105,7 @@ class REaLTabFormer:
         numeric_nparts: int = 1,
         numeric_precision: int = 4,
         numeric_max_len: int = 10,
+        grokfast_args: Optional[Dict[str, Any]] = None,
         **training_args_kwargs,
     ) -> None:
         """Set up a REaLTabFormer instance.
@@ -150,6 +151,8 @@ class REaLTabFormer:
 
         # This will be set during and will also be deleted after training.
         self.dataset = None
+
+        self.grokfast_args = grokfast_args
 
         if model_type not in ModelType.types():
             self._invalid_model_type(model_type)
@@ -1423,6 +1426,7 @@ class REaLTabFormer:
             data_collator=None,  # Use the default_data_collator
             callbacks=callbacks,
             compute_loss_func=compute_loss_func,
+            grokfast_args=self.grokfast_args,
             **self.dataset,
             **self.trainer_kwargs,
         )
