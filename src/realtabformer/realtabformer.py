@@ -407,6 +407,7 @@ class REaLTabFormer:
         save_full_every_epoch: int = 0,
         compute_loss_func: Callable | None = None,
         gen_kwargs: Optional[Dict[str, Any]] = None,
+        trainer_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
 
@@ -453,6 +454,13 @@ class REaLTabFormer:
             Trainer
         """
         device = _validate_get_device(device)
+        if field_weights is not None:
+            self.training_args_kwargs["remove_unused_columns"] = False
+
+        self.trainer_kwargs = {}
+
+        if trainer_kwargs is not None:
+            self.trainer_kwargs.update(trainer_kwargs)
 
         # Set target col for teacher forcing
         self.target_col = target_col
@@ -952,6 +960,7 @@ class REaLTabFormer:
         last_epoch_path.mkdir(parents=True, exist_ok=True)
 
         last_epoch = 0
+        num_train_epochs = 0
 
         if resume_from_checkpoint:
             chkp_list = sorted(
@@ -1043,9 +1052,10 @@ class REaLTabFormer:
             raise exception
         finally:
             print(
-                f"Finishing training... Last epoch={last_epoch}... Best objective value={best_objective_value}... Saving last epoch artefacts and loading best model..."
+                f"Finishing training... Last epoch={num_train_epochs}... Best objective value={best_objective_value}... Saving last epoch artefacts and loading best model..."
             )
             if trainer is not None:
+                self._trainer = trainer
                 # Save last epoch artefacts before loading the best model.
                 trainer.save_model(last_epoch_path.as_posix())
                 trainer.state.save_to_json(
@@ -1409,6 +1419,7 @@ class REaLTabFormer:
             callbacks=callbacks,
             compute_loss_func=compute_loss_func,
             **self.dataset,
+            **self.trainer_kwargs,
         )
 
         return trainer

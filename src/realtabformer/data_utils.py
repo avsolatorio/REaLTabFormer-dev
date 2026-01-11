@@ -627,11 +627,11 @@ def get_input_ids(
             )
         )
         if return_token_type_ids:
-            col_name = extract_processed_column(k)
+            col_name = decode_processed_column(k)
             token_type_ids.append(vocab["token2id"][col_name])
 
         if field_weights is not None:
-            col_name = extract_processed_column(k)
+            col_name = decode_processed_column(k)
             token_weights.append(field_weights.get(col_name, 1))
 
     if affix_eos:

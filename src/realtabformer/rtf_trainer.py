@@ -1,6 +1,6 @@
 import math
 from typing import Callable, Dict, List, Optional, Tuple, Union, Any
-
+from dataclasses import dataclass
 import torch
 from datasets import Dataset
 from torch import nn
@@ -59,6 +59,79 @@ def weighted_causal_lm_loss(
     return (loss_per_tok * w).sum() / denom
 
 
+@dataclass
+class WeightedLabelSmoother:
+    """
+    Label smoothing with optional per-token weights.
+
+    token_weights: (B, T) aligned with labels positions.
+    If shift_labels=True (causal LM), weights are shifted too.
+    """
+
+    epsilon: float = 0.1
+    ignore_index: int = -100
+
+    def __call__(
+        self, model_output, labels, shift_labels: bool = False, token_weights=None
+    ):
+        logits = (
+            model_output["logits"]
+            if isinstance(model_output, dict)
+            else model_output[0]
+        )
+        # logits: (B, T, V)
+
+        if shift_labels:
+            logits = logits[..., :-1, :].contiguous()  # (B, T-1, V)
+            labels = labels[..., 1:].contiguous()  # (B, T-1)
+            if token_weights is not None:
+                token_weights = token_weights[
+                    ..., 1:
+                ].contiguous()  # align with shifted labels
+
+        log_probs = -nn.functional.log_softmax(logits, dim=-1)  # (B, T, V)
+
+        # Make labels shape (B, T, 1)
+        if labels.dim() == log_probs.dim() - 1:
+            labels = labels.unsqueeze(-1)
+
+        padding_mask = labels.eq(self.ignore_index)  # (B, T, 1)
+
+        # gather requires non-negative indices
+        labels_clamped = torch.clamp(labels, min=0)
+
+        # Per-token NLL (B, T, 1)
+        nll_loss = log_probs.gather(dim=-1, index=labels_clamped)
+
+        # Per-token "smoothed" loss (B, T, 1): average negative log-prob over vocab
+        smoothed_loss = log_probs.sum(dim=-1, keepdim=True, dtype=torch.float32)
+
+        # Zero out ignored positions
+        nll_loss = nll_loss.masked_fill(padding_mask, 0.0)
+        smoothed_loss = smoothed_loss.masked_fill(padding_mask, 0.0)
+
+        # Build per-token weights (B, T, 1)
+        if token_weights is None:
+            w = (~padding_mask).float()  # 1 for active tokens, 0 for ignored
+        else:
+            w = token_weights.to(device=logits.device, dtype=torch.float).unsqueeze(-1)
+            w = w.masked_fill(padding_mask, 0.0)
+
+        denom = w.sum().clamp_min(1e-12)
+
+        # Take the mean over the label dimensions, then divide by the number of active elements (i.e. not-padded).
+        num_active_elements = padding_mask.numel() - padding_mask.long().sum()
+
+        nll = (nll_loss * w).sum() / denom / num_active_elements
+        smooth = (
+            (smoothed_loss * w).sum()
+            / denom
+            / (num_active_elements * log_probs.shape[-1])
+        )
+
+        return (1 - self.epsilon) * nll + self.epsilon * smooth
+
+
 class SaveEpochEndCallback(TrainerCallback):
     """This callback forces a checkpoint save at each epoch end."""
 
@@ -110,6 +183,7 @@ class ResumableTrainer(Trainer):
             [torch.Tensor, torch.Tensor], torch.Tensor
         ] = None,
         compute_loss_func: Callable | None = None,
+        **kwargs,
     ):
         # Declare here for typing
         self.lr_scheduler: torch.optim.lr_scheduler.LambdaLR = None
@@ -118,6 +192,7 @@ class ResumableTrainer(Trainer):
             callbacks = []
 
         callbacks.append(SaveEpochEndCallback(save_epochs=save_epochs))
+        self._vocab_size: int = model.config.vocab_size
 
         super().__init__(
             model=model,
@@ -132,6 +207,7 @@ class ResumableTrainer(Trainer):
             optimizers=optimizers,
             preprocess_logits_for_metrics=preprocess_logits_for_metrics,
             compute_loss_func=compute_loss_func,
+            **kwargs,
         )
         self.target_epochs = target_epochs
 
@@ -257,7 +333,11 @@ class ResumableTrainer(Trainer):
             if num_items_in_batch is not None:
                 kwargs["num_items_in_batch"] = num_items_in_batch
             inputs = {**inputs, **kwargs}
+
+        # print(f"inputs: {inputs}")
         outputs = model(**inputs)
+
+        # print(f"outputs: {outputs}")
 
         # User-defined compute_loss function
         if self.compute_loss_func is not None:
@@ -271,6 +351,7 @@ class ResumableTrainer(Trainer):
                 labels,
                 num_items_in_batch=num_items_in_batch,
                 inputs=inputs,
+                vocab_size=self._vocab_size,
             )
         # Default HF loss handling (label smoothing) if no custom loss function
         elif labels is not None:
@@ -298,10 +379,14 @@ class ResumableTrainer(Trainer):
             and (self.model_accepts_loss_kwargs or self.compute_loss_func)
             and num_items_in_batch is not None
         ):
+            # _loss = loss.detach().cpu().tolist()
+
             loss *= (
                 self.accelerator.num_processes
                 if self.args.n_gpu <= 1
                 else self.args.n_gpu
             )
+
+            # print(f"loss: {_loss} -> {loss}")
 
         return (loss, outputs) if return_outputs else loss
