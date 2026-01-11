@@ -984,6 +984,7 @@ class REaLTabFormer:
 
         np.random.seed(self.random_state)
         random.seed(self.random_state)
+        stop_training = False
 
         try:
             for p_epoch in range(last_epoch, self.epochs, n_critic):
@@ -1055,7 +1056,8 @@ class REaLTabFormer:
                 f"Finishing training... Last epoch={num_train_epochs}... Best objective value={best_objective_value}... Saving last epoch artefacts and loading best model..."
             )
             if trainer is not None:
-                self._trainer = trainer
+                if not stop_training:
+                    self._trainer = trainer
                 # Save last epoch artefacts before loading the best model.
                 trainer.save_model(last_epoch_path.as_posix())
                 trainer.state.save_to_json(
@@ -1306,10 +1308,13 @@ class REaLTabFormer:
         # The fields in the field_weights are the original column names.
         # We need to map them to the processed columns.
         if field_weights is not None:
+            # print(f"field_weights: {field_weights}")
             field_weights = {
                 self.orig_to_processed_col_map[col]: field_weights.get(col, 1)
                 for col in field_weights.keys()
             }
+            self._field_weights = field_weights
+            # print(self._field_weights)
 
         # NOTE: the index starts at zero, but should be adjusted
         # to account for the special tokens. For tabular data,

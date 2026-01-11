@@ -631,8 +631,12 @@ def get_input_ids(
             token_type_ids.append(vocab["token2id"][col_name])
 
         if field_weights is not None:
-            col_name = decode_processed_column(k)
-            token_weights.append(field_weights.get(col_name, 1))
+            for wk, wv in field_weights.items():
+                if k.startswith(wk):
+                    token_weights.append(wv)
+                    break
+            else:
+                token_weights.append(1)
 
     if affix_eos:
         input_ids.append(vocab["token2id"][SpecialTokens.EOS])
