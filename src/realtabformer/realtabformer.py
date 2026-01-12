@@ -411,6 +411,7 @@ class REaLTabFormer:
         compute_loss_func: Callable | None = None,
         gen_kwargs: Optional[Dict[str, Any]] = None,
         trainer_kwargs: Optional[Dict[str, Any]] = None,
+        predict_fields: Optional[List[str]] = None,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
 
@@ -452,6 +453,7 @@ class REaLTabFormer:
             target_col: The target column name.
             save_full_every_epoch: The number of epochs to save the full model. Only used for tabular data with sensitivity training.
             gen_kwargs: Additional keyword arguments to pass to the model's `generate` method. Example: `{"gen_batch": 128}`.
+            predict_fields: All other fields will be considered as features for prediction, this means their labels will be set to -100.
 
         Returns:
             Trainer
@@ -491,6 +493,7 @@ class REaLTabFormer:
                     resume_from_checkpoint=resume_from_checkpoint,
                     save_full_every_epoch=save_full_every_epoch,
                     compute_loss_func=compute_loss_func,
+                    predict_fields=predict_fields,
                 )
             else:
                 trainer = self._train_with_sensitivity(
@@ -918,6 +921,7 @@ class REaLTabFormer:
         resume_from_checkpoint: Union[bool, str] = False,
         save_full_every_epoch: int = 0,
         compute_loss_func: Callable | None = None,
+        predict_fields: Optional[List[str]] = None,
     ) -> Trainer:
         """This method trains the model with an objective function that will be tracked and used to stop the training. The objective function is characterized by a target column and optionally a validation set. Without a validation set, a hold out sample is used to compute the objective function.
 
@@ -929,6 +933,7 @@ class REaLTabFormer:
             resume_from_checkpoint: If True, resumes training from the latest checkpoint in the
               checkpoints_dir. If path, resumes the training from the given checkpoint.
             save_full_every_epoch: The number of epochs to save the full model. Only used for tabular data with objective training.
+            predict_fields: All other fields will be considered as features for prediction, this means their labels will be set to -100.
         """
 
         if save_full_every_epoch > 0:
@@ -983,6 +988,7 @@ class REaLTabFormer:
                     target_epochs=self.epochs,
                     field_weights=field_weights,
                     compute_loss_func=compute_loss_func,
+                    predict_fields=predict_fields,
                 )
 
         np.random.seed(self.random_state)
@@ -1001,6 +1007,7 @@ class REaLTabFormer:
                         target_epochs=self.epochs,
                         field_weights=field_weights,
                         compute_loss_func=compute_loss_func,
+                        predict_fields=predict_fields,
                     )
                     trainer.train(resume_from_checkpoint=False)
                 else:
@@ -1294,6 +1301,7 @@ class REaLTabFormer:
         target_epochs: int = None,
         field_weights: Optional[Dict[str, float]] = None,
         compute_loss_func: Callable | None = None,
+        predict_fields: Optional[List[str]] = None,
     ) -> Trainer:
         self._extract_column_info(df)
         df, self.col_transform_data, self.orig_to_processed_col_map = process_data(
@@ -1319,6 +1327,11 @@ class REaLTabFormer:
             self._field_weights = field_weights
             # print(self._field_weights)
 
+        if predict_fields is not None:
+            self._predict_fields = []
+            for col in predict_fields:
+                self._predict_fields.append(self.orig_to_processed_col_map[col])
+
         # NOTE: the index starts at zero, but should be adjusted
         # to account for the special tokens. For tabular data,
         # the index should start at 1.
@@ -1333,7 +1346,8 @@ class REaLTabFormer:
             self.vocab,
             mask_rate=self.mask_rate,
             return_token_type_ids=False,
-            field_weights=field_weights,
+            field_weights=self._field_weights,
+            predict_fields=self._predict_fields,
         )
 
         # Store the sequence length for the processed data

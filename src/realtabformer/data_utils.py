@@ -457,9 +457,20 @@ def process_data(
         target_ser.name = tf_col_name
         df = pd.concat([target_ser, df], axis=1)
 
+    if col_transform_data is None:
+        col_transform_data = dict()
+
     # Rename the columns to encode the original order by adding a suffix of increasing
     # integer values.
-    num_cols = len(str(len(df.columns)))
+    num_col_key = "$%NUM_COLS%$"
+
+    assert num_col_key not in df.columns, (
+        f"The column name ({num_col_key}) must not be in the raw data. Found instead..."
+    )
+    col_transform_data[num_col_key] = num_cols = col_transform_data.get(
+        num_col_key, len(str(len(df.columns)))
+    )
+
     col_idx = {col: f"{str(i).zfill(num_cols)}" for i, col in enumerate(df.columns)}
 
     # Create a dataframe that will hold the processed data
@@ -467,9 +478,6 @@ def process_data(
 
     # Process numerical data
     numeric_cols = df.select_dtypes(include=np.number).columns
-
-    if col_transform_data is None:
-        col_transform_data = dict()
 
     col_name_to_transform_data: Dict[str, Dict] = dict()
 
@@ -603,6 +611,7 @@ def get_input_ids(
     affix_bos: bool = True,
     affix_eos: bool = True,
     field_weights: Optional[Dict[str, float]] = None,
+    predict_fields: Optional[List[str]] = None,
     batched: bool = False,
 ) -> Dict[str, Any]:
     assert return_token_type_ids is False, (
@@ -624,6 +633,15 @@ def get_input_ids(
                 return float(wv)
         return 1.0
 
+    def _is_predict_field(col_name: str) -> bool:
+        if predict_fields is None:
+            # If no predict fields are specified, all fields are considered as predict fields for prediction.
+            return True
+        for pf in predict_fields:
+            if col_name.startswith(pf):
+                return True
+        return False
+
     def _build_one_row(i: int) -> Dict[str, Any]:
         """
         Build features for a single row at index i (works for batched inputs),
@@ -632,8 +650,11 @@ def get_input_ids(
         input_ids: List[int] = []
         token_weights: List[float] = []
         token_type_ids: List[int] = []
+        label_ids: List[int] = []
+
         if affix_bos:
             input_ids.append(bos_id)
+            label_ids.append(bos_id)
             if return_token_type_ids:
                 token_type_ids.append(sptype_id)
             if field_weights is not None:
@@ -648,6 +669,12 @@ def get_input_ids(
                 mask_rate=mask_rate,
             )
             input_ids.append(tid)
+
+            if _is_predict_field(k):
+                label_ids.append(tid)
+            else:
+                label_ids.append(-100)
+
             if return_token_type_ids:
                 col_name = decode_processed_column(k)
                 token_type_ids.append(vocab["token2id"][col_name])
@@ -656,6 +683,7 @@ def get_input_ids(
 
         if affix_eos:
             input_ids.append(eos_id)
+            label_ids.append(eos_id)
             if return_token_type_ids:
                 token_type_ids.append(sptype_id)
             if field_weights is not None:
@@ -665,7 +693,7 @@ def get_input_ids(
 
         if return_label_ids:
             # copy so labels can't be mutated if input_ids changes later
-            out["label_ids"] = list(input_ids)
+            out["label_ids"] = label_ids
 
         if return_token_type_ids:
             out["token_type_ids"] = token_type_ids
@@ -709,6 +737,7 @@ def make_dataset(
     batched: bool = True,
     batch_size: int = 2048,
     num_proc: int | None = None,
+    predict_fields: Optional[List[str]] = None,
 ) -> Dataset:
     # Load the dataframe into a HuggingFace Dataset
     training_dataset = Dataset.from_pandas(df, preserve_index=False)
@@ -727,6 +756,7 @@ def make_dataset(
             return_token_type_ids=return_token_type_ids,
             field_weights=field_weights,
             batched=batched,
+            predict_fields=predict_fields,
         ),
         remove_columns=training_dataset.column_names,
         num_proc=num_proc,
