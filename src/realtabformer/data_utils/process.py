@@ -1,0 +1,173 @@
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+
+from .columns import encode_column_values, encode_processed_column
+from .constants import TEACHER_FORCING_PRE, ColDataType
+from .transform import (
+    process_categorical_data,
+    process_datetime_data,
+    process_numeric_data,
+    tokenize_numeric_col,
+)
+
+
+def process_data(
+    df: pd.DataFrame,
+    numeric_max_len=10,
+    numeric_precision=4,
+    numeric_nparts=2,
+    first_col_type=None,
+    col_transform_data: Dict = None,
+    target_col: str = None,
+) -> Tuple[pd.DataFrame, Dict]:
+    # This should receive a dataframe with dtypes that have already been
+    # properly categorized between numeric and categorical.
+    # Date type can be converted as UNIX timestamps.
+    assert first_col_type in [None, ColDataType.CATEGORICAL, ColDataType.NUMERIC]
+
+    df = df.copy()
+
+    # Unify the variable for missing data
+    df = df.fillna(pd.NA)
+
+    # Force cast integral values to Int64Dtype dtype
+    # to save precision if they are represented as float.
+    for c in df:
+        try:
+            if pd.api.types.is_datetime64_any_dtype(df[c].dtype):
+                # Don't cast datetime types.
+                continue
+
+            if pd.api.types.is_numeric_dtype(df[c].dtype):
+                # Only cast if the column is explicitly numeric type.
+                df[c] = df[c].astype(pd.Int64Dtype())
+        except TypeError:
+            pass
+        except ValueError:
+            pass
+
+    if target_col is not None:
+        assert first_col_type is None, (
+            "Implicit ordering of columns when teacher-forcing of target is used is not supported yet!"
+        )
+        tf_col_name = f"{TEACHER_FORCING_PRE}_{target_col}"
+        assert tf_col_name not in df.columns, (
+            f"The column name ({tf_col_name}) must not be in the raw data. Found instead..."
+        )
+
+        target_ser = df[target_col].copy()
+        target_ser.name = tf_col_name
+        df = pd.concat([target_ser, df], axis=1)
+
+    # Rename the columns to encode the original order by adding a suffix of increasing
+    # integer values.
+    num_cols = len(str(len(df.columns)))
+    col_idx = {col: f"{str(i).zfill(num_cols)}" for i, col in enumerate(df.columns)}
+
+    # Create a dataframe that will hold the processed data
+    processed_series = []
+
+    # Process numerical data
+    numeric_cols = df.select_dtypes(include=np.number).columns
+
+    if col_transform_data is None:
+        col_transform_data = dict()
+
+    col_name_to_transform_data: Dict[str, Dict] = dict()
+
+    for c in numeric_cols:
+        col_name = encode_processed_column(col_idx[c], ColDataType.NUMERIC, c)
+        _col_transform_data = col_transform_data.get(c)
+        series, transform_data = process_numeric_data(
+            df[c],
+            max_len=numeric_max_len,
+            numeric_precision=numeric_precision,
+            transform_data=_col_transform_data,
+        )
+        if _col_transform_data is None:
+            # This means that no transform data is available
+            # before the processing.
+            transform_data["numeric_nparts"] = numeric_nparts
+            col_transform_data[c] = transform_data
+        series.name = col_name
+        col_name_to_transform_data[col_name] = transform_data
+        processed_series.append(series)
+
+    # Process datetime data
+    datetime_cols = df.select_dtypes(include="datetime").columns
+
+    for c in datetime_cols:
+        col_name = encode_processed_column(col_idx[c], ColDataType.DATETIME, c)
+
+        _col_transform_data = col_transform_data.get(c)
+        series, transform_data = process_datetime_data(
+            df[c],
+            transform_data=_col_transform_data,
+        )
+        if _col_transform_data is None:
+            # This means that no transform data is available
+            # before the processing.
+            transform_data["numeric_nparts"] = numeric_nparts
+            col_transform_data[c] = transform_data
+        series.name = col_name
+        col_name_to_transform_data[col_name] = transform_data
+        processed_series.append(series)
+
+    processed_df = pd.concat([pd.DataFrame()] + processed_series, axis=1)
+
+    if not processed_df.empty:
+        # Combine the processed numeric and datetime data.
+        processed_df = pd.concat(
+            [
+                tokenize_numeric_col(
+                    processed_df[col],
+                    nparts=col_name_to_transform_data[col].get(
+                        "numeric_nparts", numeric_nparts
+                    ),
+                )
+                for col in processed_df.columns
+            ],
+            axis=1,
+        )
+
+    # NOTE: The categorical data should be the last to be processed!
+    categorical_cols = df.columns.difference(numeric_cols).difference(datetime_cols)
+
+    if not categorical_cols.empty:
+        # Process the rest of the data, assumed to be categorical values.
+        processed_df = pd.concat(
+            [
+                processed_df,
+                *(
+                    process_categorical_data(df[c]).rename(
+                        encode_processed_column(col_idx[c], ColDataType.CATEGORICAL, c)
+                    )
+                    for c in categorical_cols
+                ),
+            ],
+            axis=1,
+        )
+
+    # Get the different sets of column types
+    cat_cols = processed_df.columns[
+        processed_df.columns.str.contains(ColDataType.CATEGORICAL)
+    ]
+    numeric_cols = processed_df.columns[
+        ~processed_df.columns.str.contains(ColDataType.CATEGORICAL)
+    ]
+
+    if first_col_type == ColDataType.CATEGORICAL:
+        df = processed_df[cat_cols.union(numeric_cols, sort=False)]
+    elif first_col_type == ColDataType.NUMERIC:
+        df = processed_df[numeric_cols.union(cat_cols, sort=False)]
+    else:
+        # Reorder columns to the original order
+        df = processed_df[sorted(processed_df.columns)]
+
+    for c in df.columns:
+        # Add the column name as part of the value.
+        df[c] = encode_column_values(df[c])
+
+    return df, col_transform_data
