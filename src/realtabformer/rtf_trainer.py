@@ -1,4 +1,5 @@
 import math
+from contextlib import nullcontext
 from typing import Callable, Dict, List, Optional, Tuple, Union, Any
 from dataclasses import dataclass
 import torch
@@ -36,7 +37,24 @@ if is_accelerate_available():
     from accelerate.utils import (
         DistributedType,
     )
-    from accelerate.utils.memory import clear_device_cache
+    try:
+        # `clear_device_cache` was added to `accelerate.utils.memory` after this
+        # package's declared floor (transformers>=4.46.0 / the accelerate version
+        # pinned alongside it). Fall back to a torch-only equivalent when absent.
+        from accelerate.utils.memory import clear_device_cache
+    except ImportError:
+
+        def clear_device_cache(garbage_collection: bool = False) -> None:
+            if garbage_collection:
+                import gc
+
+                gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+else:
+    DistributedType = None
 
 logger = logging.get_logger(__name__)
 
@@ -198,7 +216,7 @@ class ResumableTrainer(Trainer):
         preprocess_logits_for_metrics: Callable[
             [torch.Tensor, torch.Tensor], torch.Tensor
         ] = None,
-        compute_loss_func: Callable | None = None,
+        compute_loss_func: Optional[Callable] = None,
         grokfast_args: Optional[Dict[str, Any]] = None,
         **kwargs,
     ):
@@ -230,6 +248,7 @@ class ResumableTrainer(Trainer):
         self._grads = None  # Grokfast
         self._grokfast_args = grokfast_args
         self._grokfast_trigger = False  # Grokfast
+        self._weighted_label_smoother: Optional[WeightedLabelSmoother] = None
 
     def create_scheduler(
         self, num_training_steps: int, optimizer: torch.optim.Optimizer = None
@@ -264,59 +283,12 @@ class ResumableTrainer(Trainer):
 
         return self.lr_scheduler
 
-    # def set_weighted_compute_loss_func(self):
-    #     def _func(outputs, labels, num_items_in_batch):
-
-    #     self._compute_loss_func =
-    #     , model, inputs, return_outputs=False, **kwargs):
-
-    # def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-    #     """
-    #     If `token_weights` is provided in the batch, use weighted token-level loss.
-    #     Otherwise fall back to the model's default loss (Trainer default behavior).
-    #     """
-    #     token_weights = inputs.pop("token_weights", None)
-
-    #     outputs = model(**inputs)
-    #     logits = outputs.logits
-
-    #     labels = inputs.get("labels", None)
-    #     if labels is None:
-    #         # No labels => can't compute LM loss
-    #         loss = (
-    #             outputs.loss
-    #             if hasattr(outputs, "loss") and outputs.loss is not None
-    #             else None
-    #         )
-    #         if loss is None:
-    #             raise ValueError(
-    #                 "No `labels` in inputs and model didn't return `loss`."
-    #             )
-    #         return (loss, outputs) if return_outputs else loss
-
-    #     if token_weights is None:
-    #         # Default Hugging Face causal LM loss from the model
-    #         loss = outputs.loss
-    #         # Some models only compute loss when labels are passed; GPT2LMHeadModel does.
-    #         if loss is None:
-    #             # As a fallback, compute unweighted loss ourselves
-    #             token_weights = torch.ones_like(
-    #                 labels, dtype=torch.float, device=labels.device
-    #             )
-    #             loss = weighted_causal_lm_loss(logits, labels, token_weights)
-    #     else:
-    #         # Ensure float + correct device
-    #         token_weights = token_weights.to(device=labels.device, dtype=torch.float)
-    #         loss = weighted_causal_lm_loss(logits, labels, token_weights)
-
-    #     return (loss, outputs) if return_outputs else loss
-
     def compute_loss(
         self,
         model: nn.Module,
-        inputs: dict[str, torch.Tensor | Any],
+        inputs: Dict[str, Union[torch.Tensor, Any]],
         return_outputs: bool = False,
-        num_items_in_batch: torch.Tensor | None = None,
+        num_items_in_batch: Optional[torch.Tensor] = None,
     ):
         """
         https://github.com/huggingface/transformers/blob/37974267efefe020168ff27081fbab8bbce04720/src/transformers/trainer.py#L3755
@@ -342,12 +314,17 @@ class ResumableTrainer(Trainer):
         if pc is not None and pc.sp_backend == "deepspeed" and pc.sp_enabled:
             return self._deepspeed_sp_compute_loss(model, inputs, return_outputs, pc)
 
+        token_weights = inputs.pop("token_weights", None)
+
         if (
-            self.label_smoother is not None or self.compute_loss_func is not None
+            self.label_smoother is not None
+            or self.compute_loss_func is not None
+            or token_weights is not None
         ) and "labels" in inputs:
             labels = inputs.pop("labels")
         else:
             labels = None
+
         if self.model_accepts_loss_kwargs:
             kwargs = {}
             if num_items_in_batch is not None:
@@ -370,8 +347,6 @@ class ResumableTrainer(Trainer):
                 outputs,
                 labels,
                 num_items_in_batch=num_items_in_batch,
-                inputs=inputs,
-                vocab_size=self._vocab_size,
             )
         # Default HF loss handling (label smoothing) if no custom loss function
         elif labels is not None:
@@ -381,7 +356,19 @@ class ResumableTrainer(Trainer):
                 if _is_peft_model(unwrapped_model)
                 else unwrapped_model._get_name()
             )
-            if model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values():
+            is_causal_lm = model_name in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES.values()
+            if token_weights is not None:
+                if self._weighted_label_smoother is None:
+                    self._weighted_label_smoother = WeightedLabelSmoother(
+                        epsilon=self.args.label_smoothing_factor
+                    )
+                loss = self._weighted_label_smoother(
+                    outputs,
+                    labels,
+                    shift_labels=is_causal_lm,
+                    token_weights=token_weights,
+                )
+            elif is_causal_lm:
                 loss = self.label_smoother(outputs, labels, shift_labels=True)
             else:
                 loss = self.label_smoother(outputs, labels)
@@ -414,8 +401,8 @@ class ResumableTrainer(Trainer):
     def training_step(
         self,
         model: nn.Module,
-        inputs: dict[str, torch.Tensor | Any],
-        num_items_in_batch: torch.Tensor | None = None,
+        inputs: Dict[str, Union[torch.Tensor, Any]],
+        num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Perform a training step on a batch of inputs.
@@ -434,9 +421,13 @@ class ResumableTrainer(Trainer):
         Return:
             `torch.Tensor`: The tensor with training loss on this batch.
         """
-        # Prepare buffers for context parallelism
-
-        cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+        # Prepare buffers for context parallelism. `_prepare_context_parallel_inputs`
+        # is only available on transformers versions newer than this package's
+        # declared floor (transformers>=4.46.0); fall back to a no-op when absent.
+        if hasattr(self, "_prepare_context_parallel_inputs"):
+            cp_context, inputs = self._prepare_context_parallel_inputs(model, inputs)
+        else:
+            cp_context = nullcontext
 
         # Context manager is no-op if CP isn't enabled
         with cp_context():
@@ -476,8 +467,15 @@ class ResumableTrainer(Trainer):
             if (
                 not self.model_accepts_loss_kwargs or num_items_in_batch is None
             ) and self.compute_loss_func is None:
-                # If the model does not accept loss kwargs, we need to normalize the loss by the number of gradient accumulation steps
-                loss = loss / self.current_gradient_accumulation_steps
+                # If the model does not accept loss kwargs, we need to normalize the loss by the number of gradient accumulation steps.
+                # `current_gradient_accumulation_steps` is only available on transformers
+                # versions newer than this package's declared floor; fall back to the
+                # static `args.gradient_accumulation_steps` when absent.
+                loss = loss / getattr(
+                    self,
+                    "current_gradient_accumulation_steps",
+                    self.args.gradient_accumulation_steps,
+                )
 
             # Turning off loss scaling w.r.t. gradient accumulation when DeepSpeed is enabled
             # https://github.com/huggingface/transformers/pull/35808
@@ -486,7 +484,12 @@ class ResumableTrainer(Trainer):
 
             self.accelerator.backward(loss, **kwargs)
 
-            if self._grokfast_args is not None:
+            # `training_step` runs once per micro-batch under gradient accumulation,
+            # but the grokfast filter must only see the fully-accumulated gradient
+            # once per real optimizer step. `accelerator.sync_gradients` is True
+            # only on the micro-batch where gradients will actually be synced/the
+            # optimizer will step (see transformers Trainer's `do_sync_step`).
+            if self._grokfast_args is not None and self.accelerator.sync_gradients:
                 grokfast_filter = self._grokfast_args.get("filter", "none")
                 grokfast_window_size = self._grokfast_args.get("window_size", 10)
                 grokfast_lamb = self._grokfast_args.get("lamb", 0.1)

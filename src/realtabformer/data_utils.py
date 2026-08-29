@@ -589,7 +589,12 @@ def get_token_id(
     oov_options: List[int],
     mask_rate: float = 0,
 ) -> int:
-    token_id = vocab_token2id.get(token, random.choice(oov_options))
+    if token in vocab_token2id:
+        token_id = vocab_token2id[token]
+    elif oov_options:
+        token_id = random.choice(oov_options)
+    else:
+        token_id = vocab_token2id[SpecialTokens.UNK]
 
     if mask_rate > 0:
         token_id = (
@@ -736,7 +741,7 @@ def make_dataset(
     field_weights: Optional[Dict[str, float]] = None,
     batched: bool = True,
     batch_size: int = 2048,
-    num_proc: int | None = None,
+    num_proc: Optional[int] = None,
     predict_fields: Optional[List[str]] = None,
 ) -> Dataset:
     # Load the dataframe into a HuggingFace Dataset

@@ -208,7 +208,7 @@ def test_process_numeric_data():
 
 
 def test_process_data():
-    pr_df, _ = du.process_data(
+    pr_df, _, _ = du.process_data(
         df, numeric_max_len=10, numeric_precision=4, numeric_nparts=2)
 
     # Validate the processed columns
@@ -233,7 +233,7 @@ def test_process_data():
 @pytest.mark.parametrize("first_col_type", [None, du.ColDataType.CATEGORICAL, du.ColDataType.NUMERIC])
 def test_process_data_first_col_type(first_col_type):
     # Test for categorical first cols
-    pr_df, _ = du.process_data(
+    pr_df, _, _ = du.process_data(
         df, numeric_max_len=10, numeric_precision=4, numeric_nparts=2,
         first_col_type=first_col_type
     )

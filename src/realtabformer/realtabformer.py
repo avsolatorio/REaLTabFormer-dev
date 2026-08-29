@@ -408,7 +408,7 @@ class REaLTabFormer:
         load_from_best_mean_sensitivity: bool = False,
         target_col: str = None,
         save_full_every_epoch: int = 0,
-        compute_loss_func: Callable | None = None,
+        compute_loss_func: Optional[Callable] = None,
         gen_kwargs: Optional[Dict[str, Any]] = None,
         trainer_kwargs: Optional[Dict[str, Any]] = None,
         predict_fields: Optional[List[str]] = None,
@@ -920,7 +920,7 @@ class REaLTabFormer:
         n_critic: int = 5,
         resume_from_checkpoint: Union[bool, str] = False,
         save_full_every_epoch: int = 0,
-        compute_loss_func: Callable | None = None,
+        compute_loss_func: Optional[Callable] = None,
         predict_fields: Optional[List[str]] = None,
     ) -> Trainer:
         """This method trains the model with an objective function that will be tracked and used to stop the training. The objective function is characterized by a target column and optionally a validation set. Without a validation set, a hold out sample is used to compute the objective function.
@@ -950,9 +950,12 @@ class REaLTabFormer:
         # Start training
         logging.info("Start training...")
 
-        # Remove existing checkpoints
-        for chkp in self.checkpoints_dir.glob("checkpoint-*"):
-            shutil.rmtree(chkp, ignore_errors=True)
+        # Remove existing checkpoints, unless we're about to resume from one of
+        # them below -- deleting them first would make `resume_from_checkpoint`
+        # always find nothing and silently restart from epoch 0.
+        if not resume_from_checkpoint:
+            for chkp in self.checkpoints_dir.glob("checkpoint-*"):
+                shutil.rmtree(chkp, ignore_errors=True)
 
         objective_scores = []
         best_objective_value = np.inf
@@ -1089,15 +1092,16 @@ class REaLTabFormer:
         return self.full_save_dir / f"epoch_{epoch:03d}"
 
     def get_experiment_id(self, epoch: int = None) -> str:
-        if self.experiment_id is not None:
-            if epoch is not None:
-                raise ValueError("Experiment ID is already set, cannot set epoch.")
-
-            return self.experiment_id
-        elif epoch is None:
-            return f"id{int((time.time() * 10**10)):024}"
-        else:
+        # A per-epoch full-model-save name is independent of `self.experiment_id`
+        # (the model's overall save id): it must be generated fresh every time,
+        # even on a resumed `fit()` call where `self.experiment_id` is already set
+        # from a prior run.
+        if epoch is not None:
             return f"full_model_epoch_{epoch:03d}"
+        elif self.experiment_id is not None:
+            return self.experiment_id
+        else:
+            return f"id{int((time.time() * 10**10)):024}"
 
     def _set_up_relational_coder_configs(self) -> None:
         def _get_coder(coder_name) -> GPT2Config:
@@ -1300,7 +1304,7 @@ class REaLTabFormer:
         num_train_epochs: int = None,
         target_epochs: int = None,
         field_weights: Optional[Dict[str, float]] = None,
-        compute_loss_func: Callable | None = None,
+        compute_loss_func: Optional[Callable] = None,
         predict_fields: Optional[List[str]] = None,
     ) -> Trainer:
         self._extract_column_info(df)
@@ -1318,6 +1322,9 @@ class REaLTabFormer:
         # Map the column names to the field weights
         # The fields in the field_weights are the original column names.
         # We need to map them to the processed columns.
+        self._field_weights = None
+        self._predict_fields = None
+
         if field_weights is not None:
             # print(f"field_weights: {field_weights}")
             field_weights = {
@@ -1396,7 +1403,7 @@ class REaLTabFormer:
         device="cuda",
         num_train_epochs: int = None,
         target_epochs: int = None,
-        compute_loss_func: Callable | None = None,
+        compute_loss_func: Optional[Callable] = None,
     ) -> Trainer:
         device = torch.device(device)
 
