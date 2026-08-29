@@ -144,9 +144,10 @@ def process_numeric_data(
         series = series.str.ljust(ljust, "0")
 
     # If a number has a negative sign, make sure that it is placed properly.
-    series.loc[series.str.contains("-", regex=False)] = "-" + series.loc[
-        series.str.contains("-", regex=False)
-    ].str.replace("-", "", regex=False)
+    neg_mask = series.str.contains("-", regex=False)
+    series.loc[neg_mask] = "-" + series.loc[neg_mask].str.replace(
+        "-", "", regex=False
+    )
 
     return series, transform_data
 
