@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -11,6 +11,40 @@ from .transform import (
     process_numeric_data,
     tokenize_numeric_col,
 )
+
+
+def _process_typed_columns(
+    df: pd.DataFrame,
+    cols,
+    col_idx: Dict[str, str],
+    dtype_tag: str,
+    processor: Callable[[pd.Series, Dict], Tuple[pd.Series, Dict]],
+    col_transform_data: Dict,
+    numeric_nparts: int,
+    col_name_to_transform_data: Dict[str, Dict],
+    processed_series: List[pd.Series],
+    orig_to_processed_col_map: Dict[str, str],
+) -> None:
+    # Shared by the numeric and datetime column loops in `process_data`: both
+    # do the same steps below, differing only in `dtype_tag` and which
+    # processor is called. Mutates `col_transform_data`,
+    # `col_name_to_transform_data`, `processed_series`, and
+    # `orig_to_processed_col_map` in place, matching the original inline
+    # loops.
+    for c in cols:
+        col_name = encode_processed_column(col_idx[c], dtype_tag, c)
+        orig_to_processed_col_map[c] = col_name
+
+        _col_transform_data = col_transform_data.get(c)
+        series, transform_data = processor(df[c], _col_transform_data)
+        if _col_transform_data is None:
+            # This means that no transform data is available
+            # before the processing.
+            transform_data["numeric_nparts"] = numeric_nparts
+            col_transform_data[c] = transform_data
+        series.name = col_name
+        col_name_to_transform_data[col_name] = transform_data
+        processed_series.append(series)
 
 
 def process_data(
@@ -86,46 +120,39 @@ def process_data(
 
     col_name_to_transform_data: Dict[str, Dict] = dict()
 
-    for c in numeric_cols:
-        col_name = encode_processed_column(col_idx[c], ColDataType.NUMERIC, c)
-        orig_to_processed_col_map[c] = col_name
-
-        _col_transform_data = col_transform_data.get(c)
-        series, transform_data = process_numeric_data(
-            df[c],
+    _process_typed_columns(
+        df,
+        numeric_cols,
+        col_idx,
+        ColDataType.NUMERIC,
+        lambda s, td: process_numeric_data(
+            s,
             max_len=numeric_max_len,
             numeric_precision=numeric_precision,
-            transform_data=_col_transform_data,
-        )
-        if _col_transform_data is None:
-            # This means that no transform data is available
-            # before the processing.
-            transform_data["numeric_nparts"] = numeric_nparts
-            col_transform_data[c] = transform_data
-        series.name = col_name
-        col_name_to_transform_data[col_name] = transform_data
-        processed_series.append(series)
+            transform_data=td,
+        ),
+        col_transform_data,
+        numeric_nparts,
+        col_name_to_transform_data,
+        processed_series,
+        orig_to_processed_col_map,
+    )
 
     # Process datetime data
     datetime_cols = df.select_dtypes(include="datetime").columns
 
-    for c in datetime_cols:
-        col_name = encode_processed_column(col_idx[c], ColDataType.DATETIME, c)
-        orig_to_processed_col_map[c] = col_name
-
-        _col_transform_data = col_transform_data.get(c)
-        series, transform_data = process_datetime_data(
-            df[c],
-            transform_data=_col_transform_data,
-        )
-        if _col_transform_data is None:
-            # This means that no transform data is available
-            # before the processing.
-            transform_data["numeric_nparts"] = numeric_nparts
-            col_transform_data[c] = transform_data
-        series.name = col_name
-        col_name_to_transform_data[col_name] = transform_data
-        processed_series.append(series)
+    _process_typed_columns(
+        df,
+        datetime_cols,
+        col_idx,
+        ColDataType.DATETIME,
+        lambda s, td: process_datetime_data(s, transform_data=td),
+        col_transform_data,
+        numeric_nparts,
+        col_name_to_transform_data,
+        processed_series,
+        orig_to_processed_col_map,
+    )
 
     processed_df = pd.concat([pd.DataFrame()] + processed_series, axis=1)
 

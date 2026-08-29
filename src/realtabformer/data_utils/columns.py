@@ -61,16 +61,20 @@ def extract_processed_column(col):
     return match.group(0) if match else None
 
 
+def _has_col_dtype_tag(col: str, dtype_tag: str) -> bool:
+    return f"{SPECIAL_COL_SEP}{dtype_tag}{SPECIAL_COL_SEP}" in col
+
+
 def is_numeric_col(col):
-    return f"{SPECIAL_COL_SEP}{ColDataType.NUMERIC}{SPECIAL_COL_SEP}" in col
+    return _has_col_dtype_tag(col, ColDataType.NUMERIC)
 
 
 def is_datetime_col(col):
-    return f"{SPECIAL_COL_SEP}{ColDataType.DATETIME}{SPECIAL_COL_SEP}" in col
+    return _has_col_dtype_tag(col, ColDataType.DATETIME)
 
 
 def is_categorical_col(col):
-    return f"{SPECIAL_COL_SEP}{ColDataType.CATEGORICAL}{SPECIAL_COL_SEP}" in col
+    return _has_col_dtype_tag(col, ColDataType.CATEGORICAL)
 
 
 def is_numeric_datetime_col(col):
