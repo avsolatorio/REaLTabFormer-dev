@@ -49,6 +49,25 @@ def _field_weight(col_name: str, field_weights: Optional[Dict[str, float]]) -> f
     return 1.0
 
 
+def _combined_token_weight(
+    col_name: str,
+    field_weights: Optional[Dict[str, float]],
+    chunk_significance_weights: Optional[Dict[str, float]],
+) -> float:
+    """`field_weights` (user-set, per-*original*-column importance) and
+    `chunk_significance_weights` (data_utils.vocab, auto-computed,
+    per-*processed*-column digit-chunk reallocation) are orthogonal and
+    compose multiplicatively -- see `compute_chunk_significance_weights`'s
+    docstring for why they don't conflict: the latter only reallocates
+    weight *within* one original column's own chunks, it never changes
+    that column's total budget.
+    """
+    weight = _field_weight(col_name, field_weights)
+    if chunk_significance_weights is not None:
+        weight *= chunk_significance_weights.get(col_name, 1.0)
+    return weight
+
+
 def _is_predict_field(col_name: str, predict_fields: Optional[List[str]]) -> bool:
     if predict_fields is None:
         # If no predict fields are specified, all fields are considered as predict fields for prediction.
@@ -76,6 +95,7 @@ def _build_one_row(
     field_weights: Optional[Dict[str, float]],
     predict_fields: Optional[List[str]],
     batched: bool,
+    chunk_significance_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """
     Build features for a single row at index i (works for batched inputs),
@@ -86,12 +106,14 @@ def _build_one_row(
     token_type_ids: List[int] = []
     label_ids: List[int] = []
 
+    has_weights = field_weights is not None or chunk_significance_weights is not None
+
     if affix_bos:
         input_ids.append(bos_id)
         label_ids.append(bos_id)
         if return_token_type_ids:
             token_type_ids.append(sptype_id)
-        if field_weights is not None:
+        if has_weights:
             token_weights.append(1.0)
 
     for k in columns:
@@ -112,15 +134,17 @@ def _build_one_row(
         if return_token_type_ids:
             col_name = decode_processed_column(k)
             token_type_ids.append(token2id[col_name])
-        if field_weights is not None:
-            token_weights.append(_field_weight(k, field_weights))
+        if has_weights:
+            token_weights.append(
+                _combined_token_weight(k, field_weights, chunk_significance_weights)
+            )
 
     if affix_eos:
         input_ids.append(eos_id)
         label_ids.append(eos_id)
         if return_token_type_ids:
             token_type_ids.append(sptype_id)
-        if field_weights is not None:
+        if has_weights:
             token_weights.append(1.0)
 
     out: Dict[str, Any] = {"input_ids": input_ids}
@@ -132,7 +156,7 @@ def _build_one_row(
     if return_token_type_ids:
         out["token_type_ids"] = token_type_ids
 
-    if field_weights is not None:
+    if has_weights:
         out["token_weights"] = token_weights
 
     return out
@@ -183,6 +207,7 @@ def _build_batch(
     field_weights: Optional[Dict[str, float]],
     predict_fields: Optional[List[str]],
     rng: np.random.Generator,
+    chunk_significance_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """Vectorized equivalent of calling `_build_one_row` once per row in
     the batch. Builds the whole batch's `input_ids`/`label_ids`/
@@ -220,9 +245,13 @@ def _build_batch(
         label_cols = np.where(predict_mask[None, :], id_cols, -100)
         out["label_ids"] = _affix(label_cols, bos_id, eos_id).tolist()
 
-    if field_weights is not None:
+    if field_weights is not None or chunk_significance_weights is not None:
         weights = np.array(
-            [_field_weight(k, field_weights) for k in columns], dtype=np.float64
+            [
+                _combined_token_weight(k, field_weights, chunk_significance_weights)
+                for k in columns
+            ],
+            dtype=np.float64,
         )
         weight_cols = np.broadcast_to(weights, (batch_size, n_cols))
         out["token_weights"] = _affix(weight_cols, 1.0, 1.0).tolist()
@@ -247,6 +276,7 @@ def _build_batch_with_column_types(
     field_weights: Optional[Dict[str, float]],
     predict_fields: Optional[List[str]],
     rng: np.random.Generator,
+    chunk_significance_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     """REaLTabFormerV2-only variant of `_build_batch` that additionally
     emits `token_type_ids`, one id per column representing that column's
@@ -256,7 +286,7 @@ def _build_batch_with_column_types(
     the per-row Python loop the vectorization work removed.
 
     Reuses `_vectorized_column_token_ids`/`_is_predict_field`/
-    `_field_weight` unchanged. `_build_batch` (v1's function, used by
+    `_combined_token_weight` unchanged. `_build_batch` (v1's function, used by
     `get_input_ids`/`make_dataset`) is not modified or called here --
     this is a parallel, standalone implementation so v1's tested path
     stays exactly as it is.
@@ -316,9 +346,13 @@ def _build_batch_with_column_types(
         label_cols = np.where(predict_mask[None, :], id_cols, -100)
         out["label_ids"] = _affix(label_cols, bos_id, eos_id).tolist()
 
-    if field_weights is not None:
+    if field_weights is not None or chunk_significance_weights is not None:
         weights = np.array(
-            [_field_weight(k, field_weights) for k in columns], dtype=np.float64
+            [
+                _combined_token_weight(k, field_weights, chunk_significance_weights)
+                for k in columns
+            ],
+            dtype=np.float64,
         )
         weight_cols = np.broadcast_to(weights, (batch_size, n_cols))
         out["token_weights"] = _affix(weight_cols, 1.0, 1.0).tolist()
@@ -337,6 +371,7 @@ def make_dataset_with_column_types(
     predict_fields: Optional[List[str]] = None,
     seed: Optional[int] = None,
     keep_in_memory: bool = True,
+    chunk_significance_weights: Optional[Dict[str, float]] = None,
 ) -> Dataset:
     """REaLTabFormerV2-only counterpart of `make_dataset`: builds a
     dataset with an additional `token_type_ids` column carrying each
@@ -375,6 +410,7 @@ def make_dataset_with_column_types(
         predict_fields=predict_fields,
         seed=seed,
         variant="column_types",
+        chunk_significance_weights=chunk_significance_weights,
     )
 
     logging.info("Creating the input_ids/label_ids/token_type_ids columns...")
@@ -397,6 +433,7 @@ def make_dataset_with_column_types(
             field_weights,
             predict_fields,
             rng,
+            chunk_significance_weights,
         ),
         remove_columns=training_dataset.column_names,
         num_proc=num_proc,
@@ -420,6 +457,7 @@ def get_input_ids(
     predict_fields: Optional[List[str]] = None,
     batched: bool = False,
     rng: Optional[np.random.Generator] = None,
+    chunk_significance_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, Any]:
     assert return_token_type_ids is False, (
         "token_type_ids not implemented in this refactor yet."
@@ -449,6 +487,7 @@ def get_input_ids(
             field_weights=field_weights,
             predict_fields=predict_fields,
             batched=batched,
+            chunk_significance_weights=chunk_significance_weights,
         )
 
     # --- Batched path: vectorized, see _build_batch ---
@@ -466,6 +505,7 @@ def get_input_ids(
         field_weights=field_weights,
         predict_fields=predict_fields,
         rng=rng if rng is not None else np.random.default_rng(),
+        chunk_significance_weights=chunk_significance_weights,
     )
 
 
@@ -497,6 +537,7 @@ def make_dataset(
     predict_fields: Optional[List[str]] = None,
     seed: Optional[int] = None,
     keep_in_memory: bool = True,
+    chunk_significance_weights: Optional[Dict[str, float]] = None,
 ) -> Dataset:
     # Load the dataframe into a HuggingFace Dataset
     training_dataset = Dataset.from_pandas(df, preserve_index=False)
@@ -521,6 +562,7 @@ def make_dataset(
         batched=batched,
         predict_fields=predict_fields,
         seed=seed,
+        chunk_significance_weights=chunk_significance_weights,
     )
 
     # Create the input_ids and label_ids columns
@@ -538,6 +580,7 @@ def make_dataset(
             batched=batched,
             predict_fields=predict_fields,
             rng=rng,
+            chunk_significance_weights=chunk_significance_weights,
         ),
         remove_columns=training_dataset.column_names,
         num_proc=num_proc,

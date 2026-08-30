@@ -966,3 +966,175 @@ def test_compute_column_blocks_groups_partitions_and_preserves_order():
     # Every index appears exactly once across all blocks (a partition).
     all_indices = sorted(i for _, indices in blocks for i in indices)
     assert all_indices == list(range(len(pr_df.columns)))
+
+
+def test_compute_chunk_significance_weights_favors_high_entropy_chunks():
+    # A heavy-tailed column's own leading chunk (near-constant "0" for
+    # most rows under the fixed-width zero-padded encoding) should get a
+    # *lower* weight than its own high-variance trailing chunk -- not the
+    # reverse, which a naive position-based decay would give.
+    n = 1000
+    df = pd.DataFrame({
+        "0___NUMERIC___col_hi": ["0"] * 990 + ["9"] * 10,  # mostly constant
+        "0___NUMERIC___col_lo": (
+            np.random.default_rng(0).integers(0, 10, size=n).astype(str)
+        ),  # near-uniform
+        "1___CATEGORICAL___gender": ["m", "f"] * (n // 2),
+    })
+    processed_columns = df.columns.tolist()
+
+    weights = du.compute_chunk_significance_weights(df, processed_columns, floor=0.1)
+
+    hi_w = weights["0___NUMERIC___col_hi"]
+    lo_w = weights["0___NUMERIC___col_lo"]
+    gender_w = weights["1___CATEGORICAL___gender"]
+
+    assert hi_w < lo_w
+    assert abs((hi_w + lo_w) / 2 - 1.0) < 1e-9  # block averages to 1.0
+    assert gender_w == 1.0  # single-chunk column: always exactly 1.0
+
+    # A fully constant chunk resolves to exactly the floor value (relative
+    # to its column's mean) -- never zero, no matter how degenerate.
+    all_constant = pd.DataFrame({
+        "0___NUMERIC___a": ["0"] * n,
+        "0___NUMERIC___b": ["0"] * n,
+    })
+    w = du.compute_chunk_significance_weights(
+        all_constant, all_constant.columns.tolist(), floor=0.1
+    )
+    assert w["0___NUMERIC___a"] == w["0___NUMERIC___b"] == 1.0
+
+
+def test_build_vocab_chunk_significance_opt_in():
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9] * 20,
+        "gender": ["m", "f", "m", "f"] * 20,
+    })
+    pr_df, _, _ = du.process_data(
+        raw_df, numeric_max_len=6, numeric_precision=1, numeric_nparts=1
+    )
+
+    vocab_off = du.build_vocab(
+        pr_df, special_tokens=du.SpecialTokens.tokens(), add_columns=False
+    )
+    assert "chunk_significance_weights" not in vocab_off
+
+    vocab_on = du.build_vocab(
+        pr_df,
+        special_tokens=du.SpecialTokens.tokens(),
+        add_columns=False,
+        compute_chunk_significance=True,
+    )
+    assert set(vocab_on["chunk_significance_weights"].keys()) == set(pr_df.columns)
+
+
+def test_build_pooled_vocab_chunk_significance_opt_in():
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9] * 20,
+        "gender": ["m", "f", "m", "f"] * 20,
+    })
+    pr_df, _, _ = du.process_data(
+        raw_df, numeric_max_len=6, numeric_precision=1, numeric_nparts=1
+    )
+
+    vocab_off = du.build_pooled_vocab(pr_df, special_tokens=du.SpecialTokens.tokens())
+    assert "chunk_significance_weights" not in vocab_off
+
+    vocab_on = du.build_pooled_vocab(
+        pr_df, special_tokens=du.SpecialTokens.tokens(), compute_chunk_significance=True
+    )
+    assert set(vocab_on["chunk_significance_weights"].keys()) == set(pr_df.columns)
+
+
+def test_make_dataset_token_weights_from_chunk_significance_without_field_weights():
+    # token_weights must be built purely from chunk_significance_weights
+    # even when field_weights=None -- this is the gate-condition fix
+    # (previously token_weights was only ever built when field_weights
+    # was explicitly set).
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9] * 5,
+        "gender": ["m", "f", "m", "f"] * 5,
+    })
+    pr_df, _, _ = du.process_data(raw_df, numeric_max_len=6, numeric_precision=1)
+    vocab = du.build_vocab(
+        pr_df,
+        special_tokens=du.SpecialTokens.tokens(),
+        add_columns=False,
+        compute_chunk_significance=True,
+    )
+
+    ds = du.make_dataset(
+        pr_df,
+        vocab,
+        mask_rate=0,
+        return_token_type_ids=False,
+        field_weights=None,
+        chunk_significance_weights=vocab["chunk_significance_weights"],
+    )
+    assert "token_weights" in ds.column_names
+
+    # BOS/EOS weights are always 1.0; the middle weights must match the
+    # precomputed per-column significance weights, in column order.
+    row = ds[0]
+    expected = (
+        [1.0]
+        + [vocab["chunk_significance_weights"][c] for c in pr_df.columns]
+        + [1.0]
+    )
+    assert row["token_weights"] == expected
+
+
+def test_make_dataset_with_column_types_token_weights_from_chunk_significance():
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9] * 5,
+        "gender": ["m", "f", "m", "f"] * 5,
+    })
+    pr_df, _, _ = du.process_data(raw_df, numeric_max_len=6, numeric_precision=1)
+    vocab = du.build_pooled_vocab(
+        pr_df, special_tokens=du.SpecialTokens.tokens(), compute_chunk_significance=True
+    )
+
+    ds = du.make_dataset_with_column_types(
+        pr_df,
+        vocab,
+        mask_rate=0,
+        field_weights=None,
+        chunk_significance_weights=vocab["chunk_significance_weights"],
+    )
+    assert "token_weights" in ds.column_names
+    row = ds[0]
+    expected = (
+        [1.0]
+        + [vocab["chunk_significance_weights"][c] for c in pr_df.columns]
+        + [1.0]
+    )
+    assert row["token_weights"] == expected
+
+
+def test_chunk_significance_composes_multiplicatively_with_field_weights():
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9] * 5,
+        "gender": ["m", "f", "m", "f"] * 5,
+    })
+    pr_df, _, _ = du.process_data(raw_df, numeric_max_len=6, numeric_precision=1)
+    vocab = du.build_vocab(
+        pr_df,
+        special_tokens=du.SpecialTokens.tokens(),
+        add_columns=False,
+        compute_chunk_significance=True,
+    )
+    price_col = [c for c in pr_df.columns if "price" in c][0]
+    field_weights = {price_col: 3.0}
+
+    ds = du.make_dataset(
+        pr_df,
+        vocab,
+        mask_rate=0,
+        return_token_type_ids=False,
+        field_weights=field_weights,
+        chunk_significance_weights=vocab["chunk_significance_weights"],
+    )
+    row = ds[0]
+    price_idx = pr_df.columns.tolist().index(price_col) + 1  # +1 for BOS
+    expected = 3.0 * vocab["chunk_significance_weights"][price_col]
+    assert abs(row["token_weights"][price_idx] - expected) < 1e-9

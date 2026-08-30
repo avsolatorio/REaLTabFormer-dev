@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import numpy as np
+import pandas as pd
 import pytest
 from transformers import EncoderDecoderConfig
 from transformers.models.gpt2 import GPT2Config
@@ -213,3 +215,59 @@ def test_default_init():
 #         train_size=train_size,
 #         random_state=RANDOM_SEED,
 #         **training_args_kwargs)
+
+
+# --- digit_entropy_weighting (beta): entropy-based digit-chunk loss weighting ---
+
+
+def test_digit_entropy_weighting_default_off_leaves_no_chunk_significance_weights():
+    rng = np.random.default_rng(RANDOM_SEED)
+    df = pd.DataFrame({
+        "price": rng.normal(100, 20, size=40).round(2),
+        "gender": rng.choice(["m", "f"], size=40),
+    })
+    model = REaLTabFormer(
+        model_type="tabular", epochs=1, batch_size=8, random_state=RANDOM_SEED,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+    assert "chunk_significance_weights" not in model.vocab
+
+
+def test_digit_entropy_weighting_end_to_end_favors_high_entropy_chunk():
+    # Same claim validated for realtabformer2.py: fit a tiny v1 model on a
+    # deliberately heavy-tailed numeric column and confirm the computed
+    # chunk_significance_weights give the near-constant leading digit
+    # chunk a *lower* weight than a higher-variance later chunk.
+    rng = np.random.default_rng(11)
+    n = 300
+    price = np.round(rng.exponential(scale=50, size=n))
+    price = np.clip(price, 1, 999)
+    df = pd.DataFrame({
+        "price": price, "gender": rng.choice(["m", "f"], size=n),
+    })
+
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=1,
+        batch_size=8,
+        random_state=RANDOM_SEED,
+        numeric_max_len=6,
+        numeric_precision=0,
+        numeric_nparts=1,
+    )
+    model.fit(df, device="cpu", n_critic=0, digit_entropy_weighting=True)
+
+    weights = model.vocab["chunk_significance_weights"]
+    price_chunks = sorted(c for c in model.processed_columns if "price" in c)
+    assert len(price_chunks) > 1
+
+    leading_w = weights[price_chunks[0]]
+    trailing_w = weights[price_chunks[-1]]
+    assert leading_w < trailing_w, (
+        f"leading chunk weight ({leading_w}) should be lower than the "
+        f"trailing chunk's ({trailing_w}) for a heavy-tailed column"
+    )
+
+    samples = model.sample(n_samples=5, device="cpu")
+    assert len(samples) == 5
+    assert list(samples.columns) == list(df.columns)

@@ -52,4 +52,9 @@ from .transform import (  # noqa: F401
     process_numeric_data,
     tokenize_numeric_col,
 )
-from .vocab import build_pooled_vocab, build_vocab, compute_column_blocks  # noqa: F401
+from .vocab import (  # noqa: F401
+    build_pooled_vocab,
+    build_vocab,
+    compute_chunk_significance_weights,
+    compute_column_blocks,
+)

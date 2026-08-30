@@ -1,3 +1,6 @@
+from typing import Dict, List
+
+import numpy as np
 import pandas as pd
 
 from .columns import (
@@ -10,7 +13,13 @@ from .columns import (
 )
 
 
-def build_vocab(df: pd.DataFrame = None, special_tokens=None, add_columns: bool = True):
+def build_vocab(
+    df: pd.DataFrame = None,
+    special_tokens=None,
+    add_columns: bool = True,
+    compute_chunk_significance: bool = False,
+    chunk_significance_floor: float = 0.1,
+):
     assert (df is not None) or special_tokens, (
         "At least one of `df` or `special_tokens` must not be None."
     )
@@ -48,11 +57,18 @@ def build_vocab(df: pd.DataFrame = None, special_tokens=None, add_columns: bool 
 
     token2id = {v: k for k, v in id2token.items()}
 
-    return dict(
+    vocab = dict(
         id2token=id2token,
         token2id=token2id,
         column_token_ids=column_token_ids,
     )
+
+    if compute_chunk_significance and df is not None:
+        vocab["chunk_significance_weights"] = compute_chunk_significance_weights(
+            df, df.columns.to_list(), floor=chunk_significance_floor
+        )
+
+    return vocab
 
 
 def _original_column_name(processed_col: str) -> str:
@@ -102,7 +118,81 @@ def compute_column_blocks(processed_columns) -> list:
     return [[name, blocks[name]] for name in order]
 
 
-def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
+def compute_chunk_significance_weights(
+    df: pd.DataFrame, processed_columns: List[str], floor: float = 0.1
+) -> Dict[str, float]:
+    """Per-processed-column loss weights derived from each column's own
+    *empirical* value distribution in the training data, not from its
+    position (digit-chunk index or numeric place value).
+
+    Why not position: `process_numeric_data` zero-pads every value in a
+    numeric/datetime column to the width its column-wide *maximum*
+    needs. For a heavy-tailed column (income, price, counts -- the
+    tabular norm), most rows are small relative to that max, so the
+    leading (highest place-value) digit chunks are constant "0" for most
+    of the data, and the real distinguishing information for most rows
+    lives in the trailing chunks. A weighting scheme based on chunk
+    *index* (leading = more important) would push weight onto an
+    already-trivial, near-constant position and pull it away from the
+    chunks actually carrying the data's variation. Deriving the weight
+    from each chunk's own observed distribution instead sidesteps this
+    entirely -- it's correct regardless of whether a chunk happens to be
+    degenerate because it's a heavy tail's leading digits, or genuinely
+    high-variance because it's the tens/ones digit everyone actually
+    varies on.
+
+    For each processed column `c` (via `compute_column_blocks`, so a
+    numeric/datetime column's own digit-chunk sub-columns are grouped
+    together, in order):
+      1. Normalized Shannon entropy of `c`'s observed values:
+         `H_norm(c) = H(c) / log2(K(c))`, where `K(c)` is the number of
+         distinct observed values (`H_norm = 0` for a constant/
+         single-value chunk, avoiding a 0/0).
+      2. A floor so no chunk's raw weight is exactly zero -- a
+         degenerate chunk can still matter for the rare row where it's
+         *not* degenerate (e.g. an outlier's leading digit), so it
+         should get *less* gradient pressure, not none:
+         `raw(c) = floor + (1 - floor) * H_norm(c)`.
+      3. Renormalized *within each original column's own block* so that
+         column's chunks average to weight 1.0:
+         `weight(c) = raw(c) / mean(raw over the block)`. This is what
+         keeps the feature orthogonal to `field_weights` -- it only
+         *reallocates* weight among one column's own chunks, never
+         changes that column's total weight budget relative to other
+         columns. A single-chunk block (categorical, or a
+         non-partitioned numeric column) always resolves to exactly
+         1.0, since `raw / mean(raw of one element) == 1` regardless of
+         what `raw` is.
+    """
+    blocks = compute_column_blocks(processed_columns)
+    weights: Dict[str, float] = {}
+
+    for _name, indices in blocks:
+        cols = [processed_columns[i] for i in indices]
+        raw = np.empty(len(cols))
+        for j, c in enumerate(cols):
+            counts = df[c].value_counts(normalize=True)
+            k = len(counts)
+            h_norm = 0.0
+            if k > 1:
+                h = -(counts * np.log2(counts)).sum()
+                h_norm = h / np.log2(k)
+            raw[j] = floor + (1 - floor) * h_norm
+
+        mean_raw = raw.mean()
+        normalized = raw / mean_raw if mean_raw > 0 else np.ones_like(raw)
+        for c, w in zip(cols, normalized):
+            weights[c] = float(w)
+
+    return weights
+
+
+def build_pooled_vocab(
+    df: pd.DataFrame = None,
+    special_tokens=None,
+    compute_chunk_significance: bool = False,
+    chunk_significance_floor: float = 0.1,
+):
     """Like `build_vocab`, but the *embedding space* (`id2token`/`token2id`)
     for numeric/datetime partition columns is pooled -- shared across all
     of them, instead of every processed column getting its own -- so the
@@ -238,9 +328,16 @@ def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
 
     token2id = {v: k for k, v in id2token.items()}
 
-    return dict(
+    vocab = dict(
         id2token=id2token,
         token2id=token2id,
         column_token_ids=column_token_ids,
         column_type_ids=column_type_ids,
     )
+
+    if compute_chunk_significance and df is not None:
+        vocab["chunk_significance_weights"] = compute_chunk_significance_weights(
+            df, df.columns.to_list(), floor=chunk_significance_floor
+        )
+
+    return vocab

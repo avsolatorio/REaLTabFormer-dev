@@ -350,8 +350,19 @@ class REaLTabFormer:
         # special preprocessing.
         self.datetime_columns = df.select_dtypes(include="datetime").columns.to_list()
 
-    def _generate_vocab(self, df: pd.DataFrame) -> dict:
-        return build_vocab(df, special_tokens=SpecialTokens.tokens(), add_columns=False)
+    def _generate_vocab(
+        self,
+        df: pd.DataFrame,
+        compute_chunk_significance: bool = False,
+        chunk_significance_floor: float = 0.1,
+    ) -> dict:
+        return build_vocab(
+            df,
+            special_tokens=SpecialTokens.tokens(),
+            add_columns=False,
+            compute_chunk_significance=compute_chunk_significance,
+            chunk_significance_floor=chunk_significance_floor,
+        )
 
     def _check_model(self):
         assert self.model is not None, "Model is None. Train the model first!"
@@ -412,6 +423,8 @@ class REaLTabFormer:
         gen_kwargs: Optional[Dict[str, Any]] = None,
         trainer_kwargs: Optional[Dict[str, Any]] = None,
         predict_fields: Optional[List[str]] = None,
+        digit_entropy_weighting: bool = False,
+        digit_entropy_weight_floor: float = 0.1,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
 
@@ -427,6 +440,17 @@ class REaLTabFormer:
               Use torch devices, e.g., `cpu`, `cuda`, `mps` (experimental)
             objective_callback: If not None, the `_train_with_objective` method will be used to train the model with an objective function that will be tracked and used to stop the training. Callable[[Any, list[float], int], tuple[float, bool]] that will be used to compute the objective function. The input is the model itself and the history of objective_values. The output is the objective function value and a boolean indicating if the training should be stopped. The function must implement the sampling from the model and the computation of the objective function. The function must return None if the model is still not able to generate stable observations. A better model will have a lower objective function value. Sensitivity training will be disabled.
             field_weights: Optional[Dict[str, float]] that will be used to weight the columns of the data. The keys are the column names and the values are the weights.
+            digit_entropy_weighting: If True, numeric/datetime columns' digit-chunk loss weights
+              are derived from each chunk's own empirical value distribution in the training data
+              (normalized Shannon entropy) instead of being uniform -- a near-constant chunk (e.g.
+              a heavy-tailed column's leading digits, constant "0" for most rows under the
+              fixed-width zero-padded encoding) gets low weight, a high-variance chunk gets high
+              weight, regardless of chunk position. Composes multiplicatively with `field_weights`
+              and reallocates weight *within* each original column's own chunks only. See
+              `data_utils.vocab.compute_chunk_significance_weights`.
+            digit_entropy_weight_floor: Floor applied to a chunk's raw weight so a fully
+              degenerate chunk never gets exactly zero weight. Only used when
+              `digit_entropy_weighting=True`.
             num_bootstrap: Number of Bootstrap samples
             frac: The fraction of the data used for training.
             frac_max_data: The maximum number of rows that the training data will have.
@@ -459,7 +483,7 @@ class REaLTabFormer:
             Trainer
         """
         device = _validate_get_device(device)
-        if field_weights is not None:
+        if field_weights is not None or digit_entropy_weighting:
             self.training_args_kwargs["remove_unused_columns"] = False
 
         self.trainer_kwargs = {}
@@ -481,7 +505,20 @@ class REaLTabFormer:
 
         if self.model_type == ModelType.tabular:
             if n_critic <= 0:
-                trainer = self._fit_tabular(df, device=device)
+                # NOTE: field_weights/predict_fields/compute_loss_func were
+                # previously silently dropped on this path (pre-existing
+                # gap, unrelated to digit_entropy_weighting) -- fixed here
+                # since leaving it would also silently drop
+                # digit_entropy_weighting on the simplest fit() call.
+                trainer = self._fit_tabular(
+                    df,
+                    device=device,
+                    field_weights=field_weights,
+                    compute_loss_func=compute_loss_func,
+                    predict_fields=predict_fields,
+                    digit_entropy_weighting=digit_entropy_weighting,
+                    digit_entropy_weight_floor=digit_entropy_weight_floor,
+                )
                 trainer.train(resume_from_checkpoint=resume_from_checkpoint)
             elif objective_callback is not None:
                 trainer = self._train_with_objective(
@@ -494,6 +531,8 @@ class REaLTabFormer:
                     save_full_every_epoch=save_full_every_epoch,
                     compute_loss_func=compute_loss_func,
                     predict_fields=predict_fields,
+                    digit_entropy_weighting=digit_entropy_weighting,
+                    digit_entropy_weight_floor=digit_entropy_weight_floor,
                 )
             else:
                 trainer = self._train_with_sensitivity(
@@ -922,6 +961,8 @@ class REaLTabFormer:
         save_full_every_epoch: int = 0,
         compute_loss_func: Optional[Callable] = None,
         predict_fields: Optional[List[str]] = None,
+        digit_entropy_weighting: bool = False,
+        digit_entropy_weight_floor: float = 0.1,
     ) -> Trainer:
         """This method trains the model with an objective function that will be tracked and used to stop the training. The objective function is characterized by a target column and optionally a validation set. Without a validation set, a hold out sample is used to compute the objective function.
 
@@ -992,6 +1033,8 @@ class REaLTabFormer:
                     field_weights=field_weights,
                     compute_loss_func=compute_loss_func,
                     predict_fields=predict_fields,
+                    digit_entropy_weighting=digit_entropy_weighting,
+                    digit_entropy_weight_floor=digit_entropy_weight_floor,
                 )
 
         np.random.seed(self.random_state)
@@ -1011,6 +1054,8 @@ class REaLTabFormer:
                         field_weights=field_weights,
                         compute_loss_func=compute_loss_func,
                         predict_fields=predict_fields,
+                        digit_entropy_weighting=digit_entropy_weighting,
+                        digit_entropy_weight_floor=digit_entropy_weight_floor,
                     )
                     trainer.train(resume_from_checkpoint=False)
                 else:
@@ -1306,6 +1351,8 @@ class REaLTabFormer:
         field_weights: Optional[Dict[str, float]] = None,
         compute_loss_func: Optional[Callable] = None,
         predict_fields: Optional[List[str]] = None,
+        digit_entropy_weighting: bool = False,
+        digit_entropy_weight_floor: float = 0.1,
     ) -> Trainer:
         self._extract_column_info(df)
         df, self.col_transform_data, self.orig_to_processed_col_map = process_data(
@@ -1316,8 +1363,17 @@ class REaLTabFormer:
             target_col=self.target_col,
         )
         self.processed_columns = df.columns.to_list()
-        self.vocab = self._generate_vocab(df)
+        self.vocab = self._generate_vocab(
+            df,
+            compute_chunk_significance=digit_entropy_weighting,
+            chunk_significance_floor=digit_entropy_weight_floor,
+        )
         self.tabular_col_size = df.shape[0]
+        chunk_significance_weights = (
+            self.vocab.get("chunk_significance_weights")
+            if digit_entropy_weighting
+            else None
+        )
 
         # Map the column names to the field weights
         # The fields in the field_weights are the original column names.
@@ -1356,6 +1412,7 @@ class REaLTabFormer:
             field_weights=self._field_weights,
             predict_fields=self._predict_fields,
             seed=self.random_state,
+            chunk_significance_weights=chunk_significance_weights,
         )
 
         # Store the sequence length for the processed data
@@ -1366,7 +1423,7 @@ class REaLTabFormer:
 
         dataset_columns = ["input_ids", "labels"]
 
-        if field_weights is not None:
+        if field_weights is not None or chunk_significance_weights is not None:
             dataset_columns.append("token_weights")
 
         for split in dataset.keys():
