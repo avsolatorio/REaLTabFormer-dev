@@ -44,6 +44,7 @@ from .dataset import (  # noqa: F401
 )
 from .process import process_data  # noqa: F401
 from .transform import (  # noqa: F401
+    NumericTransformData,
     fix_multi_decimal,
     process_categorical_data,
     process_datetime_data,

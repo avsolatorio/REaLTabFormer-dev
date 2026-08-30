@@ -1,11 +1,41 @@
 import time
 import warnings
-from typing import Dict, Tuple
+from typing import Dict, Tuple, TypedDict
 
 import pandas as pd
 
 from .columns import encode_partition_numeric_col
 from .constants import INVALID_NUMS_RE, NUMERIC_NA_TOKEN
+
+
+class NumericTransformData(TypedDict, total=False):
+    """Documents the implicit fit/transform schema that
+    `process_numeric_data`/`process_datetime_data` build up in their
+    `transform_data` dict.
+
+    This is a pure static-typing aid -- at runtime it's still a plain
+    `dict`. `col_transform_data` (the outer `Dict[str, Dict]` keyed by
+    column name, built in `data_utils.process.process_data`) is dumped
+    verbatim as raw JSON by `REaLTabFormer.save()` and restored via a
+    generic `setattr` loop with no key remapping, so these literal key
+    names must not change without a compatibility plan for already-saved
+    models.
+
+    Keys are populated conditionally, hence `total=False`:
+    - `mx_sig`/`zfill` are set for values with no decimal point.
+    - `mx_sig`/`ljust` are set for values with a decimal point.
+    - `mean_date` is set only for datetime-derived columns.
+    - `numeric_nparts` is stamped by `process_data`, not by these
+      functions themselves.
+    """
+
+    max_len: int
+    numeric_precision: int
+    mx_sig: int
+    zfill: int
+    ljust: int
+    mean_date: int
+    numeric_nparts: int
 
 
 def fix_multi_decimal(v):
@@ -20,7 +50,7 @@ def process_numeric_data(
     max_len: int = 10,
     numeric_precision: int = 4,
     transform_data: Dict = None,
-) -> Tuple[pd.Series, Dict]:
+) -> Tuple[pd.Series, NumericTransformData]:
     is_transform = True
 
     if transform_data is None:
@@ -114,16 +144,17 @@ def process_numeric_data(
         series = series.str.ljust(ljust, "0")
 
     # If a number has a negative sign, make sure that it is placed properly.
-    series.loc[series.str.contains("-", regex=False)] = "-" + series.loc[
-        series.str.contains("-", regex=False)
-    ].str.replace("-", "", regex=False)
+    neg_mask = series.str.contains("-", regex=False)
+    series.loc[neg_mask] = "-" + series.loc[neg_mask].str.replace(
+        "-", "", regex=False
+    )
 
     return series, transform_data
 
 
 def process_datetime_data(
     series, transform_data: Dict = None
-) -> Tuple[pd.Series, Dict]:
+) -> Tuple[pd.Series, NumericTransformData]:
     # Get the max_len from the current time.
     # This will be ignored later if the actual max_len
     # is shorter.
