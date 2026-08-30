@@ -277,7 +277,12 @@ def _build_batch_with_column_types(
     for j, k in enumerate(columns):
         raw_values = example[k]
         if k in numeric_like_columns:
-            raw_values = decode_column_values(pd.Series(raw_values)).tolist()
+            # Left as a Series (not `.tolist()`'d back to a plain list):
+            # `_vectorized_column_token_ids` just wraps its `values` arg in
+            # `pd.Series(values)` right away, so handing it an existing
+            # Series skips a redundant list-materialize + Series-rebuild
+            # round trip.
+            raw_values = decode_column_values(pd.Series(raw_values))
         id_cols[:, j] = _vectorized_column_token_ids(
             raw_values, token2id, col_oov[k], rng
         )

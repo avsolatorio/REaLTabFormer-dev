@@ -161,19 +161,20 @@ def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
 
         # Pool numeric/datetime partition-column values into one shared
         # embedding range, but narrow `column_token_ids[col]` back down to
-        # each column's own observed values -- see docstring.
+        # each column's own observed values -- see docstring. Each
+        # column's decoded (prefix-stripped) values are computed once and
+        # reused for both the pooled concat and the per-column narrowing
+        # below, instead of decoding every column twice.
         if numeric_like_cols:
-            pooled_values = pd.concat(
-                [decode_column_values(df[c]) for c in numeric_like_cols],
-                ignore_index=True,
-            )
+            decoded_cols = {c: decode_column_values(df[c]) for c in numeric_like_cols}
+            pooled_values = pd.concat(decoded_cols.values(), ignore_index=True)
             unique_vals = sorted(pooled_values.unique())
             id2token.update(dict(enumerate(unique_vals, curr_id)))
             shared_token2id = {v: k for k, v in enumerate(unique_vals, curr_id)}
             curr_id += len(unique_vals)
 
             for c in numeric_like_cols:
-                own_vals = sorted(decode_column_values(df[c]).unique())
+                own_vals = sorted(decoded_cols[c].unique())
                 column_token_ids[c] = [shared_token2id[v] for v in own_vals]
 
         # Categorical columns: unchanged from build_vocab, one range each.
