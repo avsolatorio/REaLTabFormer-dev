@@ -89,6 +89,16 @@ def process_numeric_data(
         # the precision and not increase the precision.
         # So, we strip the right trailing zeros because the formatting
         # pads the series to the numeric_precision even when not needed.
+        #
+        # Deliberately left as a Python-level `.map(lambda)` rather than
+        # vectorized: there's no numpy/pandas primitive that reproduces
+        # this exact fixed-point formatting without the scientific-notation
+        # hazard `series.round(numeric_precision).astype(str)` has above --
+        # `numpy.format_float_positional`/`np.vectorize` don't remove the
+        # per-row Python call either, they just replace one Python-level
+        # formatter with another. This runs once per numeric/datetime
+        # *column* (small N), not per row x column, so the correctness
+        # risk isn't worth taking for a comparatively small win.
         series = series.map(lambda x: f"{x:.{numeric_precision}f}").str.rstrip("0")
 
     # Get the most significant digit
@@ -108,7 +118,7 @@ def process_numeric_data(
         if is_transform:
             zfill = transform_data["zfill"]
         else:
-            zfill = series.map(len).max()
+            zfill = series.str.len().max()
             transform_data["zfill"] = int(zfill)
         series = series.str.zfill(zfill)
     else:
@@ -129,6 +139,12 @@ def process_numeric_data(
         # determine that 1029.61 has the largest magnitude, with most significant
         # digit of 4. It will pad the value 4.269 with three zeros and convert it
         # to 0004.269.
+        #
+        # Deliberately left as a Python-level `.map(lambda)`: numpy has no
+        # ragged/variable-length string-repeat primitive, so a vectorized
+        # version would need to pad to a fixed width and slice instead --
+        # about the same cost with more code and edge-case risk. Same
+        # once-per-column (not per-row-x-column) scale argument as above.
         series = (mx_sig - series.str.find(".")).map(lambda x: "0" * x) + series
         series = series.str[:max_len]
 
@@ -138,7 +154,7 @@ def process_numeric_data(
         if is_transform:
             ljust = transform_data["ljust"]
         else:
-            ljust = series.map(len).max()
+            ljust = series.str.len().max()
             transform_data["ljust"] = int(ljust)
 
         series = series.str.ljust(ljust, "0")
@@ -220,7 +236,7 @@ def tokenize_numeric_col(series: pd.Series, nparts=2, col_zfill=2):
     # After normalizing the numeric values, we then segment
     # them based on a fixed partition size (nparts).
     col = series.name
-    max_len = series.map(len).min()
+    max_len = series.str.len().min()
 
     # Take the observations that have non-numeric characters.
     # These are NaNs.
@@ -231,7 +247,7 @@ def tokenize_numeric_col(series: pd.Series, nparts=2, col_zfill=2):
         raise ValueError(
             f"Partition size {nparts} is greater than the value length {max_len}. Consider reducing the number of partitions..."
         )
-    mx = series.map(len).max()
+    mx = series.str.len().max()
 
     tr = pd.concat([series.str[i : i + nparts] for i in range(0, mx, nparts)], axis=1)
 
