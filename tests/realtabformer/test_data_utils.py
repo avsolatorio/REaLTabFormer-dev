@@ -1,5 +1,6 @@
 import json
 import random
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -491,6 +492,71 @@ def test_build_vocab_duplicate_values_across_columns():
         "0___NUMERIC___colA": [0, 1, 2],
         "1___CATEGORICAL___colB": [3, 4, 5],
     }
+
+
+def _build_vocab_reference(df=None, special_tokens=None, add_columns=True):
+    # Pre-optimization reference implementation of build_vocab, using the
+    # original `max(id2token) + 1` recomputation instead of a running
+    # counter. Kept here (not shipped) purely to prove the O(1)-per-column
+    # optimization in data_utils/vocab.py is byte-identical, not just
+    # equivalent-in-effect.
+    id2token = {}
+    curr_id = 0
+    if special_tokens:
+        id2token.update(dict(enumerate(special_tokens)))
+        curr_id = max(id2token) + 1
+    column_token_ids = {}
+
+    if df is not None:
+        for col in df.columns:
+            id2token.update(dict(enumerate(sorted(df[col].unique()), curr_id)))
+            column_token_ids[col] = list(range(curr_id, max(id2token) + 1))
+            curr_id = max(id2token) + 1
+
+        if add_columns:
+            id2token.update(
+                dict(
+                    enumerate(
+                        [du.extract_processed_column(col) for col in df.columns], curr_id
+                    )
+                )
+            )
+            curr_id = max(id2token) + 1
+
+    token2id = {v: k for k, v in id2token.items()}
+    return dict(id2token=id2token, token2id=token2id, column_token_ids=column_token_ids)
+
+
+def test_build_vocab_running_counter_matches_reference_on_high_cardinality():
+    # Proves the running-counter optimization in build_vocab produces
+    # byte-identical output to the original max(id2token)-recomputation
+    # formula, on a dataframe with many columns and high-cardinality
+    # values -- the regime where the two formulas could plausibly diverge
+    # if the optimization were subtly wrong. Guards against vocab ids
+    # baked into already-trained models shifting.
+    rng = np.random.default_rng(1029)
+    n_cols = 12
+    ddf = pd.DataFrame({
+        f"{idx}___CATEGORICAL___col{idx}": [
+            f"val_{v}" for v in rng.integers(0, 500, size=200)
+        ]
+        for idx in range(n_cols)
+    })
+
+    for special_tokens, add_columns in [
+        (None, False),
+        (du.SpecialTokens.tokens(), True),
+        (du.SpecialTokens.tokens(), False),
+    ]:
+        expected = _build_vocab_reference(
+            ddf, special_tokens=special_tokens, add_columns=add_columns
+        )
+        actual = du.build_vocab(
+            ddf, special_tokens=special_tokens, add_columns=add_columns
+        )
+        assert actual["id2token"] == expected["id2token"]
+        assert actual["token2id"] == expected["token2id"]
+        assert actual["column_token_ids"] == expected["column_token_ids"]
 
 
 def test_get_input_ids_field_weights_and_predict_fields_snapshot():

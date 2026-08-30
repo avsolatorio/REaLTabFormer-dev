@@ -15,30 +15,29 @@ def build_vocab(df: pd.DataFrame = None, special_tokens=None, add_columns: bool 
         assert df.columns.str[0].str.isdigit().all()
 
     id2token = {}
+    # `curr_id` is tracked as a running counter incremented by exactly the
+    # number of ids assigned at each step, rather than recomputed via
+    # `max(id2token) + 1` (which rescans the whole, monotonically-growing
+    # dict every time -- O(vocab size) per call instead of O(1)). Since ids
+    # are always assigned contiguously starting from `curr_id` and never
+    # reused or removed, the two are algebraically identical.
     curr_id = 0
     if special_tokens:
         id2token.update(dict(enumerate(special_tokens)))
-        curr_id = max(id2token) + 1
+        curr_id = len(special_tokens)
     column_token_ids = {}
 
     if df is not None:
         for col in df.columns:
-            id2token.update(dict(enumerate(sorted(df[col].unique()), curr_id)))
-            column_token_ids[col] = list(range(curr_id, max(id2token) + 1))
-            curr_id = max(id2token) + 1
+            unique_vals = sorted(df[col].unique())
+            id2token.update(dict(enumerate(unique_vals, curr_id)))
+            column_token_ids[col] = list(range(curr_id, curr_id + len(unique_vals)))
+            curr_id += len(unique_vals)
 
         if add_columns:
-            id2token.update(
-                dict(
-                    enumerate(
-                        [extract_processed_column(col) for col in df.columns], curr_id
-                    )
-                )
-            )
-
-            # Add this here to prevent a semantic error in case we add another
-            # set of tokens later.
-            curr_id = max(id2token) + 1
+            col_labels = [extract_processed_column(col) for col in df.columns]
+            id2token.update(dict(enumerate(col_labels, curr_id)))
+            curr_id += len(col_labels)
 
     token2id = {v: k for k, v in id2token.items()}
 
