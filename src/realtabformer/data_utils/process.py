@@ -72,6 +72,53 @@ def _compute_column_index_prefixes(
     return {col: f"{str(i).zfill(num_cols)}" for i, col in enumerate(df.columns)}
 
 
+def _split_numeric_categorical_cols(
+    df: pd.DataFrame,
+    numeric_cols: pd.Index,
+    col_transform_data: Dict,
+    numeric_categorical_threshold: int,
+) -> pd.Index:
+    """Of `numeric_cols` (dtype-numeric columns), demote the ones that
+    should be tokenized as a single categorical value instead of
+    digit-chunked -- returns the subset that stays on the numeric
+    pipeline. A numeric column with only `K` distinct values has a hard
+    information ceiling of `log2(K)` bits; digit-chunking it still spends
+    several autoregressive generation steps (and gives the
+    entropy-weighting heuristic several *marginally* plausible-looking
+    but actually redundant positions -- see compute_chunk_significance_weights)
+    to represent something a single categorical token already captures
+    exactly, in one generation step.
+
+    The decision is made *once*, at first encounter, and frozen into
+    `col_transform_data[c]["treated_as_categorical"]` -- mirroring the
+    same "does `col_transform_data.get(c)` already exist?" first-time
+    check `_process_typed_columns` uses for its own transform data -- so
+    that later calls on a different (often much smaller -- a seed_input
+    can be a single row) slice of the same column always replay the
+    frozen decision instead of recomputing cardinality on data too small
+    for that to mean anything.
+    """
+    kept = []
+    for c in numeric_cols:
+        existing = col_transform_data.get(c)
+        if existing is not None:
+            if existing.get("treated_as_categorical", False):
+                continue
+            kept.append(c)
+            continue
+
+        if (
+            numeric_categorical_threshold is not None
+            and df[c].nunique() <= numeric_categorical_threshold
+        ):
+            col_transform_data[c] = {"treated_as_categorical": True}
+            continue
+
+        kept.append(c)
+
+    return pd.Index(kept)
+
+
 def _process_typed_columns(
     df: pd.DataFrame,
     cols,
@@ -196,6 +243,7 @@ def process_data(
     first_col_type=None,
     col_transform_data: Dict = None,
     target_col: str = None,
+    numeric_categorical_threshold: int = None,
 ) -> Tuple[pd.DataFrame, Dict, Dict[str, str]]:
     # This should receive a dataframe with dtypes that have already been
     # properly categorized between numeric and categorical.
@@ -223,6 +271,9 @@ def process_data(
 
     # Process numerical data
     numeric_cols = df.select_dtypes(include=np.number).columns
+    numeric_cols = _split_numeric_categorical_cols(
+        df, numeric_cols, col_transform_data, numeric_categorical_threshold
+    )
 
     col_name_to_transform_data: Dict[str, Dict] = dict()
 

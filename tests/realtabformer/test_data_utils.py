@@ -1138,3 +1138,67 @@ def test_chunk_significance_composes_multiplicatively_with_field_weights():
     price_idx = pr_df.columns.tolist().index(price_col) + 1  # +1 for BOS
     expected = 3.0 * vocab["chunk_significance_weights"][price_col]
     assert abs(row["token_weights"][price_idx] - expected) < 1e-9
+
+
+# --- numeric_categorical_threshold: cardinality-aware numeric dispatch -----
+
+
+def _bedrooms_price_df(n=200, seed=0):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame({
+        "bedrooms": rng.choice([1, 2, 3, 4, 5], size=n, p=[0.05, 0.30, 0.35, 0.20, 0.10]),
+        "price": rng.integers(100000, 999999, size=n).astype(float),
+        "gender": rng.choice(["m", "f"], size=n),
+    })
+
+
+def test_numeric_categorical_threshold_default_off_unchanged():
+    df = _bedrooms_price_df()
+    pr_off, _, _ = du.process_data(
+        df, numeric_max_len=8, numeric_precision=0, numeric_nparts=1
+    )
+    bedroom_cols = [c for c in pr_off.columns if "bedrooms" in c]
+    assert du.is_numeric_col(bedroom_cols[0])
+
+
+def test_numeric_categorical_threshold_demotes_low_cardinality_column():
+    df = _bedrooms_price_df()
+    pr_on, ctd_on, _ = du.process_data(
+        df, numeric_max_len=8, numeric_precision=0, numeric_nparts=1,
+        numeric_categorical_threshold=10,
+    )
+    bedroom_cols = [c for c in pr_on.columns if "bedrooms" in c]
+    price_cols = [c for c in pr_on.columns if "price" in c]
+
+    assert len(bedroom_cols) == 1
+    assert du.is_categorical_col(bedroom_cols[0])
+    assert ctd_on["bedrooms"] == {"treated_as_categorical": True}
+
+    # High-cardinality "price" is unaffected: still digit-chunked, still
+    # tagged numeric.
+    assert len(price_cols) > 1
+    assert all(du.is_numeric_col(c) for c in price_cols)
+
+
+def test_numeric_categorical_threshold_decision_frozen_and_replayed():
+    # The decision is made once at fit time and must be *replayed*, not
+    # recomputed, on a later call with a much smaller slice of the same
+    # column (e.g. a seed_input that could be a single row) -- cardinality
+    # computed fresh on 1 row would be meaningless.
+    df = _bedrooms_price_df()
+    _, ctd, _ = du.process_data(
+        df, numeric_max_len=8, numeric_precision=0, numeric_nparts=1,
+        numeric_categorical_threshold=10,
+    )
+
+    seed = df.iloc[[0]][["bedrooms"]]
+    # No threshold passed at all on replay -- must still come out categorical.
+    seed_pr, _, _ = du.process_data(seed, col_transform_data=ctd)
+    assert du.is_categorical_col(seed_pr.columns.tolist()[0])
+
+    # A threshold passed at replay time must be ignored -- the frozen
+    # fit-time decision always wins.
+    seed_pr2, _, _ = du.process_data(
+        seed, col_transform_data=ctd, numeric_categorical_threshold=0
+    )
+    assert du.is_categorical_col(seed_pr2.columns.tolist()[0])

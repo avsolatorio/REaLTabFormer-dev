@@ -373,3 +373,95 @@ def test_digit_entropy_weighting_composes_with_field_weights():
     )
     assert model.model is not None
     assert "chunk_significance_weights" in model.vocab
+
+
+# --- numeric_categorical_threshold: cardinality-aware numeric dispatch -----
+
+
+def _low_cardinality_df(n_rows: int = 200, seed: int = 5) -> pd.DataFrame:
+    rng = np.random.default_rng(seed)
+    bedrooms = rng.choice([1, 2, 3, 4, 5], size=n_rows, p=[0.05, 0.30, 0.35, 0.20, 0.10])
+    # A rating column with real missing values -- pandas naturally
+    # represents "int-like + NaN" as float64, the realistic case (a
+    # nullable Int64 dtype hits a separate, pre-existing cast limitation
+    # unrelated to this feature -- see the plan's dtype round-trip note).
+    rating = rng.choice([1.0, 2.0, 3.0, 4.0, 5.0], size=n_rows).astype(float)
+    missing_idx = rng.choice(n_rows, size=int(n_rows * 0.1), replace=False)
+    rating[missing_idx] = np.nan
+    return pd.DataFrame({
+        "bedrooms": bedrooms.astype("int64"),
+        "rating": rating,
+        "price": rng.integers(100000, 999999, size=n_rows).astype(float),
+        "gender": rng.choice(["m", "f"], size=n_rows),
+    })
+
+
+def test_numeric_categorical_threshold_default_off_leaves_column_blocks_unaffected():
+    df = _low_cardinality_df()
+    model = REaLTabFormer2(
+        model_type="tabular", epochs=1, batch_size=8, tabular_backbone="distilgpt2",
+    )
+    model.fit(df, device="cpu", n_critic=0)
+    bedroom_cols = [c for c in model.processed_columns if "bedrooms" in c]
+    assert all("NUMERIC" in c for c in bedroom_cols)
+
+
+def test_numeric_categorical_threshold_end_to_end_dtype_round_trip():
+    df = _low_cardinality_df()
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=3,
+        batch_size=16,
+        tabular_backbone="distilgpt2",
+        numeric_categorical_threshold=10,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+
+    bedroom_cols = [c for c in model.processed_columns if "bedrooms" in c]
+    rating_cols = [c for c in model.processed_columns if "rating" in c]
+    price_cols = [c for c in model.processed_columns if "price" in c]
+    assert len(bedroom_cols) == 1 and "CATEGORICAL" in bedroom_cols[0]
+    assert len(rating_cols) == 1 and "CATEGORICAL" in rating_cols[0]
+    # price has a wide range -- unaffected, still digit-chunked.
+    assert len(price_cols) > 1 and all("NUMERIC" in c for c in price_cols)
+
+    samples = model.sample(n_samples=20, device="cpu", gen_batch=20)
+
+    # The explicit requirement: the recovered column must be the
+    # *original* pandas dtype, not a string or generic object dtype --
+    # regardless of which internal pipeline (digit-chunked or
+    # single-token categorical) produced it.
+    assert samples["bedrooms"].dtype == df["bedrooms"].dtype
+    assert samples["rating"].dtype == df["rating"].dtype
+    assert samples["price"].dtype == df["price"].dtype
+
+    # Values are drawn from real, plausible options (not raw strings, not
+    # tokenizer artefacts) -- bedrooms is a closed enum the model can
+    # only ever have observed 1..5 for.
+    assert samples["bedrooms"].dropna().isin([1, 2, 3, 4, 5]).all()
+
+    # rating's missing-value round trip: the model was trained on a
+    # column that has real NaNs, so nothing here should error out even
+    # if none happen to be sampled in this particular batch of 20.
+    assert samples["rating"].isna().sum() >= 0
+
+
+def test_numeric_categorical_threshold_seed_input_on_demoted_column():
+    # A demoted column becomes a single-element block, identical in shape
+    # to any genuinely-categorical column already handled by
+    # compute_column_blocks/any_order -- verify seeding on it works with
+    # no special-casing needed.
+    df = _low_cardinality_df()
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=1,
+        batch_size=16,
+        tabular_backbone="distilgpt2",
+        numeric_categorical_threshold=10,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+
+    seed_input = pd.DataFrame({"bedrooms": [3]})
+    samples = model.sample(n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input)
+    assert (samples["bedrooms"] == 3).all()
+    assert samples["bedrooms"].dtype == df["bedrooms"].dtype

@@ -179,6 +179,7 @@ class REaLTabFormer2:
         numeric_nparts: int = 1,
         numeric_precision: int = 4,
         numeric_max_len: int = 10,
+        numeric_categorical_threshold: Optional[int] = None,
         grokfast_args: Optional[Dict[str, Any]] = None,
         shared_numeric_vocab: bool = False,
         any_order: bool = False,
@@ -222,6 +223,16 @@ class REaLTabFormer2:
                 https://huggingface.co/docs/transformers/main_classes/callback#transformers.EarlyStoppingCallback.early_stopping_threshold(float,
             mask_rate: The rate of tokens in the transformed observation that will be replaced
                 with the [RMASK] token for regularization during training.
+            numeric_categorical_threshold: If set, a numeric/datetime column with at most this
+                many distinct values is tokenized as a single categorical token instead of being
+                digit-chunked -- a column with `K` distinct values has a hard information ceiling
+                of `log2(K)` bits, and digit-chunking still spends several generation steps (and,
+                under `digit_entropy_weighting`, several positions whose *marginal* entropy looks
+                fine but is actually mutually redundant) to represent something a single token
+                already captures exactly, in one generation step. The decision is made once at
+                fit time per column and frozen (not re-evaluated against a seed_input's smaller
+                slice of the data). `None` (default) preserves today's dtype-only routing. Tabular
+                only for now -- not threaded through relational fitting.
             shared_numeric_vocab: Beta. Tabular-only. If True, numeric/datetime partition
                 columns share one pooled value vocabulary (the same digit chunk in two
                 different numeric columns maps to the same token id) instead of each column
@@ -408,6 +419,7 @@ class REaLTabFormer2:
         self.numeric_nparts = numeric_nparts
         self.numeric_precision = numeric_precision
         self.numeric_max_len = numeric_max_len
+        self.numeric_categorical_threshold = numeric_categorical_threshold
 
         # A unique identifier for the experiment set after the
         # model is trained.
@@ -1522,6 +1534,7 @@ class REaLTabFormer2:
             numeric_precision=self.numeric_precision,
             numeric_nparts=self.numeric_nparts,
             target_col=self.target_col,
+            numeric_categorical_threshold=self.numeric_categorical_threshold,
         )
         self.processed_columns = df.columns.to_list()
         if self.any_order:

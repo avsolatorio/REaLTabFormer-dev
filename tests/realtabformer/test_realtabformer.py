@@ -271,3 +271,45 @@ def test_digit_entropy_weighting_end_to_end_favors_high_entropy_chunk():
     samples = model.sample(n_samples=5, device="cpu")
     assert len(samples) == 5
     assert list(samples.columns) == list(df.columns)
+
+
+# --- numeric_categorical_threshold: cardinality-aware numeric dispatch -----
+
+
+def test_numeric_categorical_threshold_end_to_end_dtype_round_trip():
+    rng = np.random.default_rng(9)
+    n = 200
+    bedrooms = rng.choice([1, 2, 3, 4, 5], size=n, p=[0.05, 0.30, 0.35, 0.20, 0.10])
+    rating = rng.choice([1.0, 2.0, 3.0, 4.0, 5.0], size=n).astype(float)
+    missing_idx = rng.choice(n, size=int(n * 0.1), replace=False)
+    rating[missing_idx] = np.nan
+    df = pd.DataFrame({
+        "bedrooms": bedrooms.astype("int64"),
+        "rating": rating,
+        "price": rng.integers(100000, 999999, size=n).astype(float),
+        "gender": rng.choice(["m", "f"], size=n),
+    })
+
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=3,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        numeric_categorical_threshold=10,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+
+    bedroom_cols = [c for c in model.processed_columns if "bedrooms" in c]
+    price_cols = [c for c in model.processed_columns if "price" in c]
+    assert len(bedroom_cols) == 1 and "CATEGORICAL" in bedroom_cols[0]
+    assert len(price_cols) > 1 and all("NUMERIC" in c for c in price_cols)
+
+    samples = model.sample(n_samples=20, device="cpu")
+
+    # Explicit requirement: the recovered dtype must match the original
+    # input column's dtype exactly, regardless of which internal pipeline
+    # produced it.
+    assert samples["bedrooms"].dtype == df["bedrooms"].dtype
+    assert samples["rating"].dtype == df["rating"].dtype
+    assert samples["price"].dtype == df["price"].dtype
+    assert samples["bedrooms"].dropna().isin([1, 2, 3, 4, 5]).all()
