@@ -33,6 +33,104 @@ def get_token_id(
     return token_id
 
 
+def _field_weight(col_name: str, field_weights: Optional[Dict[str, float]]) -> float:
+    if field_weights is None:
+        return 1.0
+    for wk, wv in field_weights.items():
+        if col_name.startswith(wk):
+            return float(wv)
+    return 1.0
+
+
+def _is_predict_field(col_name: str, predict_fields: Optional[List[str]]) -> bool:
+    if predict_fields is None:
+        # If no predict fields are specified, all fields are considered as predict fields for prediction.
+        return True
+    for pf in predict_fields:
+        if col_name.startswith(pf):
+            return True
+    return False
+
+
+def _build_one_row(
+    i: int,
+    example: Dict[str, Any],
+    columns: List[str],
+    token2id: Dict[str, int],
+    col_oov: Dict[str, List[int]],
+    bos_id: int,
+    eos_id: int,
+    sptype_id: int,
+    mask_rate: float,
+    return_label_ids: bool,
+    return_token_type_ids: bool,
+    affix_bos: bool,
+    affix_eos: bool,
+    field_weights: Optional[Dict[str, float]],
+    predict_fields: Optional[List[str]],
+    batched: bool,
+) -> Dict[str, Any]:
+    """
+    Build features for a single row at index i (works for batched inputs),
+    or for the non-batched case i is ignored and values are scalars.
+    """
+    input_ids: List[int] = []
+    token_weights: List[float] = []
+    token_type_ids: List[int] = []
+    label_ids: List[int] = []
+
+    if affix_bos:
+        input_ids.append(bos_id)
+        label_ids.append(bos_id)
+        if return_token_type_ids:
+            token_type_ids.append(sptype_id)
+        if field_weights is not None:
+            token_weights.append(1.0)
+
+    for k in columns:
+        val = example[k][i] if batched else example[k]
+        tid = get_token_id(
+            val,
+            token2id,
+            oov_options=col_oov[k],
+            mask_rate=mask_rate,
+        )
+        input_ids.append(tid)
+
+        if _is_predict_field(k, predict_fields):
+            label_ids.append(tid)
+        else:
+            label_ids.append(-100)
+
+        if return_token_type_ids:
+            col_name = decode_processed_column(k)
+            token_type_ids.append(token2id[col_name])
+        if field_weights is not None:
+            token_weights.append(_field_weight(k, field_weights))
+
+    if affix_eos:
+        input_ids.append(eos_id)
+        label_ids.append(eos_id)
+        if return_token_type_ids:
+            token_type_ids.append(sptype_id)
+        if field_weights is not None:
+            token_weights.append(1.0)
+
+    out: Dict[str, Any] = {"input_ids": input_ids}
+
+    if return_label_ids:
+        # copy so labels can't be mutated if input_ids changes later
+        out["label_ids"] = label_ids
+
+    if return_token_type_ids:
+        out["token_type_ids"] = token_type_ids
+
+    if field_weights is not None:
+        out["token_weights"] = token_weights
+
+    return out
+
+
 def get_input_ids(
     example: Dict[str, Any],
     vocab: Dict,
@@ -53,98 +151,34 @@ def get_input_ids(
     token2id = vocab["token2id"]
     col_oov = vocab["column_token_ids"]
 
-    bos_id = token2id[SpecialTokens.BOS]
-    eos_id = token2id[SpecialTokens.EOS]
-    sptype_id = token2id[SpecialTokens.SPTYPE]
-
-    def _field_weight(col_name: str) -> float:
-        if field_weights is None:
-            return 1.0
-        for wk, wv in field_weights.items():
-            if col_name.startswith(wk):
-                return float(wv)
-        return 1.0
-
-    def _is_predict_field(col_name: str) -> bool:
-        if predict_fields is None:
-            # If no predict fields are specified, all fields are considered as predict fields for prediction.
-            return True
-        for pf in predict_fields:
-            if col_name.startswith(pf):
-                return True
-        return False
-
-    def _build_one_row(i: int) -> Dict[str, Any]:
-        """
-        Build features for a single row at index i (works for batched inputs),
-        or for the non-batched case i is ignored and values are scalars.
-        """
-        input_ids: List[int] = []
-        token_weights: List[float] = []
-        token_type_ids: List[int] = []
-        label_ids: List[int] = []
-
-        if affix_bos:
-            input_ids.append(bos_id)
-            label_ids.append(bos_id)
-            if return_token_type_ids:
-                token_type_ids.append(sptype_id)
-            if field_weights is not None:
-                token_weights.append(1.0)
-
-        for k in columns:
-            val = example[k][i] if batched else example[k]
-            tid = get_token_id(
-                val,
-                token2id,
-                oov_options=col_oov[k],
-                mask_rate=mask_rate,
-            )
-            input_ids.append(tid)
-
-            if _is_predict_field(k):
-                label_ids.append(tid)
-            else:
-                label_ids.append(-100)
-
-            if return_token_type_ids:
-                col_name = decode_processed_column(k)
-                token_type_ids.append(vocab["token2id"][col_name])
-            if field_weights is not None:
-                token_weights.append(_field_weight(k))
-
-        if affix_eos:
-            input_ids.append(eos_id)
-            label_ids.append(eos_id)
-            if return_token_type_ids:
-                token_type_ids.append(sptype_id)
-            if field_weights is not None:
-                token_weights.append(1.0)
-
-        out: Dict[str, Any] = {"input_ids": input_ids}
-
-        if return_label_ids:
-            # copy so labels can't be mutated if input_ids changes later
-            out["label_ids"] = label_ids
-
-        if return_token_type_ids:
-            out["token_type_ids"] = token_type_ids
-
-        if field_weights is not None:
-            out["token_weights"] = token_weights
-
-        return out
+    row_kwargs = dict(
+        example=example,
+        columns=columns,
+        token2id=token2id,
+        col_oov=col_oov,
+        bos_id=token2id[SpecialTokens.BOS],
+        eos_id=token2id[SpecialTokens.EOS],
+        sptype_id=token2id[SpecialTokens.SPTYPE],
+        mask_rate=mask_rate,
+        return_label_ids=return_label_ids,
+        return_token_type_ids=return_token_type_ids,
+        affix_bos=affix_bos,
+        affix_eos=affix_eos,
+        field_weights=field_weights,
+        predict_fields=predict_fields,
+        batched=batched,
+    )
 
     # --- Non-batched path: return single example dict with flat lists ---
     if not batched:
-        return _build_one_row(i=0)
+        return _build_one_row(i=0, **row_kwargs)
 
     # --- Batched path: example[k] is a list; return list-of-list per key ---
     # Infer batch size from the first column
     first_col = columns[0]
     B = len(example[first_col])
 
-    rows = [_build_one_row(i) for i in range(B)]
+    rows = [_build_one_row(i, **row_kwargs) for i in range(B)]
 
     batched_out: Dict[str, Any] = {
         "input_ids": [r["input_ids"] for r in rows],
