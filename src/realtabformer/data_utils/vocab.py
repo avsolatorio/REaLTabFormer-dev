@@ -70,26 +70,50 @@ def _original_column_name(processed_col: str) -> str:
 
 
 def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
-    """Like `build_vocab`, but pools numeric/datetime partition-column
-    values into one shared token range instead of giving every processed
-    column its own -- so the same digit chunk in two different numeric
-    columns maps to the same token id -- and additionally returns
-    `column_type_ids`, mapping each processed column to a token id
-    representing its *original* (pre-partition) column identity, with
-    every partition sub-column of the same original column sharing one id.
-    Intended for REaLTabFormerV2's `token_type_ids`-based column-identity
-    embedding (added on top of the value token's own embedding, reusing
-    the same embedding table -- GPT2-family models compute
-    `token_type_embeds = self.wte(token_type_ids)`, the same `wte` used
-    for `input_ids`, so these ids must be valid vocab indices, not a
-    separate small id space).
+    """Like `build_vocab`, but the *embedding space* (`id2token`/`token2id`)
+    for numeric/datetime partition columns is pooled -- shared across all
+    of them, instead of every processed column getting its own -- so the
+    same digit chunk in two different numeric columns maps to the same
+    token id, and the underlying `wte` row (and therefore anything learned
+    about that digit chunk) is shared and updated by every column that
+    uses it. Additionally returns `column_type_ids`, mapping each
+    processed column to a token id representing its *original*
+    (pre-partition) column identity, with every partition sub-column of
+    the same original column sharing one id. Intended for
+    REaLTabFormerV2's `token_type_ids`-based column-identity embedding
+    (added on top of the value token's own embedding, reusing the same
+    embedding table -- GPT2-family models compute `token_type_embeds =
+    self.wte(token_type_ids)`, the same `wte` used for `input_ids`, so
+    these ids must be valid vocab indices, not a separate small id space).
+
+    Crucially, `column_token_ids[col]` -- the set `_prefix_allowed_tokens_fn`
+    (rtf_sampler.py) masks generation down to at each column's position,
+    and the OOV-fallback pool `get_token_id`/`_vectorized_column_token_ids`
+    draw from at training time -- is **not** the full pooled/shared range.
+    It's narrowed back down to only the ids for values that specific
+    column actually observed, looked up in the shared `token2id`. Sharing
+    the embedding *space* and constraining the *allowed set per position*
+    are independent concerns: the former is what gives the transfer-
+    learning/smaller-vocab benefit (training-time), the latter is what
+    gives the hard per-column range guarantee constrained decoding relies
+    on (generation-time) -- pooling both together would let `price`'s
+    position emit any digit chunk ever seen by *any* numeric/datetime
+    column (including a different partition position of `price` itself,
+    e.g. its own trailing-digit chunk leaking into its leading-digit
+    chunk's allowed set), silently widening every numeric column's
+    generation range to the union of all of them. Narrowing
+    `column_token_ids` back to per-column keeps the range exactly as
+    strict as `build_vocab`'s, with no other change needed anywhere else
+    in the pipeline -- everything downstream (constrained decoding, OOV
+    fallback, `realtabformer2.py`'s `col_idx_ids`) already reads
+    `column_token_ids` generically, unaware of how it was built.
 
     Values are pooled on their *raw*, column-prefix-stripped form
     (`decode_column_values`): `process_data`'s final step
     (`encode_column_values`) bakes the owning column's name onto the
     front of every cell value, so pooling the as-is (prefixed) strings
-    would never actually collide across columns and this function would
-    be a no-op.
+    would never actually collide across columns and the shared embedding
+    space would be a no-op.
 
     Categorical columns are intentionally NOT pooled (kept one token
     range per column, same as `build_vocab`) -- a coincidental string
@@ -135,7 +159,9 @@ def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
         ]
         categorical_cols = [c for c in df.columns if c not in numeric_like_cols]
 
-        # Pool numeric/datetime partition-column values into one shared range.
+        # Pool numeric/datetime partition-column values into one shared
+        # embedding range, but narrow `column_token_ids[col]` back down to
+        # each column's own observed values -- see docstring.
         if numeric_like_cols:
             pooled_values = pd.concat(
                 [decode_column_values(df[c]) for c in numeric_like_cols],
@@ -143,10 +169,12 @@ def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
             )
             unique_vals = sorted(pooled_values.unique())
             id2token.update(dict(enumerate(unique_vals, curr_id)))
-            shared_range = list(range(curr_id, curr_id + len(unique_vals)))
-            for c in numeric_like_cols:
-                column_token_ids[c] = shared_range
+            shared_token2id = {v: k for k, v in enumerate(unique_vals, curr_id)}
             curr_id += len(unique_vals)
+
+            for c in numeric_like_cols:
+                own_vals = sorted(decode_column_values(df[c]).unique())
+                column_token_ids[c] = [shared_token2id[v] for v in own_vals]
 
         # Categorical columns: unchanged from build_vocab, one range each.
         for c in categorical_cols:

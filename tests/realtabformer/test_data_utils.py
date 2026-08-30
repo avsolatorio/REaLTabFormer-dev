@@ -790,9 +790,14 @@ def test_make_dataset_end_to_end_with_seed_matches_manual_vectorized_call():
 # build_vocab/make_dataset are untouched by any of this.
 
 def test_build_pooled_vocab_shares_tokens_across_numeric_columns():
-    # The whole point of this function: the same digit chunk in two
-    # different numeric columns must map to the SAME token id, unlike
-    # build_vocab where every column gets its own disjoint range.
+    # The point of this function: the same digit chunk in two different
+    # numeric columns must map to the SAME token id in the shared
+    # embedding space (id2token/token2id), unlike build_vocab where every
+    # column gets its own disjoint range with no relation between
+    # identical values. But `column_token_ids` -- the set generation is
+    # constrained to at each column's position -- must stay narrowed to
+    # each column's own observed values, not the full shared range (see
+    # test_build_pooled_vocab_preserves_per_column_range_guarantee).
     raw_df = pd.DataFrame({
         "price": [10.5, 20.3, 30.1, 40.9],
         "age": [10.5, 20.3, 5.0, 99.0],  # shares "10", "20" with price
@@ -807,17 +812,69 @@ def test_build_pooled_vocab_shares_tokens_across_numeric_columns():
     age_00 = [c for c in pr_df.columns if c.endswith("age_00")][0]
     gender_col = [c for c in pr_df.columns if c.endswith("gender")][0]
 
-    # price_00/age_00 (both numeric) share the exact same token range.
-    assert vocab["column_token_ids"][price_00] == vocab["column_token_ids"][age_00]
+    # price_00 observed {"10","20","30","40"}, age_00 observed
+    # {"10","20","05","99"} -- different sets, so their narrowed allowed
+    # ids must differ (price_00 must not be able to emit age_00's "99",
+    # and vice versa).
+    assert set(vocab["column_token_ids"][price_00]) != set(vocab["column_token_ids"][age_00])
     # categorical stays on its own, separate range.
     assert vocab["column_token_ids"][gender_col] != vocab["column_token_ids"][price_00]
 
     # Row 0: price=10.5 -> price_00="10"; age=10.5 -> age_00="10" (same
-    # raw digit chunk). Confirm they resolve to the identical token id.
+    # raw digit chunk). Confirm they resolve to the identical token id --
+    # the shared embedding space is preserved despite the narrowing.
     ds = du.make_dataset_with_column_types(pr_df, vocab, mask_rate=0)
     price_00_idx = list(pr_df.columns).index(price_00) + 1  # +1 for BOS
     age_00_idx = list(pr_df.columns).index(age_00) + 1
-    assert ds[0]["input_ids"][price_00_idx] == ds[0]["input_ids"][age_00_idx]
+    shared_id = ds[0]["input_ids"][price_00_idx]
+    assert shared_id == ds[0]["input_ids"][age_00_idx]
+
+    # And that shared id is a member of both columns' own narrowed
+    # allowed sets -- the narrowing didn't drop a value either column
+    # actually needs to be able to encode.
+    assert shared_id in vocab["column_token_ids"][price_00]
+    assert shared_id in vocab["column_token_ids"][age_00]
+
+
+def test_build_pooled_vocab_preserves_per_column_range_guarantee():
+    # Pooling the embedding space must NOT widen any column's *allowed*
+    # value range beyond what build_vocab (unpooled) allows for the same
+    # data -- that would break the hard per-column range guarantee that
+    # constrained decoding (rtf_sampler._prefix_allowed_tokens_fn) and the
+    # OOV fallback (get_token_id / _vectorized_column_token_ids) both rely
+    # on `column_token_ids` for. This also guards against leakage across
+    # partition positions of the *same* original column (e.g. a narrow
+    # leading-digit chunk range polluted by a wide trailing-digit chunk
+    # range from the same column).
+    raw_df = pd.DataFrame({
+        "big_value": list(range(9000, 9010)),
+        "small_value": [1, 2, 3, 4, 5, 6, 7, 8, 1, 2],
+    })
+    pr_df, _, _ = du.process_data(
+        raw_df, numeric_max_len=6, numeric_precision=0, numeric_nparts=2
+    )
+
+    unpooled = du.build_vocab(
+        pr_df, special_tokens=du.SpecialTokens.tokens(), add_columns=False
+    )
+    pooled = du.build_pooled_vocab(pr_df, special_tokens=du.SpecialTokens.tokens())
+
+    for col in pr_df.columns:
+        # build_vocab's id2token entries are still column-prefixed
+        # (encode_column_values bakes the prefix on before either
+        # function sees the data); build_pooled_vocab's numeric entries
+        # are prefix-stripped (decode_column_values). Compare on the
+        # decoded raw value so both sides are on equal footing.
+        unpooled_allowed = {
+            du.decode_column_values(
+                pd.Series([unpooled["id2token"][i]])
+            ).iloc[0]
+            for i in unpooled["column_token_ids"][col]
+        }
+        pooled_allowed = {
+            pooled["id2token"][i] for i in pooled["column_token_ids"][col]
+        }
+        assert pooled_allowed == unpooled_allowed, col
 
 
 def test_build_pooled_vocab_column_type_ids_group_partitions():
