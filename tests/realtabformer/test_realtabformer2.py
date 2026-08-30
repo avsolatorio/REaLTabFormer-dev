@@ -96,3 +96,44 @@ def test_shared_numeric_vocab_end_to_end_fit_and_sample():
     # this is the entire point of the feature, not just "didn't crash".
     assert pooled_model.tabular_config.vocab_size < unpooled_model.tabular_config.vocab_size
     assert not hasattr(unpooled_model, "col_type_ids_seq")
+
+
+def test_shared_numeric_vocab_seed_input_preserves_numeric_value():
+    # Regression test: `_process_seed_input` (rtf_sampler.py) used to
+    # unconditionally tokenize seed values with `make_dataset`, which
+    # looks up the still column-prefixed value in a vocab keyed on the
+    # prefix-*stripped* value for pooled numeric/datetime columns (see
+    # `build_pooled_vocab`). That lookup always missed for
+    # shared_numeric_vocab=True models, silently falling back to a
+    # *random* token from the column's own vocabulary -- so every
+    # numeric/datetime seed value was replaced with noise, no matter how
+    # common that exact value was in training. Fixed by routing pooled-
+    # vocab models through `make_dataset_with_column_types` instead,
+    # which applies the same prefix-stripping vocab lookup used at
+    # training time.
+    df = _tiny_df(n_rows=60, seed=7)
+    # Use a distinct, easy-to-verify integer price so any corruption in
+    # the digit-chunk tokens is unambiguous (not just a rounding quirk).
+    df["price"] = np.random.default_rng(7).integers(1000, 9999, size=len(df)).astype(float)
+
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=1,
+        batch_size=8,
+        tabular_backbone="distilgpt2",
+        shared_numeric_vocab=True,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+
+    # Seed with an *actual* training-set value -- guaranteed to be
+    # in-vocabulary, so any mismatch can only be a tokenization bug, not
+    # legitimate OOV handling for an unseen value.
+    seed_price = float(df["price"].iloc[0])
+    seed_input = pd.DataFrame({"price": [seed_price]})
+
+    samples = model.sample(n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input)
+
+    assert (samples["price"] == seed_price).all(), (
+        f"seed_input price={seed_price} was not preserved in generated "
+        f"samples: {samples['price'].tolist()}"
+    )

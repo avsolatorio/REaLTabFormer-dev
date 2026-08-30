@@ -27,6 +27,7 @@ from .data_utils import (
     is_numeric_col,
     is_numeric_datetime_col,
     make_dataset,
+    make_dataset_with_column_types,
     process_data,
 )
 from .rtf_exceptions import SampleEmptyError, SampleEmptyLimitError
@@ -634,13 +635,37 @@ class TabularSampler(REaLSampler):
         seed_data, _, _ = process_data(
             df=seed_input, col_transform_data=self.col_transform_data
         )
-        seed_data = make_dataset(
-            seed_data,
-            self.vocab,
-            mask_rate=0,
-            affix_eos=False,
-            seed=self.random_state,
-        )
+
+        if self.col_type_ids_seq is not None:
+            # REaLTabFormerV2-only, beta (`shared_numeric_vocab`): `self.vocab`
+            # came from `build_pooled_vocab`, whose numeric/datetime columns
+            # are keyed on the column-prefix-*stripped* raw value (see that
+            # function's docstring), not the still-prefixed value every raw
+            # cell actually holds. `make_dataset` (v1's tokenizer) looks up
+            # the still-prefixed value directly, which never matches for
+            # those columns -- silently falling through to the OOV-fallback
+            # path (a *random* token from that column's own vocabulary) for
+            # every numeric/datetime seed value, no matter how common that
+            # exact value was in training. `make_dataset_with_column_types`
+            # applies the same column-prefix-stripping
+            # (`decode_column_values`) before the token2id lookup that
+            # `build_pooled_vocab`/training already do, so seed values
+            # resolve to their real tokens instead of noise.
+            seed_data = make_dataset_with_column_types(
+                seed_data,
+                self.vocab,
+                mask_rate=0,
+                affix_eos=False,
+                seed=self.random_state,
+            )
+        else:
+            seed_data = make_dataset(
+                seed_data,
+                self.vocab,
+                mask_rate=0,
+                affix_eos=False,
+                seed=self.random_state,
+            )
 
         generated = torch.tensor(seed_data["input_ids"])
 
