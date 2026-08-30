@@ -8,7 +8,12 @@ import numpy as np
 import pandas as pd
 from datasets import Dataset
 
-from .columns import decode_processed_column
+from .columns import (
+    decode_column_values,
+    decode_processed_column,
+    is_datetime_col,
+    is_numeric_col,
+)
 from .constants import SpecialTokens
 
 
@@ -223,6 +228,178 @@ def _build_batch(
         out["token_weights"] = _affix(weight_cols, 1.0, 1.0).tolist()
 
     return out
+
+
+def _build_batch_with_column_types(
+    example: Dict[str, Any],
+    columns: List[str],
+    token2id: Dict[str, int],
+    col_oov: Dict[str, List[int]],
+    column_type_ids: Dict[str, int],
+    numeric_like_columns: set,
+    bos_id: int,
+    eos_id: int,
+    sptype_id: int,
+    mask_rate: float,
+    return_label_ids: bool,
+    affix_bos: bool,
+    affix_eos: bool,
+    field_weights: Optional[Dict[str, float]],
+    predict_fields: Optional[List[str]],
+    rng: np.random.Generator,
+) -> Dict[str, Any]:
+    """REaLTabFormerV2-only variant of `_build_batch` that additionally
+    emits `token_type_ids`, one id per column representing that column's
+    *original* (pre-partition) identity (see `vocab.build_pooled_vocab`),
+    broadcast across rows the same way `token_weights` already is --
+    O(columns) work, not O(rows x columns), so this doesn't reintroduce
+    the per-row Python loop the vectorization work removed.
+
+    Reuses `_vectorized_column_token_ids`/`_is_predict_field`/
+    `_field_weight` unchanged. `_build_batch` (v1's function, used by
+    `get_input_ids`/`make_dataset`) is not modified or called here --
+    this is a parallel, standalone implementation so v1's tested path
+    stays exactly as it is.
+
+    `column_type_ids`'s vocab comes from `build_pooled_vocab`, whose
+    numeric/datetime-like columns share one *pooled* value range keyed on
+    the column-prefix-*stripped* raw value (see that function's
+    docstring) -- so, unlike `_build_batch`, the raw values for those
+    columns must be de-prefixed (`decode_column_values`) before the
+    token2id lookup, or every value would still be a distinct string per
+    column by construction and pooling would be a no-op.
+    """
+    n_cols = len(columns)
+    batch_size = len(example[columns[0]])
+
+    id_cols = np.empty((batch_size, n_cols), dtype=np.int64)
+    type_cols = np.empty((batch_size, n_cols), dtype=np.int64)
+    for j, k in enumerate(columns):
+        raw_values = example[k]
+        if k in numeric_like_columns:
+            raw_values = decode_column_values(pd.Series(raw_values)).tolist()
+        id_cols[:, j] = _vectorized_column_token_ids(
+            raw_values, token2id, col_oov[k], rng
+        )
+        type_cols[:, j] = column_type_ids[k]
+
+    if mask_rate > 0:
+        rmask_id = token2id[SpecialTokens.RMASK]
+        mask_draw = rng.random(size=(batch_size, n_cols)) < mask_rate
+        id_cols = np.where(mask_draw, rmask_id, id_cols)
+        # `type_cols` is untouched by masking: a masked position still
+        # belongs to its column, it just doesn't reveal its value.
+
+    def _affix(cols: np.ndarray, bos_val, eos_val) -> np.ndarray:
+        parts = [cols]
+        if affix_bos:
+            parts.insert(0, np.full((batch_size, 1), bos_val, dtype=cols.dtype))
+        if affix_eos:
+            parts.append(np.full((batch_size, 1), eos_val, dtype=cols.dtype))
+        return np.hstack(parts)
+
+    out: Dict[str, Any] = {"input_ids": _affix(id_cols, bos_id, eos_id).tolist()}
+    # BOS/EOS get the dedicated [SPTYPE] structural marker as their type
+    # id, matching the convention already present (but previously unused)
+    # in `_build_one_row`.
+    out["token_type_ids"] = _affix(type_cols, sptype_id, sptype_id).tolist()
+
+    if return_label_ids:
+        predict_mask = np.array(
+            [_is_predict_field(k, predict_fields) for k in columns]
+        )
+        label_cols = np.where(predict_mask[None, :], id_cols, -100)
+        out["label_ids"] = _affix(label_cols, bos_id, eos_id).tolist()
+
+    if field_weights is not None:
+        weights = np.array(
+            [_field_weight(k, field_weights) for k in columns], dtype=np.float64
+        )
+        weight_cols = np.broadcast_to(weights, (batch_size, n_cols))
+        out["token_weights"] = _affix(weight_cols, 1.0, 1.0).tolist()
+
+    return out
+
+
+def make_dataset_with_column_types(
+    df: pd.DataFrame,
+    vocab: Dict,
+    mask_rate: float = 0,
+    affix_eos: bool = True,
+    field_weights: Optional[Dict[str, float]] = None,
+    batch_size: int = 32768,
+    num_proc: Optional[int] = None,
+    predict_fields: Optional[List[str]] = None,
+    seed: Optional[int] = None,
+    keep_in_memory: bool = True,
+) -> Dataset:
+    """REaLTabFormerV2-only counterpart of `make_dataset`: builds a
+    dataset with an additional `token_type_ids` column carrying each
+    position's column-identity id (see `_build_batch_with_column_types`
+    and `vocab.build_pooled_vocab`). `vocab` must come from
+    `build_pooled_vocab`, not `build_vocab` -- it needs the
+    `column_type_ids` key this function reads below.
+
+    `make_dataset`/`get_input_ids`/`_build_batch` (v1's functions) are
+    not modified or called here.
+    """
+    training_dataset = Dataset.from_pandas(df, preserve_index=False)
+
+    columns = list(df.columns)
+    token2id = vocab["token2id"]
+    col_oov = vocab["column_token_ids"]
+    column_type_ids = vocab["column_type_ids"]
+    numeric_like_columns = {
+        c for c in columns if is_numeric_col(c) or is_datetime_col(c)
+    }
+    bos_id = token2id[SpecialTokens.BOS]
+    eos_id = token2id[SpecialTokens.EOS]
+    sptype_id = token2id[SpecialTokens.SPTYPE]
+
+    # Same rationale as `make_dataset`: a local Generator, independent of
+    # the legacy global `random`/`np.random` state, created once and
+    # shared (via closure) across every batch for one deterministic
+    # sequence over the whole dataset given a `seed`.
+    rng = np.random.default_rng(seed)
+
+    new_fingerprint = _cheap_map_fingerprint(
+        training_dataset,
+        mask_rate=mask_rate,
+        affix_eos=affix_eos,
+        field_weights=field_weights,
+        predict_fields=predict_fields,
+        seed=seed,
+        variant="column_types",
+    )
+
+    logging.info("Creating the input_ids/label_ids/token_type_ids columns...")
+
+    return training_dataset.map(
+        lambda example: _build_batch_with_column_types(
+            example,
+            columns,
+            token2id,
+            col_oov,
+            column_type_ids,
+            numeric_like_columns,
+            bos_id,
+            eos_id,
+            sptype_id,
+            mask_rate,
+            True,  # return_label_ids
+            True,  # affix_bos
+            affix_eos,
+            field_weights,
+            predict_fields,
+            rng,
+        ),
+        remove_columns=training_dataset.column_names,
+        num_proc=num_proc,
+        batch_size=batch_size,
+        batched=True,
+        new_fingerprint=new_fingerprint,
+        keep_in_memory=keep_in_memory,
+    )
 
 
 def get_input_ids(

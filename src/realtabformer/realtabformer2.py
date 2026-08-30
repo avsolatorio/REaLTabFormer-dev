@@ -2,6 +2,7 @@
 for tabular and relational data.
 """
 
+import inspect
 import json
 import logging
 import math
@@ -34,6 +35,7 @@ from transformers import (
     Trainer,
     TrainingArguments,
 )
+from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING
 
 import realtabformer
 
@@ -42,8 +44,10 @@ from .data_utils import (
     ModelType,
     SpecialTokens,
     TabularArtefact,
+    build_pooled_vocab,
     build_vocab,
     make_dataset,
+    make_dataset_with_column_types,
     make_relational_dataset,
     process_data,
 )
@@ -53,7 +57,6 @@ from .rtf_exceptions import SampleEmptyLimitError
 from .rtf_sampler import RelationalSampler, TabularSampler
 from .rtf_trainer import ResumableTrainer
 from .rtf_validators import ObservationValidator
-
 
 # Default backbone model IDs
 DEFAULT_TABULAR_BACKBONE = "distilgpt2"
@@ -93,6 +96,23 @@ def _maybe_enable_cross_attention(cfg: PretrainedConfig) -> None:
     # Needed for GPT2 decoder in EncoderDecoderModel; harmless to skip otherwise
     if hasattr(cfg, "add_cross_attention"):
         cfg.add_cross_attention = True
+
+
+def _backbone_supports_token_type_ids(cfg: PretrainedConfig) -> bool:
+    """Check whether the model class a given config resolves to accepts
+    `token_type_ids` in its forward() signature, without instantiating the
+    model. GPT2-family models do (they reuse their own `wte` table for
+    it: `token_type_embeds = self.wte(token_type_ids)`, verified against
+    the installed transformers version) -- most other modern decoder-only
+    architectures (LLaMA, Mistral, GPT-NeoX, ...) don't. `shared_numeric_vocab`
+    needs this, since column identity is carried as a token_type_ids value.
+    """
+    # `_LazyAutoMapping` (HF's lazy-loading mapping class backing this
+    # dict-like) doesn't support single-arg `.get()`.
+    if type(cfg) not in MODEL_FOR_CAUSAL_LM_MAPPING:
+        return False
+    model_cls = MODEL_FOR_CAUSAL_LM_MAPPING[type(cfg)]
+    return "token_type_ids" in inspect.signature(model_cls.forward).parameters
 
 
 def _maybe_normalize_parent_state_dict(cfg: PretrainedConfig, sd: dict) -> dict:
@@ -159,6 +179,7 @@ class REaLTabFormer2:
         numeric_precision: int = 4,
         numeric_max_len: int = 10,
         grokfast_args: Optional[Dict[str, Any]] = None,
+        shared_numeric_vocab: bool = False,
         **training_args_kwargs,
     ) -> None:
         """Set up a REaLTabFormer instance.
@@ -199,6 +220,14 @@ class REaLTabFormer2:
                 https://huggingface.co/docs/transformers/main_classes/callback#transformers.EarlyStoppingCallback.early_stopping_threshold(float,
             mask_rate: The rate of tokens in the transformed observation that will be replaced
                 with the [RMASK] token for regularization during training.
+            shared_numeric_vocab: Beta. Tabular-only. If True, numeric/datetime partition
+                columns share one pooled value vocabulary (the same digit chunk in two
+                different numeric columns maps to the same token id) instead of each column
+                getting its own disjoint range, with column identity carried separately via
+                `token_type_ids`. Requires a `tabular_backbone`/`tabular_config` whose model
+                class accepts `token_type_ids` (GPT2-family backbones do; most others, e.g.
+                LLaMA/Mistral/GPT-NeoX-family, do not) -- raises `ValueError` at construction
+                time otherwise. Categorical columns are not pooled.
             training_args_kwargs: Keyword arguments for the `TrainingArguments` used in training
                 the model. Arguments such as `output_dir`, `num_train_epochs`,
                 `per_device_train_batch_size`, `per_device_eval_batch_size` if passed will be
@@ -212,6 +241,13 @@ class REaLTabFormer2:
         self.dataset = None
 
         self.grokfast_args = grokfast_args
+
+        if shared_numeric_vocab and model_type != ModelType.tabular:
+            raise ValueError(
+                "shared_numeric_vocab is only supported for model_type='tabular' "
+                f"(got model_type={model_type!r})."
+            )
+        self.shared_numeric_vocab = shared_numeric_vocab
 
         if model_type not in ModelType.types():
             self._invalid_model_type(model_type)
@@ -380,6 +416,16 @@ class REaLTabFormer2:
             # Default is 12, use 6 for distill-gpt2 as default
             tabular_config = AutoConfig.from_pretrained(self.tabular_backbone)
             _set_num_layers(tabular_config, 6)  # small default
+
+        if self.shared_numeric_vocab and not _backbone_supports_token_type_ids(
+            tabular_config
+        ):
+            raise ValueError(
+                "shared_numeric_vocab=True requires a tabular backbone whose model class "
+                "accepts `token_type_ids` (GPT2-family backbones do; most others -- e.g. "
+                "LLaMA/Mistral/GPT-NeoX-family -- do not). "
+                f"Resolved config type: {type(tabular_config).__name__}."
+            )
 
         self.tabular_config = tabular_config
         self.model = None
@@ -1410,12 +1456,22 @@ class REaLTabFormer2:
             target_col=self.target_col,
         )
         self.processed_columns = df.columns.to_list()
-        self.vocab = self._generate_vocab(df)
+        if self.shared_numeric_vocab:
+            # Beta: pools numeric/datetime partition-column values into one
+            # shared token range and adds `column_type_ids` (see
+            # data_utils/vocab.py::build_pooled_vocab) -- v1's build_vocab
+            # is not touched.
+            self.vocab = build_pooled_vocab(df, special_tokens=SpecialTokens.tokens())
+        else:
+            self.vocab = self._generate_vocab(df)
         self.tabular_col_size = df.shape[0]
 
         # Map the column names to the field weights
         # The fields in the field_weights are the original column names.
         # We need to map them to the processed columns.
+        self._field_weights = None
+        self._predict_fields = None
+
         if field_weights is not None:
             # print(f"field_weights: {field_weights}")
             field_weights = {
@@ -1438,15 +1494,44 @@ class REaLTabFormer2:
             for ix, col in enumerate(self.processed_columns)
         }
 
-        # Load the dataframe into a HuggingFace Dataset
-        dataset = make_dataset(
-            df,
-            self.vocab,
-            mask_rate=self.mask_rate,
-            return_token_type_ids=False,
-            field_weights=self._field_weights,
-            predict_fields=self._predict_fields,
-        )
+        if self.shared_numeric_vocab:
+            # Full per-row token_type_ids sequence (BOS's [SPTYPE] marker,
+            # then each column's identity id in order, then EOS's), for
+            # the sampler to pass into `generate_kwargs["token_type_ids"]`.
+            # A tabular row's length/column order is fixed and known in
+            # advance, so this can be precomputed once here -- HF's
+            # `GenerationMixin.prepare_inputs_for_generation` slices it to
+            # the current cache position at each decode step on its own,
+            # the same way it already does for `position_ids`; no custom
+            # generation-time extension logic is needed from us.
+            sptype_id = self.vocab["token2id"][SpecialTokens.SPTYPE]
+            self.col_type_ids_seq = (
+                [sptype_id]
+                + [
+                    self.vocab["column_type_ids"][col]
+                    for col in self.processed_columns
+                ]
+                + [sptype_id]
+            )
+
+            # Load the dataframe into a HuggingFace Dataset
+            dataset = make_dataset_with_column_types(
+                df,
+                self.vocab,
+                mask_rate=self.mask_rate,
+                field_weights=self._field_weights,
+                predict_fields=self._predict_fields,
+            )
+        else:
+            # Load the dataframe into a HuggingFace Dataset
+            dataset = make_dataset(
+                df,
+                self.vocab,
+                mask_rate=self.mask_rate,
+                return_token_type_ids=False,
+                field_weights=self._field_weights,
+                predict_fields=self._predict_fields,
+            )
 
         # Store the sequence length for the processed data
         self.tabular_max_length = len(dataset[0]["input_ids"])
@@ -1455,6 +1540,9 @@ class REaLTabFormer2:
         dataset = self._split_train_eval_dataset(dataset)
 
         dataset_columns = ["input_ids", "labels"]
+
+        if self.shared_numeric_vocab:
+            dataset_columns.append("token_type_ids")
 
         if field_weights is not None:
             dataset_columns.append("token_weights")

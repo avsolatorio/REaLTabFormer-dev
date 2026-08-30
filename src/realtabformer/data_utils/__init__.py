@@ -40,6 +40,7 @@ from .dataset import (  # noqa: F401
     get_relational_input_ids,
     get_token_id,
     make_dataset,
+    make_dataset_with_column_types,
     make_relational_dataset,
 )
 from .process import process_data  # noqa: F401
@@ -51,4 +52,4 @@ from .transform import (  # noqa: F401
     process_numeric_data,
     tokenize_numeric_col,
 )
-from .vocab import build_vocab  # noqa: F401
+from .vocab import build_pooled_vocab, build_vocab  # noqa: F401

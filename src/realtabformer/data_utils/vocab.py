@@ -1,6 +1,13 @@
 import pandas as pd
 
-from .columns import extract_processed_column
+from .columns import (
+    decode_column_values,
+    decode_partition_numeric_col,
+    decode_processed_column,
+    extract_processed_column,
+    is_datetime_col,
+    is_numeric_col,
+)
 
 
 def build_vocab(df: pd.DataFrame = None, special_tokens=None, add_columns: bool = True):
@@ -45,4 +52,133 @@ def build_vocab(df: pd.DataFrame = None, special_tokens=None, add_columns: bool 
         id2token=id2token,
         token2id=token2id,
         column_token_ids=column_token_ids,
+    )
+
+
+def _original_column_name(processed_col: str) -> str:
+    """Recover the pre-partition, pre-index/dtype-prefix column name from a
+    processed column name -- e.g. "0___NUMERIC___price_00" -> "price",
+    "2___CATEGORICAL___gender" -> "gender". Numeric/datetime partition
+    sub-columns of the same original column (price_00, price_01, ...) all
+    map to the same name; `decode_processed_column` alone is not enough
+    for those since it leaves the "_00"/"_01" partition suffix attached.
+    """
+    base = decode_processed_column(processed_col)
+    if is_numeric_col(processed_col) or is_datetime_col(processed_col):
+        return decode_partition_numeric_col(base)
+    return base
+
+
+def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
+    """Like `build_vocab`, but pools numeric/datetime partition-column
+    values into one shared token range instead of giving every processed
+    column its own -- so the same digit chunk in two different numeric
+    columns maps to the same token id -- and additionally returns
+    `column_type_ids`, mapping each processed column to a token id
+    representing its *original* (pre-partition) column identity, with
+    every partition sub-column of the same original column sharing one id.
+    Intended for REaLTabFormerV2's `token_type_ids`-based column-identity
+    embedding (added on top of the value token's own embedding, reusing
+    the same embedding table -- GPT2-family models compute
+    `token_type_embeds = self.wte(token_type_ids)`, the same `wte` used
+    for `input_ids`, so these ids must be valid vocab indices, not a
+    separate small id space).
+
+    Values are pooled on their *raw*, column-prefix-stripped form
+    (`decode_column_values`): `process_data`'s final step
+    (`encode_column_values`) bakes the owning column's name onto the
+    front of every cell value, so pooling the as-is (prefixed) strings
+    would never actually collide across columns and this function would
+    be a no-op.
+
+    Categorical columns are intentionally NOT pooled (kept one token
+    range per column, same as `build_vocab`) -- a coincidental string
+    match across two categorical columns is more likely accidental than
+    meaningful, unlike a digit chunk, which is unambiguous regardless of
+    which column it came from.
+
+    Unlike `build_vocab`, there is no `add_columns` flag: column-identity
+    markers are always produced (that's the point of this function), via
+    a dedicated, collision-free mechanism -- not `build_vocab`'s
+    `add_columns=True`/`extract_processed_column` path, which mints one
+    label per (index, dtype) prefix and therefore collides across
+    partition sub-columns of the same original column (confirmed:
+    `extract_processed_column("0___NUMERIC___price_00")` and
+    `extract_processed_column("0___NUMERIC___price_01")` both return
+    `"0___NUMERIC"`). That path is dormant in practice --
+    `add_columns=True` is only ever exercised in `build_vocab`'s own
+    tests today, never in `realtabformer.py`'s or `realtabformer2.py`'s
+    real call sites, both of which pass `add_columns=False` -- so it's a
+    latent, out-of-scope bug in `build_vocab`, not something this
+    function inherits or fixes.
+    """
+    assert (df is not None) or special_tokens, (
+        "At least one of `df` or `special_tokens` must not be None."
+    )
+
+    if df is not None:
+        # Same convention assumption as `build_vocab`.
+        assert df.columns.str[0].str.isdigit().all()
+
+    id2token = {}
+    curr_id = 0
+    if special_tokens:
+        id2token.update(dict(enumerate(special_tokens)))
+        curr_id = len(special_tokens)
+
+    column_token_ids = {}
+    column_type_ids = {}
+
+    if df is not None:
+        numeric_like_cols = [
+            c for c in df.columns if is_numeric_col(c) or is_datetime_col(c)
+        ]
+        categorical_cols = [c for c in df.columns if c not in numeric_like_cols]
+
+        # Pool numeric/datetime partition-column values into one shared range.
+        if numeric_like_cols:
+            pooled_values = pd.concat(
+                [decode_column_values(df[c]) for c in numeric_like_cols],
+                ignore_index=True,
+            )
+            unique_vals = sorted(pooled_values.unique())
+            id2token.update(dict(enumerate(unique_vals, curr_id)))
+            shared_range = list(range(curr_id, curr_id + len(unique_vals)))
+            for c in numeric_like_cols:
+                column_token_ids[c] = shared_range
+            curr_id += len(unique_vals)
+
+        # Categorical columns: unchanged from build_vocab, one range each.
+        for c in categorical_cols:
+            unique_vals = sorted(df[c].unique())
+            id2token.update(dict(enumerate(unique_vals, curr_id)))
+            column_token_ids[c] = list(range(curr_id, curr_id + len(unique_vals)))
+            curr_id += len(unique_vals)
+
+        # Column-identity markers: one fresh token per *original* column,
+        # grouping numeric/datetime partitions together. `__COLTYPE__`
+        # prefix guarantees no collision with a real value token.
+        original_names = []
+        seen = set()
+        for c in df.columns:
+            name = _original_column_name(c)
+            if name not in seen:
+                seen.add(name)
+                original_names.append(name)
+
+        col_type_tokens = [f"__COLTYPE__{name}" for name in original_names]
+        id2token.update(dict(enumerate(col_type_tokens, curr_id)))
+        name_to_type_id = {name: curr_id + i for i, name in enumerate(original_names)}
+        curr_id += len(col_type_tokens)
+
+        for c in df.columns:
+            column_type_ids[c] = name_to_type_id[_original_column_name(c)]
+
+    token2id = {v: k for k, v in id2token.items()}
+
+    return dict(
+        id2token=id2token,
+        token2id=token2id,
+        column_token_ids=column_token_ids,
+        column_type_ids=column_type_ids,
     )

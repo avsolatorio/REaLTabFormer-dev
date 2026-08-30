@@ -53,6 +53,7 @@ class REaLSampler:
         col_transform_data: Dict,
         random_state: Optional[int] = 1029,
         device="cuda",
+        col_type_ids_seq: Optional[List[int]] = None,
     ) -> None:
         self.model_type = model_type
         self.vocab = vocab
@@ -60,6 +61,12 @@ class REaLSampler:
         self.col_size = col_size  # relational_col_size or tabular_col_size
         self.col_idx_ids = col_idx_ids
         self.max_length = max_length  # relational_max_length or tabular_max_length
+        # REaLTabFormerV2-only, beta: full per-row token_type_ids sequence
+        # (see realtabformer2.py's `shared_numeric_vocab`). None for every
+        # v1 REaLTabFormer model, which never sets this attribute --
+        # `sampler_from_model` uses `getattr(rtf_model, ..., None)` below,
+        # so this stays a no-op for v1.
+        self.col_type_ids_seq = col_type_ids_seq
 
         self.columns = columns
         self.datetime_columns = datetime_columns
@@ -256,6 +263,22 @@ class REaLSampler:
 
         if "eos_token_id" not in generate_kwargs:
             generate_kwargs["eos_token_id"] = vocab["token2id"][SpecialTokens.EOS]
+
+        if self.col_type_ids_seq is not None and "token_type_ids" not in generate_kwargs:
+            # REaLTabFormerV2-only, beta (`shared_numeric_vocab`): the full
+            # per-row column-identity sequence, precomputed once at fit
+            # time since a tabular row's length/column order is fixed and
+            # known in advance. `GenerationMixin.prepare_inputs_for_generation`
+            # slices this to the current cache position at each decode
+            # step the same way it already does for `position_ids` -- no
+            # per-step extension logic needed here. Matched to `inputs`'/
+            # `input_ids`'s starting batch dimension; HF expands it along
+            # with the prompt when `num_return_sequences` > 1.
+            seed = generate_kwargs.get("inputs", generate_kwargs.get("input_ids"))
+            batch = seed.shape[0] if seed is not None else 1
+            generate_kwargs["token_type_ids"] = torch.tensor(
+                [self.col_type_ids_seq] * batch, device=device
+            )
 
         _samples = self.model.generate(**generate_kwargs)
 
@@ -525,6 +548,7 @@ class TabularSampler(REaLSampler):
         col_transform_data: Dict,
         random_state: Optional[int] = 1029,
         device="cuda",
+        col_type_ids_seq: Optional[List[int]] = None,
     ) -> None:
         super().__init__(
             model_type,
@@ -542,6 +566,7 @@ class TabularSampler(REaLSampler):
             col_transform_data,
             random_state,
             device,
+            col_type_ids_seq,
         )
 
         self.output_vocab = self.vocab
@@ -570,6 +595,7 @@ class TabularSampler(REaLSampler):
             col_transform_data=rtf_model.col_transform_data,
             random_state=rtf_model.random_state,
             device=device,
+            col_type_ids_seq=getattr(rtf_model, "col_type_ids_seq", None),
         )
 
     def _prefix_allowed_tokens_fn(self, batch_id, input_ids) -> List:

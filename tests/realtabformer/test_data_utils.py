@@ -783,3 +783,91 @@ def test_make_dataset_end_to_end_with_seed_matches_manual_vectorized_call():
     assert len(dataset) == len(ddf)
     assert dataset[0]["input_ids"][0] == vocab["token2id"][du.SpecialTokens.BOS]
     assert dataset[0]["input_ids"][-1] == vocab["token2id"][du.SpecialTokens.EOS]
+
+
+# --- REaLTabFormerV2-only: build_pooled_vocab / make_dataset_with_column_types
+# (see /Users/avsolatorio/.claude/plans/snappy-swimming-hickey.md). v1's
+# build_vocab/make_dataset are untouched by any of this.
+
+def test_build_pooled_vocab_shares_tokens_across_numeric_columns():
+    # The whole point of this function: the same digit chunk in two
+    # different numeric columns must map to the SAME token id, unlike
+    # build_vocab where every column gets its own disjoint range.
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9],
+        "age": [10.5, 20.3, 5.0, 99.0],  # shares "10", "20" with price
+        "gender": ["m", "f", "m", "f"],
+    })
+    pr_df, _, _ = du.process_data(
+        raw_df, numeric_max_len=6, numeric_precision=1, numeric_nparts=2
+    )
+    vocab = du.build_pooled_vocab(pr_df, special_tokens=du.SpecialTokens.tokens())
+
+    price_00 = [c for c in pr_df.columns if c.endswith("price_00")][0]
+    age_00 = [c for c in pr_df.columns if c.endswith("age_00")][0]
+    gender_col = [c for c in pr_df.columns if c.endswith("gender")][0]
+
+    # price_00/age_00 (both numeric) share the exact same token range.
+    assert vocab["column_token_ids"][price_00] == vocab["column_token_ids"][age_00]
+    # categorical stays on its own, separate range.
+    assert vocab["column_token_ids"][gender_col] != vocab["column_token_ids"][price_00]
+
+    # Row 0: price=10.5 -> price_00="10"; age=10.5 -> age_00="10" (same
+    # raw digit chunk). Confirm they resolve to the identical token id.
+    ds = du.make_dataset_with_column_types(pr_df, vocab, mask_rate=0)
+    price_00_idx = list(pr_df.columns).index(price_00) + 1  # +1 for BOS
+    age_00_idx = list(pr_df.columns).index(age_00) + 1
+    assert ds[0]["input_ids"][price_00_idx] == ds[0]["input_ids"][age_00_idx]
+
+
+def test_build_pooled_vocab_column_type_ids_group_partitions():
+    # column_type_ids must group all partition sub-columns of the same
+    # original column (price_00, price_01, ...) under one id, distinct
+    # from other columns' ids.
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9],
+        "age": [10.5, 20.3, 5.0, 99.0],
+        "gender": ["m", "f", "m", "f"],
+    })
+    pr_df, _, _ = du.process_data(
+        raw_df, numeric_max_len=6, numeric_precision=1, numeric_nparts=2
+    )
+    vocab = du.build_pooled_vocab(pr_df, special_tokens=du.SpecialTokens.tokens())
+
+    price_cols = [c for c in pr_df.columns if "price" in c]
+    age_cols = [c for c in pr_df.columns if "age" in c]
+    gender_cols = [c for c in pr_df.columns if "gender" in c]
+
+    price_type_ids = {vocab["column_type_ids"][c] for c in price_cols}
+    age_type_ids = {vocab["column_type_ids"][c] for c in age_cols}
+    gender_type_ids = {vocab["column_type_ids"][c] for c in gender_cols}
+
+    assert len(price_cols) > 1  # sanity: price really did get partitioned
+    assert len(price_type_ids) == 1  # ...but all partitions share one id
+    assert len(age_type_ids) == 1
+    assert len(gender_type_ids) == 1
+    # And the three original columns are distinguishable from each other.
+    assert price_type_ids != age_type_ids != gender_type_ids
+    assert price_type_ids != gender_type_ids
+
+
+def test_make_dataset_with_column_types_deterministic_when_no_rng_needed():
+    # Same principle as test_get_input_ids_batched_matches_nonbatched_when_deterministic:
+    # with mask_rate=0 and full vocab coverage, there is no RNG consumption,
+    # so two independent calls must produce byte-identical output.
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9] * 5,
+        "gender": ["m", "f", "m", "f"] * 5,
+    })
+    pr_df, _, _ = du.process_data(raw_df, numeric_max_len=6, numeric_precision=1)
+    vocab = du.build_pooled_vocab(pr_df, special_tokens=du.SpecialTokens.tokens())
+
+    ds1 = du.make_dataset_with_column_types(pr_df, vocab, mask_rate=0, seed=7)
+    ds2 = du.make_dataset_with_column_types(pr_df, vocab, mask_rate=0, seed=7)
+    assert ds1["input_ids"] == ds2["input_ids"]
+    assert ds1["token_type_ids"] == ds2["token_type_ids"]
+    assert ds1["label_ids"] == ds2["label_ids"]
+
+    # token_type_ids length must match input_ids length (one type id per
+    # position, including BOS/EOS).
+    assert len(ds1[0]["token_type_ids"]) == len(ds1[0]["input_ids"])
