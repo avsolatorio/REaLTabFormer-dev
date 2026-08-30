@@ -1,8 +1,10 @@
+import hashlib
 import logging
 import random
 import warnings
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 from datasets import Dataset
 
@@ -131,6 +133,98 @@ def _build_one_row(
     return out
 
 
+def _vectorized_column_token_ids(
+    values: List[Any],
+    token2id: Dict[str, int],
+    oov_options: List[int],
+    rng: np.random.Generator,
+) -> np.ndarray:
+    """Map one column's batch of raw values to token ids, vectorized.
+
+    Equivalent to calling `get_token_id(v, token2id, oov_options,
+    mask_rate=0)` for each `v` in `values`, but `pandas.Series.map` with a
+    dict argument dispatches to a C-level hashtable lookup instead of a
+    Python function call per element, and the OOV fallback draws one
+    batched `rng.choice` instead of one `random.choice` per OOV cell.
+    (`mask_rate` masking is applied afterward, across the whole batch at
+    once -- see `_build_batch`.)
+    """
+    mapped = pd.Series(values).map(token2id)
+    na_mask = mapped.isna()
+
+    if not na_mask.any():
+        return mapped.to_numpy(dtype=np.int64)
+
+    if oov_options:
+        fallback = rng.choice(oov_options, size=int(na_mask.sum()))
+        filled = mapped.to_numpy(dtype="float64", copy=True)
+        filled[na_mask.to_numpy()] = fallback
+        return filled.astype(np.int64)
+
+    return mapped.fillna(token2id[SpecialTokens.UNK]).to_numpy(dtype=np.int64)
+
+
+def _build_batch(
+    example: Dict[str, Any],
+    columns: List[str],
+    token2id: Dict[str, int],
+    col_oov: Dict[str, List[int]],
+    bos_id: int,
+    eos_id: int,
+    mask_rate: float,
+    return_label_ids: bool,
+    affix_bos: bool,
+    affix_eos: bool,
+    field_weights: Optional[Dict[str, float]],
+    predict_fields: Optional[List[str]],
+    rng: np.random.Generator,
+) -> Dict[str, Any]:
+    """Vectorized equivalent of calling `_build_one_row` once per row in
+    the batch. Builds the whole batch's `input_ids`/`label_ids`/
+    `token_weights` as 2D numpy arrays via per-column vectorized
+    operations, instead of a Python loop over rows x columns.
+    """
+    n_cols = len(columns)
+    batch_size = len(example[columns[0]])
+
+    id_cols = np.empty((batch_size, n_cols), dtype=np.int64)
+    for j, k in enumerate(columns):
+        id_cols[:, j] = _vectorized_column_token_ids(
+            example[k], token2id, col_oov[k], rng
+        )
+
+    if mask_rate > 0:
+        rmask_id = token2id[SpecialTokens.RMASK]
+        mask_draw = rng.random(size=(batch_size, n_cols)) < mask_rate
+        id_cols = np.where(mask_draw, rmask_id, id_cols)
+
+    def _affix(cols: np.ndarray, bos_val, eos_val) -> np.ndarray:
+        parts = [cols]
+        if affix_bos:
+            parts.insert(0, np.full((batch_size, 1), bos_val, dtype=cols.dtype))
+        if affix_eos:
+            parts.append(np.full((batch_size, 1), eos_val, dtype=cols.dtype))
+        return np.hstack(parts)
+
+    out: Dict[str, Any] = {"input_ids": _affix(id_cols, bos_id, eos_id).tolist()}
+
+    if return_label_ids:
+        predict_mask = np.array(
+            [_is_predict_field(k, predict_fields) for k in columns]
+        )
+        label_cols = np.where(predict_mask[None, :], id_cols, -100)
+        out["label_ids"] = _affix(label_cols, bos_id, eos_id).tolist()
+
+    if field_weights is not None:
+        weights = np.array(
+            [_field_weight(k, field_weights) for k in columns], dtype=np.float64
+        )
+        weight_cols = np.broadcast_to(weights, (batch_size, n_cols))
+        out["token_weights"] = _affix(weight_cols, 1.0, 1.0).tolist()
+
+    return out
+
+
 def get_input_ids(
     example: Dict[str, Any],
     vocab: Dict,
@@ -143,6 +237,7 @@ def get_input_ids(
     field_weights: Optional[Dict[str, float]] = None,
     predict_fields: Optional[List[str]] = None,
     batched: bool = False,
+    rng: Optional[np.random.Generator] = None,
 ) -> Dict[str, Any]:
     assert return_token_type_ids is False, (
         "token_type_ids not implemented in this refactor yet."
@@ -150,47 +245,61 @@ def get_input_ids(
 
     token2id = vocab["token2id"]
     col_oov = vocab["column_token_ids"]
+    bos_id = token2id[SpecialTokens.BOS]
+    eos_id = token2id[SpecialTokens.EOS]
 
-    row_kwargs = dict(
+    # --- Non-batched path: single row, vectorization buys nothing here ---
+    if not batched:
+        return _build_one_row(
+            i=0,
+            example=example,
+            columns=columns,
+            token2id=token2id,
+            col_oov=col_oov,
+            bos_id=bos_id,
+            eos_id=eos_id,
+            sptype_id=token2id[SpecialTokens.SPTYPE],
+            mask_rate=mask_rate,
+            return_label_ids=return_label_ids,
+            return_token_type_ids=return_token_type_ids,
+            affix_bos=affix_bos,
+            affix_eos=affix_eos,
+            field_weights=field_weights,
+            predict_fields=predict_fields,
+            batched=batched,
+        )
+
+    # --- Batched path: vectorized, see _build_batch ---
+    return _build_batch(
         example=example,
         columns=columns,
         token2id=token2id,
         col_oov=col_oov,
-        bos_id=token2id[SpecialTokens.BOS],
-        eos_id=token2id[SpecialTokens.EOS],
-        sptype_id=token2id[SpecialTokens.SPTYPE],
+        bos_id=bos_id,
+        eos_id=eos_id,
         mask_rate=mask_rate,
         return_label_ids=return_label_ids,
-        return_token_type_ids=return_token_type_ids,
         affix_bos=affix_bos,
         affix_eos=affix_eos,
         field_weights=field_weights,
         predict_fields=predict_fields,
-        batched=batched,
+        rng=rng if rng is not None else np.random.default_rng(),
     )
 
-    # --- Non-batched path: return single example dict with flat lists ---
-    if not batched:
-        return _build_one_row(i=0, **row_kwargs)
 
-    # --- Batched path: example[k] is a list; return list-of-list per key ---
-    # Infer batch size from the first column
-    first_col = columns[0]
-    B = len(example[first_col])
-
-    rows = [_build_one_row(i, **row_kwargs) for i in range(B)]
-
-    batched_out: Dict[str, Any] = {
-        "input_ids": [r["input_ids"] for r in rows],
-    }
-    if return_label_ids:
-        batched_out["label_ids"] = [r["label_ids"] for r in rows]
-    if return_token_type_ids:
-        batched_out["token_type_ids"] = [r["token_type_ids"] for r in rows]
-    if field_weights is not None:
-        batched_out["token_weights"] = [r["token_weights"] for r in rows]
-
-    return batched_out
+def _cheap_map_fingerprint(training_dataset: Dataset, **transform_args: Any) -> str:
+    # `Dataset.map()` otherwise computes its own cache fingerprint by
+    # dill-pickling the *entire* transform closure (here: `vocab`, `rng`,
+    # etc.) -- for closures like this one that turned out to be
+    # pathologically slow (confirmed: dominated wall-clock time, worse
+    # than the actual vectorized work, and scaling with row count since
+    # it's invoked once per internal batch/writer-flush, not once per
+    # `.map()` call). We don't rely on `datasets`' on-disk cache here, so
+    # compute a cheap fingerprint ourselves from just the actual varying
+    # inputs (the input dataset's own fingerprint plus the transform
+    # arguments) instead of letting `datasets` hash the whole closure.
+    payload = repr((training_dataset._fingerprint, transform_args))
+    return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 
 def make_dataset(
@@ -201,13 +310,36 @@ def make_dataset(
     return_token_type_ids: bool = False,
     field_weights: Optional[Dict[str, float]] = None,
     batched: bool = True,
-    batch_size: int = 2048,
+    batch_size: int = 32768,
     num_proc: Optional[int] = None,
     predict_fields: Optional[List[str]] = None,
+    seed: Optional[int] = None,
+    keep_in_memory: bool = True,
 ) -> Dataset:
     # Load the dataframe into a HuggingFace Dataset
     training_dataset = Dataset.from_pandas(df, preserve_index=False)
     num_proc = num_proc
+
+    # A single Generator, created once and shared across every batch (via
+    # closure) rather than re-seeded per batch, so the draws across the
+    # whole dataset form one deterministic sequence for a given `seed`
+    # instead of different batches repeating the same values. This is a
+    # local object, independent of the legacy global `random`/`np.random`
+    # state the rest of training uses (sensitivity computation, model
+    # init, etc. -- see realtabformer.py's `random.seed`/`np.random.seed`
+    # calls) -- it neither reads nor perturbs that state.
+    rng = np.random.default_rng(seed)
+
+    new_fingerprint = _cheap_map_fingerprint(
+        training_dataset,
+        mask_rate=mask_rate,
+        affix_eos=affix_eos,
+        return_token_type_ids=return_token_type_ids,
+        field_weights=field_weights,
+        batched=batched,
+        predict_fields=predict_fields,
+        seed=seed,
+    )
 
     # Create the input_ids and label_ids columns
     logging.info("Creating the input_ids and label_ids columns...")
@@ -223,11 +355,21 @@ def make_dataset(
             field_weights=field_weights,
             batched=batched,
             predict_fields=predict_fields,
+            rng=rng,
         ),
         remove_columns=training_dataset.column_names,
         num_proc=num_proc,
         batch_size=batch_size,
         batched=batched,
+        new_fingerprint=new_fingerprint,
+        # By the time execution reaches here, `df` is already a fully
+        # in-memory pandas DataFrame (process_data eagerly copies/
+        # transforms it upstream) -- there's no larger-than-memory/
+        # out-of-core scenario for this library to preserve, so building
+        # the mapped output in memory instead of a memory-mapped disk
+        # cache file avoids real disk I/O that otherwise dominates
+        # make_dataset's wall-clock time (confirmed via profiling).
+        keep_in_memory=keep_in_memory,
     )
 
 

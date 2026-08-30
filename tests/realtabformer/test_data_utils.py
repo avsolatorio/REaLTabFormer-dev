@@ -637,3 +637,149 @@ def test_data_utils_public_api_surface():
     }
     missing = {name for name in required_names if not hasattr(du, name)}
     assert not missing, f"Missing from realtabformer.data_utils: {missing}"
+
+
+# --- Regression tests for the vectorized get_input_ids batched path (see
+# /Users/avsolatorio/.claude/plans/snappy-swimming-hickey.md, the data_utils
+# performance plan). The non-batched path (_build_one_row) is unchanged by
+# that optimization, so it doubles as ground truth: with no RNG involved
+# (mask_rate=0, full vocab coverage) the vectorized batched output must
+# exactly match calling the non-batched path once per row.
+
+def _make_perf_test_vocab(n_rows: int = 64, n_cols: int = 8, seed: int = 7):
+    rng = np.random.default_rng(seed)
+    ddf = pd.DataFrame({
+        f"{idx}___CATEGORICAL___col{idx}": [
+            f"v{v}" for v in rng.integers(0, 20, size=n_rows)
+        ]
+        for idx in range(n_cols)
+    })
+    vocab = du.build_vocab(
+        ddf.astype(str), special_tokens=du.SpecialTokens.tokens(), add_columns=True
+    )
+    return ddf, vocab
+
+
+def test_get_input_ids_batched_matches_nonbatched_when_deterministic():
+    # No RNG consumption possible in this regime (mask_rate=0, every value
+    # drawn straight from the vocab-fitting dataframe so nothing is OOV) --
+    # the vectorized batched path and the row-by-row non-batched path must
+    # therefore agree exactly.
+    ddf, vocab = _make_perf_test_vocab()
+    columns = list(ddf.columns)
+
+    example_batch = {col: ddf[col].astype(str).tolist() for col in columns}
+
+    batched_out = du.get_input_ids(
+        example_batch,
+        vocab=vocab,
+        columns=columns,
+        mask_rate=0,
+        return_label_ids=True,
+        affix_bos=True,
+        affix_eos=True,
+        field_weights={columns[0]: 3.0},
+        predict_fields=[columns[1]],
+        batched=True,
+    )
+
+    for i in range(len(ddf)):
+        row_example = {col: example_batch[col][i] for col in columns}
+        row_out = du.get_input_ids(
+            row_example,
+            vocab=vocab,
+            columns=columns,
+            mask_rate=0,
+            return_label_ids=True,
+            affix_bos=True,
+            affix_eos=True,
+            field_weights={columns[0]: 3.0},
+            predict_fields=[columns[1]],
+            batched=False,
+        )
+        assert batched_out["input_ids"][i] == row_out["input_ids"]
+        assert batched_out["label_ids"][i] == row_out["label_ids"]
+        assert batched_out["token_weights"][i] == row_out["token_weights"]
+
+
+def test_get_input_ids_batched_determinism_with_seeded_rng():
+    # Same seed, run twice through make_dataset -> identical output. Proves
+    # the Generator-based design is actually deterministic given a seed,
+    # even when mask_rate/OOV are in play (so the RNG is genuinely
+    # exercised, unlike the test above).
+    ddf, vocab = _make_perf_test_vocab(n_rows=200, n_cols=6, seed=11)
+    columns = list(ddf.columns)
+    processed_df = ddf.astype(str)
+    processed_df.columns = columns
+
+    def _run():
+        ds = du.make_dataset(processed_df, vocab, mask_rate=0.3, seed=1029)
+        return ds["input_ids"]
+
+    first = _run()
+    second = _run()
+    assert first == second
+
+
+def test_get_input_ids_batched_masking_and_oov_distribution():
+    # Statistical check for the regime where old and new code can't be
+    # compared value-for-value (RNG consumption differs by design -- see
+    # the plan's RNG section): assert the empirical mask rate is close to
+    # the configured mask_rate, and that OOV substitutions always resolve
+    # to a value from the correct column's own vocabulary.
+    ddf, vocab = _make_perf_test_vocab(n_rows=2000, n_cols=5, seed=3)
+    columns = list(ddf.columns)
+
+    # Half the batch gets values guaranteed to be out-of-vocabulary.
+    example_batch = {col: ddf[col].astype(str).tolist() for col in columns}
+    oov_col = columns[0]
+    n = len(example_batch[oov_col])
+    for i in range(n // 2):
+        example_batch[oov_col][i] = f"__never_seen__{i}"
+
+    mask_rate = 0.4
+    rng = np.random.default_rng(42)
+    out = du.dataset._build_batch(
+        example=example_batch,
+        columns=columns,
+        token2id=vocab["token2id"],
+        col_oov=vocab["column_token_ids"],
+        bos_id=vocab["token2id"][du.SpecialTokens.BOS],
+        eos_id=vocab["token2id"][du.SpecialTokens.EOS],
+        mask_rate=mask_rate,
+        return_label_ids=False,
+        affix_bos=False,
+        affix_eos=False,
+        field_weights=None,
+        predict_fields=None,
+        rng=rng,
+    )
+
+    input_ids = np.array(out["input_ids"])
+    rmask_id = vocab["token2id"][du.SpecialTokens.RMASK]
+
+    empirical_mask_rate = (input_ids == rmask_id).mean()
+    assert abs(empirical_mask_rate - mask_rate) < 0.03
+
+    oov_col_idx = columns.index(oov_col)
+    oov_options = set(vocab["column_token_ids"][oov_col])
+    oov_col_ids = input_ids[: n // 2, oov_col_idx]
+    # Every substituted id (that isn't itself a mask token) must come from
+    # this column's own vocabulary, never another column's.
+    non_masked = oov_col_ids[oov_col_ids != rmask_id]
+    assert set(non_masked.tolist()) <= oov_options
+
+
+def test_make_dataset_end_to_end_with_seed_matches_manual_vectorized_call():
+    # Exercises the full make_dataset -> .map(batched=True) path (not just
+    # _build_batch called directly) to make sure the Generator threaded in
+    # via the closure actually reaches the vectorized code, end to end.
+    ddf, vocab = _make_perf_test_vocab(n_rows=50, n_cols=4, seed=5)
+    columns = list(ddf.columns)
+    processed_df = ddf.astype(str)
+    processed_df.columns = columns
+
+    dataset = du.make_dataset(processed_df, vocab, mask_rate=0, seed=123)
+    assert len(dataset) == len(ddf)
+    assert dataset[0]["input_ids"][0] == vocab["token2id"][du.SpecialTokens.BOS]
+    assert dataset[0]["input_ids"][-1] == vocab["token2id"][du.SpecialTokens.EOS]

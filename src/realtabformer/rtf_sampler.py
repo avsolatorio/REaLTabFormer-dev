@@ -608,7 +608,13 @@ class TabularSampler(REaLSampler):
         seed_data, _, _ = process_data(
             df=seed_input, col_transform_data=self.col_transform_data
         )
-        seed_data = make_dataset(seed_data, self.vocab, mask_rate=0, affix_eos=False)
+        seed_data = make_dataset(
+            seed_data,
+            self.vocab,
+            mask_rate=0,
+            affix_eos=False,
+            seed=self.random_state,
+        )
 
         generated = torch.tensor(seed_data["input_ids"])
 
@@ -1117,7 +1123,9 @@ class RelationalSampler(REaLSampler):
         )
 
         # Load the dataframe into a HuggingFace Dataset
-        dataset = make_dataset(input_df, self.vocab["encoder"])
+        dataset = make_dataset(
+            input_df, self.vocab["encoder"], seed=self.random_state
+        )
 
         input_loader = DataLoader(
             dataset, batch_size=gen_batch, collate_fn=DefaultDataCollator()

@@ -1355,6 +1355,7 @@ class REaLTabFormer:
             return_token_type_ids=False,
             field_weights=self._field_weights,
             predict_fields=self._predict_fields,
+            seed=self.random_state,
         )
 
         # Store the sequence length for the processed data
