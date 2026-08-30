@@ -928,3 +928,41 @@ def test_make_dataset_with_column_types_deterministic_when_no_rng_needed():
     # token_type_ids length must match input_ids length (one type id per
     # position, including BOS/EOS).
     assert len(ds1[0]["token_type_ids"]) == len(ds1[0]["input_ids"])
+
+
+def test_compute_column_blocks_groups_partitions_and_preserves_order():
+    raw_df = pd.DataFrame({
+        "price": [10.5, 20.3, 30.1, 40.9],
+        "age": [10.5, 20.3, 5.0, 99.0],
+        "gender": ["m", "f", "m", "f"],
+    })
+    pr_df, _, _ = du.process_data(
+        raw_df, numeric_max_len=6, numeric_precision=1, numeric_nparts=2
+    )
+    blocks = du.compute_column_blocks(pr_df.columns.tolist())
+
+    names = [name for name, _ in blocks]
+    assert names == ["price", "age", "gender"]
+
+    price_indices = dict(blocks)["price"]
+    age_indices = dict(blocks)["age"]
+    gender_indices = dict(blocks)["gender"]
+
+    # price/age were partitioned (numeric_nparts=2) -- multiple indices,
+    # each pointing at the right processed column, in order.
+    assert len(price_indices) > 1
+    assert [pr_df.columns[i] for i in price_indices] == [
+        c for c in pr_df.columns if "price" in c
+    ]
+    assert [pr_df.columns[i] for i in age_indices] == [
+        c for c in pr_df.columns if "age" in c
+    ]
+    # gender is categorical -- exactly one index.
+    assert len(gender_indices) == 1
+    assert pr_df.columns[gender_indices[0]] == [
+        c for c in pr_df.columns if "gender" in c
+    ][0]
+
+    # Every index appears exactly once across all blocks (a partition).
+    all_indices = sorted(i for _, indices in blocks for i in indices)
+    assert all_indices == list(range(len(pr_df.columns)))

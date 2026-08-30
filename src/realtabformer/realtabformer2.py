@@ -46,13 +46,14 @@ from .data_utils import (
     TabularArtefact,
     build_pooled_vocab,
     build_vocab,
+    compute_column_blocks,
     make_dataset,
     make_dataset_with_column_types,
     make_relational_dataset,
     process_data,
 )
 from .rtf_analyze import SyntheticDataBench
-from .rtf_datacollator import RelationalDataCollator
+from .rtf_datacollator import AnyOrderColumnCollator, RelationalDataCollator
 from .rtf_exceptions import SampleEmptyLimitError
 from .rtf_sampler import RelationalSampler, TabularSampler
 from .rtf_trainer import ResumableTrainer
@@ -180,6 +181,7 @@ class REaLTabFormer2:
         numeric_max_len: int = 10,
         grokfast_args: Optional[Dict[str, Any]] = None,
         shared_numeric_vocab: bool = False,
+        any_order: bool = False,
         **training_args_kwargs,
     ) -> None:
         """Set up a REaLTabFormer instance.
@@ -228,6 +230,15 @@ class REaLTabFormer2:
                 class accepts `token_type_ids` (GPT2-family backbones do; most others, e.g.
                 LLaMA/Mistral/GPT-NeoX-family, do not) -- raises `ValueError` at construction
                 time otherwise. Categorical columns are not pooled.
+            any_order: Beta. Requires `shared_numeric_vocab=True`. If True, training randomly
+                permutes each row's *original*-column order every batch (each numeric/datetime
+                column's own digit chunks always stay together and in order; only the order of
+                columns relative to each other is permuted), so the model is trained to be
+                robust to any column ordering instead of only the one fixed left-to-right order.
+                This lets `seed_input`/`sample_tabular_with_seed()`/`predict()` condition
+                generation on an *arbitrary subset* of columns (not just a prefix of the
+                training column order) -- see `rtf_sampler.py`'s `_process_seed_input`. Raises
+                `ValueError` at construction time if `shared_numeric_vocab` is not also True.
             training_args_kwargs: Keyword arguments for the `TrainingArguments` used in training
                 the model. Arguments such as `output_dir`, `num_train_epochs`,
                 `per_device_train_batch_size`, `per_device_eval_batch_size` if passed will be
@@ -248,6 +259,15 @@ class REaLTabFormer2:
                 f"(got model_type={model_type!r})."
             )
         self.shared_numeric_vocab = shared_numeric_vocab
+
+        if any_order and not shared_numeric_vocab:
+            raise ValueError(
+                "any_order=True requires shared_numeric_vocab=True -- any-order training "
+                "relies on the token_type_ids column-identity machinery that "
+                "shared_numeric_vocab already sets up."
+            )
+        self.any_order = any_order
+        self.column_blocks: Optional[List[List]] = None
 
         if model_type not in ModelType.types():
             self._invalid_model_type(model_type)
@@ -1456,6 +1476,11 @@ class REaLTabFormer2:
             target_col=self.target_col,
         )
         self.processed_columns = df.columns.to_list()
+        if self.any_order:
+            # Beta: the per-original-column block structure any-order
+            # training's collator (AnyOrderColumnCollator) and order-aware
+            # sampling (rtf_sampler.py's _build_order_masks) both need.
+            self.column_blocks = compute_column_blocks(self.processed_columns)
         if self.shared_numeric_vocab:
             # Beta: pools numeric/datetime partition-column values into one
             # shared token range and adds `column_type_ids` (see
@@ -1619,13 +1644,20 @@ class REaLTabFormer2:
                 )
             ]
 
+        data_collator = None  # Use the default_data_collator
+        if self.any_order:
+            assert self.column_blocks is not None
+            data_collator = AnyOrderColumnCollator(
+                column_blocks=self.column_blocks, seed=self.random_state
+            )
+
         assert self.dataset
         trainer = ResumableTrainer(
             target_epochs=target_epochs,
             save_epochs=None,
             model=self.model,
             args=TrainingArguments(**training_args_kwargs),
-            data_collator=None,  # Use the default_data_collator
+            data_collator=data_collator,
             callbacks=callbacks,
             compute_loss_func=compute_loss_func,
             grokfast_args=self.grokfast_args,

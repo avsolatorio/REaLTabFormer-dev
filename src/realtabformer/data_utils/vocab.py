@@ -69,6 +69,39 @@ def _original_column_name(processed_col: str) -> str:
     return base
 
 
+def compute_column_blocks(processed_columns) -> list:
+    """Group `processed_columns` (e.g. `model.processed_columns`) into
+    per-*original*-column blocks, each an `[original_name, [indices]]` pair,
+    in original left-to-right order. Every numeric/datetime partition
+    sub-column of the same original column (`price_00`, `price_01`, ...)
+    lands in one block, in their existing relative order, via the same
+    `_original_column_name` grouping `build_pooled_vocab`'s
+    `column_type_ids` already uses.
+
+    Built for REaLTabFormerV2's any-order training (`AnyOrderColumnCollator`,
+    rtf_datacollator.py) and order-aware sampling (`rtf_sampler.py`): both
+    need to permute/query *original* columns as indivisible units without
+    ever splitting one column's digit chunks apart from each other.
+
+    Returned as `[[name, [indices]], ...]` (lists, not tuples) so it
+    round-trips as-is through `REaLTabFormer2.save()`'s generic
+    `json.dumps(self.__dict__)` / `load_from_dir()`'s generic `setattr`
+    restore loop -- a tuple would silently become a list on that round trip
+    anyway (JSON has no tuple type), so storing it as a list from the start
+    avoids a save/load type mismatch instead of masking one.
+    """
+    blocks: dict = {}
+    order: list = []
+    for i, col in enumerate(processed_columns):
+        name = _original_column_name(col)
+        if name not in blocks:
+            blocks[name] = []
+            order.append(name)
+        blocks[name].append(i)
+
+    return [[name, blocks[name]] for name in order]
+
+
 def build_pooled_vocab(df: pd.DataFrame = None, special_tokens=None):
     """Like `build_vocab`, but the *embedding space* (`id2token`/`token2id`)
     for numeric/datetime partition columns is pooled -- shared across all

@@ -137,3 +137,161 @@ def test_shared_numeric_vocab_seed_input_preserves_numeric_value():
         f"seed_input price={seed_price} was not preserved in generated "
         f"samples: {samples['price'].tolist()}"
     )
+
+
+# --- any_order (beta): arbitrary-subset conditioning -----------------------
+
+
+def test_any_order_requires_shared_numeric_vocab():
+    with pytest.raises(ValueError, match="shared_numeric_vocab"):
+        REaLTabFormer2(
+            model_type="tabular",
+            tabular_backbone="distilgpt2",
+            any_order=True,
+            shared_numeric_vocab=False,
+        )
+
+
+def test_any_order_default_is_off():
+    model = REaLTabFormer2(
+        model_type="tabular", tabular_backbone="distilgpt2", shared_numeric_vocab=True
+    )
+    assert model.any_order is False
+    assert model.column_blocks is None
+
+
+def _fit_any_order_model(df: pd.DataFrame) -> REaLTabFormer2:
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=1,
+        batch_size=8,
+        tabular_backbone="distilgpt2",
+        shared_numeric_vocab=True,
+        any_order=True,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+    return model
+
+
+def test_any_order_end_to_end_fit_and_unconditional_sample():
+    df = _tiny_df(n_rows=60, seed=13)
+    model = _fit_any_order_model(df)
+
+    block_names = [name for name, _ in model.column_blocks]
+    assert block_names == ["price", "age", "gender"]
+
+    samples = model.sample(n_samples=5, device="cpu", gen_batch=5)
+    assert len(samples) == 5
+    assert list(samples.columns) == list(df.columns)
+
+
+def test_any_order_seed_on_last_column_only():
+    # Under fixed-order training this would be impossible: "gender" is the
+    # *last* column in canonical order, not a prefix, so a fixed-order
+    # model can never condition on it alone. any_order=True is trained to
+    # be robust to any column order specifically so this works.
+    #
+    # Checks *both* categorical values, not just one: a binary column has
+    # a 50% chance of "passing" by luck alone via the (unrelated)
+    # OOV-fallback random-value path if the seed encoding were broken --
+    # exactly how a real bug here (process_data's fresh-vs-fit-time index
+    # mismatch corrupting the seeded *value*, not just observed for a
+    # reordered/gapped subset) initially slipped past a single-value
+    # version of this test during development, caught only by the
+    # save/load test's independently-chosen seed value.
+    df = _tiny_df(n_rows=60, seed=17)
+    model = _fit_any_order_model(df)
+
+    for seed_val in ["m", "f"]:
+        seed_input = pd.DataFrame({"gender": [seed_val]})
+        samples = model.sample(
+            n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input
+        )
+        assert (samples["gender"] == seed_val).all(), (
+            f"seed_input gender={seed_val!r} not preserved: "
+            f"{samples['gender'].tolist()}"
+        )
+
+
+def test_any_order_seed_on_middle_column_skipping_earlier_column():
+    # Seeds on "age" (the middle column) while skipping "price" (the
+    # first column) entirely -- an arbitrary subset *with a gap*, not
+    # just a suffix. This is the case that specifically exercises the
+    # process_data re-indexing realignment (_realign_seed_columns):
+    # process_data assigns fresh 0-based indices to whatever subset/order
+    # of columns it's given, which don't match the fit-time indices
+    # unless corrected.
+    df = _tiny_df(n_rows=60, seed=19)
+    model = _fit_any_order_model(df)
+
+    seed_age = float(df["age"].iloc[0])
+    seed_input = pd.DataFrame({"age": [seed_age]})
+    samples = model.sample(n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input)
+
+    assert (samples["age"] == seed_age).all(), (
+        f"seed_input age={seed_age} was not preserved: {samples['age'].tolist()}"
+    )
+
+
+def test_any_order_save_load_roundtrip_preserves_non_prefix_seeding(tmp_path):
+    df = _tiny_df(n_rows=60, seed=23)
+    model = _fit_any_order_model(df)
+
+    save_dir = tmp_path / "any_order_model"
+    model.save(save_dir)
+
+    # save() creates save_dir/<experiment_id>/ and stores artefacts there.
+    reloaded = REaLTabFormer2.load_from_dir(save_dir / model.experiment_id)
+    assert reloaded.any_order is True
+    assert reloaded.column_blocks == model.column_blocks
+
+    seed_input = pd.DataFrame({"gender": ["f"]})
+    samples = reloaded.sample(n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input)
+    assert (samples["gender"] == "f").all()
+
+
+def test_any_order_conditioning_shifts_dependent_column_distribution():
+    # Statistical sanity check beyond "didn't crash": construct data with
+    # a strong, *coarse* dependency: "bucket" is a categorical column
+    # fully determined by which half of "a"'s range a falls in. A coarse
+    # threshold signal like this is far easier for a tiny model to pick
+    # up in a handful of epochs on a small dataset than an exact
+    # digit-level numeric relationship would be -- the point of this test
+    # is to check that conditioning propagates through the any-order
+    # machinery at all, not to benchmark fidelity on a hard regression.
+    rng = np.random.default_rng(29)
+    n = 300
+    a = rng.integers(1000, 1999, size=n).astype(float)
+    bucket = np.where(a < 1500, "low", "high")
+    df = pd.DataFrame({
+        "a": a, "bucket": bucket, "gender": rng.choice(["m", "f"], size=n),
+    })
+
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=20,
+        batch_size=16,
+        tabular_backbone="distilgpt2",
+        shared_numeric_vocab=True,
+        any_order=True,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+
+    seeded_low = model.sample(
+        n_samples=40, gen_batch=40, device="cpu",
+        seed_input=pd.DataFrame({"bucket": ["low"]}),
+    )
+    seeded_high = model.sample(
+        n_samples=40, gen_batch=40, device="cpu",
+        seed_input=pd.DataFrame({"bucket": ["high"]}),
+    )
+
+    assert (seeded_low["bucket"] == "low").all()
+    assert (seeded_high["bucket"] == "high").all()
+
+    assert seeded_low["a"].mean() < seeded_high["a"].mean(), (
+        "Conditioning on bucket='low' vs 'high' (a non-prefix column) "
+        "should shift generated 'a' accordingly: "
+        f"low-seeded mean={seeded_low['a'].mean()}, "
+        f"high-seeded mean={seeded_high['a'].mean()}"
+    )

@@ -4,7 +4,7 @@ algorithms used for tabular and relational data generation.
 
 import logging
 import warnings
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import datasets
 import numpy as np
@@ -19,9 +19,11 @@ from .data_utils import (
     NUMERIC_NA_TOKEN,
     ModelType,
     SpecialTokens,
+    compute_column_blocks,
     decode_column_values,
     decode_partition_numeric_col,
     decode_processed_column,
+    encode_column_values,
     fix_multi_decimal,
     is_datetime_col,
     is_numeric_col,
@@ -55,6 +57,7 @@ class REaLSampler:
         random_state: Optional[int] = 1029,
         device="cuda",
         col_type_ids_seq: Optional[List[int]] = None,
+        column_blocks: Optional[List[List]] = None,
     ) -> None:
         self.model_type = model_type
         self.vocab = vocab
@@ -68,6 +71,19 @@ class REaLSampler:
         # `sampler_from_model` uses `getattr(rtf_model, ..., None)` below,
         # so this stays a no-op for v1.
         self.col_type_ids_seq = col_type_ids_seq
+        # REaLTabFormerV2-only, beta (`any_order`, requires
+        # `shared_numeric_vocab`): the per-original-column block structure
+        # (data_utils.compute_column_blocks), None for every model that
+        # wasn't trained with `any_order=True`. Its presence is what gates
+        # `_process_seed_input` between today's prefix-only behavior and
+        # arbitrary-subset conditioning -- see that method.
+        self.column_blocks = column_blocks
+        # Scratch slot `_generate` uses to temporarily override
+        # `_prefix_allowed_tokens_fn`'s masking for one `.generate()` call
+        # with an order-specific `col_idx_ids` (see `_generate`'s
+        # `col_idx_ids_override` param) -- always reset after the call, so
+        # it never leaks into a later, unrelated call.
+        self._active_col_idx_ids: Optional[Dict[int, list]] = None
 
         self.columns = columns
         self.datetime_columns = datetime_columns
@@ -234,62 +250,87 @@ class REaLSampler:
         device: torch.device,
         as_numpy: Optional[bool] = True,
         constrain_tokens_gen: Optional[bool] = True,
+        col_idx_ids_override: Optional[Dict[int, list]] = None,
+        col_type_ids_seq_override: Optional[List[int]] = None,
         **generate_kwargs,
     ) -> Union[torch.tensor, np.ndarray]:
         # This leverages the generic interface of HuggingFace transformer models' `.generate` method.
         # Refer to the transformers documentation for valid arguments to `generate_kwargs`.
         self.model.eval()
 
-        if constrain_tokens_gen:
-            generate_kwargs["prefix_allowed_tokens_fn"] = self._prefix_allowed_tokens_fn
+        # REaLTabFormerV2-only, beta (`any_order`): scoped, single-call
+        # overrides for a non-canonical column order (e.g. an
+        # arbitrary-subset seed_input) -- `_prefix_allowed_tokens_fn` reads
+        # `self._active_col_idx_ids` in preference to `self.col_idx_ids`,
+        # and reusing `self.col_type_ids_seq` here (rather than a separate
+        # code path) lets the existing token_type_ids auto-injection below
+        # handle the batch-size expansion for us. Always restored in
+        # `finally`, so an override never leaks into a later call.
+        prev_active_col_idx_ids = self._active_col_idx_ids
+        prev_col_type_ids_seq = self.col_type_ids_seq
+        try:
+            self._active_col_idx_ids = col_idx_ids_override
+            if col_type_ids_seq_override is not None:
+                self.col_type_ids_seq = col_type_ids_seq_override
 
-        vocab = (
-            self.vocab
-            if self.model_type == ModelType.tabular
-            else self.vocab["decoder"]
-        )
+            if constrain_tokens_gen:
+                generate_kwargs["prefix_allowed_tokens_fn"] = (
+                    self._prefix_allowed_tokens_fn
+                )
 
-        # Make sure that the [RMASK] token will never be generated.
-        RMASK_ID = vocab["token2id"][SpecialTokens.RMASK]
-        if generate_kwargs["suppress_tokens"] is None:
-            generate_kwargs["suppress_tokens"] = [RMASK_ID]
-        else:
-            generate_kwargs["suppress_tokens"].append(RMASK_ID)
-
-        if "bos_token_id" not in generate_kwargs:
-            generate_kwargs["bos_token_id"] = vocab["token2id"][SpecialTokens.BOS]
-
-        if "pad_token_id" not in generate_kwargs:
-            generate_kwargs["pad_token_id"] = vocab["token2id"][SpecialTokens.PAD]
-
-        if "eos_token_id" not in generate_kwargs:
-            generate_kwargs["eos_token_id"] = vocab["token2id"][SpecialTokens.EOS]
-
-        if self.col_type_ids_seq is not None and "token_type_ids" not in generate_kwargs:
-            # REaLTabFormerV2-only, beta (`shared_numeric_vocab`): the full
-            # per-row column-identity sequence, precomputed once at fit
-            # time since a tabular row's length/column order is fixed and
-            # known in advance. `GenerationMixin.prepare_inputs_for_generation`
-            # slices this to the current cache position at each decode
-            # step the same way it already does for `position_ids` -- no
-            # per-step extension logic needed here. Matched to `inputs`'/
-            # `input_ids`'s starting batch dimension; HF expands it along
-            # with the prompt when `num_return_sequences` > 1.
-            seed = generate_kwargs.get("inputs", generate_kwargs.get("input_ids"))
-            batch = seed.shape[0] if seed is not None else 1
-            generate_kwargs["token_type_ids"] = torch.tensor(
-                [self.col_type_ids_seq] * batch, device=device
+            vocab = (
+                self.vocab
+                if self.model_type == ModelType.tabular
+                else self.vocab["decoder"]
             )
 
-        _samples = self.model.generate(**generate_kwargs)
-
-        if as_numpy:
-            if device == torch.device("cpu"):
-                _samples = _samples.numpy()
+            # Make sure that the [RMASK] token will never be generated.
+            RMASK_ID = vocab["token2id"][SpecialTokens.RMASK]
+            if generate_kwargs["suppress_tokens"] is None:
+                generate_kwargs["suppress_tokens"] = [RMASK_ID]
             else:
-                _samples = _samples.cpu().numpy()
+                generate_kwargs["suppress_tokens"].append(RMASK_ID)
 
-        return _samples
+            if "bos_token_id" not in generate_kwargs:
+                generate_kwargs["bos_token_id"] = vocab["token2id"][SpecialTokens.BOS]
+
+            if "pad_token_id" not in generate_kwargs:
+                generate_kwargs["pad_token_id"] = vocab["token2id"][SpecialTokens.PAD]
+
+            if "eos_token_id" not in generate_kwargs:
+                generate_kwargs["eos_token_id"] = vocab["token2id"][SpecialTokens.EOS]
+
+            if (
+                self.col_type_ids_seq is not None
+                and "token_type_ids" not in generate_kwargs
+            ):
+                # REaLTabFormerV2-only, beta (`shared_numeric_vocab`): the full
+                # per-row column-identity sequence, precomputed once at fit
+                # time since a tabular row's length/column order is fixed and
+                # known in advance. `GenerationMixin.prepare_inputs_for_generation`
+                # slices this to the current cache position at each decode
+                # step the same way it already does for `position_ids` -- no
+                # per-step extension logic needed here. Matched to `inputs`'/
+                # `input_ids`'s starting batch dimension; HF expands it along
+                # with the prompt when `num_return_sequences` > 1.
+                seed = generate_kwargs.get("inputs", generate_kwargs.get("input_ids"))
+                batch = seed.shape[0] if seed is not None else 1
+                generate_kwargs["token_type_ids"] = torch.tensor(
+                    [self.col_type_ids_seq] * batch, device=device
+                )
+
+            _samples = self.model.generate(**generate_kwargs)
+
+            if as_numpy:
+                if device == torch.device("cpu"):
+                    _samples = _samples.numpy()
+                else:
+                    _samples = _samples.cpu().numpy()
+
+            return _samples
+        finally:
+            self._active_col_idx_ids = prev_active_col_idx_ids
+            self.col_type_ids_seq = prev_col_type_ids_seq
 
     def _validate_synth_sample(self, synth_sample: pd.DataFrame) -> pd.DataFrame:
         # Validate data
@@ -410,6 +451,7 @@ class REaLSampler:
         relate_ids: Optional[List[Any]] = None,
         validator: Optional[ObservationValidator] = None,
         output_cols: Optional[List[str]] = None,
+        column_order: Optional[List[str]] = None,
     ) -> pd.DataFrame:
         assert isinstance(sample_outputs, np.ndarray)
 
@@ -419,10 +461,24 @@ class REaLSampler:
             return [vocab["id2token"][i] for i in s]
 
         if self.model_type == ModelType.tabular:
+            # `column_order` (REaLTabFormerV2-only, beta `any_order`):
+            # generation may have happened in a non-canonical column order
+            # (see `_process_seed_input`/`_build_order_masks`) -- naming
+            # each generated position with the *correct* processed column
+            # for that order (instead of always assuming
+            # `self.processed_columns`' canonical order) is all downstream
+            # code needs: `_recover_data_values`/`_convert_to_table` look
+            # columns up by *name*, and `_convert_to_table` re-sorts
+            # columns back to canonical order anyway
+            # (`synth_df[sorted(synth_df.columns)]`, which sorts
+            # lexicographically -- equivalent to canonical order since the
+            # index prefix is zero-padded), so nothing else needs to change.
             # Slice to remove the [BOS] and [EOS] tokens
             synth_sample = pd.DataFrame(
                 [_decode_tokens(s)[1:-1] for s in sample_outputs],
-                columns=self.processed_columns,
+                columns=(
+                    column_order if column_order is not None else self.processed_columns
+                ),
             )
         else:
             assert relate_ids is not None
@@ -550,6 +606,7 @@ class TabularSampler(REaLSampler):
         random_state: Optional[int] = 1029,
         device="cuda",
         col_type_ids_seq: Optional[List[int]] = None,
+        column_blocks: Optional[List[List]] = None,
     ) -> None:
         super().__init__(
             model_type,
@@ -568,6 +625,7 @@ class TabularSampler(REaLSampler):
             random_state,
             device,
             col_type_ids_seq,
+            column_blocks,
         )
 
         self.output_vocab = self.vocab
@@ -597,6 +655,7 @@ class TabularSampler(REaLSampler):
             random_state=rtf_model.random_state,
             device=device,
             col_type_ids_seq=getattr(rtf_model, "col_type_ids_seq", None),
+            column_blocks=getattr(rtf_model, "column_blocks", None),
         )
 
     def _prefix_allowed_tokens_fn(self, batch_id, input_ids) -> List:
@@ -605,13 +664,128 @@ class TabularSampler(REaLSampler):
 
         # Subtract by 1 since the first valid token has index zero in
         # col_idx_ids while the input_ids already contains the [BOS] token.
-        return self.col_idx_ids.get(
+        # `self._active_col_idx_ids` (REaLTabFormerV2-only, beta
+        # `any_order`) takes precedence when `_generate` has set it for a
+        # non-canonical-order call -- see `_generate`'s
+        # `col_idx_ids_override`.
+        col_idx_ids = (
+            self._active_col_idx_ids
+            if self._active_col_idx_ids is not None
+            else self.col_idx_ids
+        )
+        return col_idx_ids.get(
             len(input_ids) - 1, [self.vocab["token2id"][SpecialTokens.EOS]]
         )
 
+    def _build_order_masks(
+        self, column_order: List[str]
+    ) -> Tuple[Dict[int, list], List[int], List[str]]:
+        """REaLTabFormerV2-only, beta (`any_order`). Given a full
+        permutation of *original* column names (every name in
+        `self.columns`, in some order), build the position-indexed
+        `col_idx_ids`/`token_type_ids_seq` for that specific order, plus
+        the flat processed-column-name order (for `_processes_sample`'s
+        DataFrame construction) -- generalizes what `_fit_tabular`
+        (realtabformer2.py) computes once for the canonical order to an
+        arbitrary order, via the same `column_blocks` structure and the
+        same `vocab["column_token_ids"]`/`vocab["column_type_ids"]`
+        lookups.
+        """
+        assert self.column_blocks is not None
+        block_by_name = {name: indices for name, indices in self.column_blocks}
+        sptype_id = self.vocab["token2id"][SpecialTokens.SPTYPE]
+
+        processed_column_order: List[str] = []
+        for name in column_order:
+            for idx in block_by_name[name]:
+                processed_column_order.append(self.processed_columns[idx])
+
+        col_idx_ids = {
+            ix: self.vocab["column_token_ids"][col]
+            for ix, col in enumerate(processed_column_order)
+        }
+        token_type_ids_seq = (
+            [sptype_id]
+            + [self.vocab["column_type_ids"][col] for col in processed_column_order]
+            + [sptype_id]
+        )
+
+        return col_idx_ids, token_type_ids_seq, processed_column_order
+
+    def _realign_seed_columns(
+        self, seed_pr_df: pd.DataFrame, target_processed_order: List[str]
+    ) -> pd.DataFrame:
+        """`process_data` derives each processed column's *index* prefix
+        fresh from `enumerate(df.columns)` on whatever subset/order of
+        original columns is passed to it
+        (`_compute_column_index_prefixes`, data_utils/process.py) -- so
+        calling it on a non-prefix or reordered subset of `self.columns`
+        (as `_process_seed_input` does for an any-order arbitrary-subset
+        seed) produces processed column names with the *wrong* index
+        prefix relative to the ones `self.vocab` actually knows (fit-time
+        indices came from the full, canonically-ordered dataframe).
+        Confirmed empirically: seeding with just `["gender", "price"]`
+        (fit-time indices 2 and 0) reindexes them fresh as 0 and 1.
+
+        `_original_column_name` is robust to this -- it only strips the
+        index+dtype prefix, it doesn't care what the digits are -- so
+        finding the *correct* fit-time name for each of the seed's
+        freshly (mis-)indexed processed sub-columns is a matter of
+        pairing them up via `self.column_blocks`, in their shared,
+        index-independent relative sub-order (a numeric column's digit
+        chunks are always produced in the same order regardless of which
+        outer index the column happens to get).
+
+        Critically, `process_data`'s `encode_column_values` step bakes
+        that *fresh*, wrong-index column name onto every cell's value
+        (`col_name + SEP + value`) before this function ever sees it --
+        so simply renaming the DataFrame's column *label* to the correct
+        name (leaving the cell values' baked-in prefix untouched) is not
+        enough: `vocab["token2id"]` would still miss on the resulting
+        `"<fresh-wrong-index>___<value>"` strings and silently fall
+        through to the OOV-fallback random-value path, exactly the class
+        of bug the shared_numeric_vocab seed_input fix (this session)
+        already fixed once for the simpler prefix-only case. Confirmed
+        empirically here too: renaming only the column label left seeded
+        `gender="f"` silently generating `"m"` instead. Each column's
+        values are stripped back to raw (`decode_column_values`) and
+        re-baked with the correct fit-time name
+        (`encode_column_values`), not just relabeled.
+        """
+        fresh_blocks = compute_column_blocks(seed_pr_df.columns.tolist())
+        fit_time_blocks = {name: indices for name, indices in self.column_blocks}
+
+        realigned: Dict[str, pd.Series] = {}
+        for name, fresh_indices in fresh_blocks:
+            fresh_names = [seed_pr_df.columns[i] for i in fresh_indices]
+            correct_names = [self.processed_columns[i] for i in fit_time_blocks[name]]
+            assert len(fresh_names) == len(correct_names), (
+                f"Partition count mismatch for column {name!r}: seed-time "
+                f"produced {len(fresh_names)}, fit-time expects "
+                f"{len(correct_names)}."
+            )
+            for fresh_name, correct_name in zip(fresh_names, correct_names):
+                raw_values = decode_column_values(seed_pr_df[fresh_name])
+                raw_values.name = correct_name
+                realigned[correct_name] = encode_column_values(raw_values)
+
+        return pd.DataFrame(realigned)[target_processed_order]
+
     def _process_seed_input(
         self, seed_input: Union[pd.DataFrame, Dict[str, Any]]
-    ) -> torch.Tensor:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[Dict[int, list]],
+        Optional[List[int]],
+        Optional[List[str]],
+    ]:
+        """Returns `(generated, col_idx_ids_override, token_type_ids_override,
+        column_order)`. The last three are `None` unless this is an
+        any-order model (`self.column_blocks is not None`) -- callers
+        pass them straight into `_generate`/`_processes_sample` and their
+        `None` default there reproduces today's canonical-order behavior
+        exactly, so a non-any-order model sees zero behavior change.
+        """
         # TODO: The heuristic of choosing the valid columns shouldn't contradict
         # with the `first_col_type` argument of `data_utils.process_data`.`
         if isinstance(seed_input, pd.DataFrame):
@@ -621,11 +795,32 @@ class TabularSampler(REaLSampler):
         else:
             raise ValueError(f"Unknown seed_input type: {type(seed_input)}...")
 
-        valid_cols = []
-        for col in self.columns:
-            if col not in input_cols:
-                break
-            valid_cols.append(col)
+        col_idx_ids_override = None
+        token_type_ids_override = None
+        processed_column_order = None
+
+        if self.column_blocks is not None:
+            # Beta (`any_order`): the model was trained to be robust to
+            # any column order, so seed_input can be an *arbitrary
+            # subset* of self.columns, not just a prefix of it. Given
+            # columns keep the caller's own relative order (more
+            # intuitive/controllable than silently renormalizing to
+            # canonical order for the part the caller actually
+            # specified); the remaining, ungiven columns are appended in
+            # their canonical relative order.
+            valid_cols = [c for c in input_cols if c in self.columns]
+            remaining_cols = [c for c in self.columns if c not in valid_cols]
+            full_order = valid_cols + remaining_cols
+
+            col_idx_ids_override, token_type_ids_override, processed_column_order = (
+                self._build_order_masks(full_order)
+            )
+        else:
+            valid_cols = []
+            for col in self.columns:
+                if col not in input_cols:
+                    break
+                valid_cols.append(col)
 
         if isinstance(seed_input, dict):
             seed_input = pd.DataFrame.from_dict({0: seed_input}, orient="index")
@@ -635,6 +830,16 @@ class TabularSampler(REaLSampler):
         seed_data, _, _ = process_data(
             df=seed_input, col_transform_data=self.col_transform_data
         )
+
+        if self.column_blocks is not None:
+            # See `_realign_seed_columns`: process_data's freshly-assigned
+            # index prefixes for this (possibly non-prefix/reordered)
+            # subset don't match the fit-time ones `self.vocab` knows.
+            # Realign to the correct fit-time names, in the exact order
+            # this call's chosen column order needs (the given-columns
+            # prefix of `processed_column_order`).
+            given_processed_order = processed_column_order[: len(seed_data.columns)]
+            seed_data = self._realign_seed_columns(seed_data, given_processed_order)
 
         if self.col_type_ids_seq is not None:
             # REaLTabFormerV2-only, beta (`shared_numeric_vocab`): `self.vocab`
@@ -672,7 +877,12 @@ class TabularSampler(REaLSampler):
         if len(generated.shape) == 1:
             generated = generated.unsqueeze(0)
 
-        return generated
+        return (
+            generated,
+            col_idx_ids_override,
+            token_type_ids_override,
+            processed_column_order,
+        )
 
     def sample_tabular(
         self,
@@ -695,12 +905,18 @@ class TabularSampler(REaLSampler):
         self.model.eval()
         synth_df = []
 
+        col_idx_ids_override = None
+        token_type_ids_override = None
+        column_order = None
+
         if seed_input is None:
             generated = torch.tensor(
                 [self.vocab["token2id"][SpecialTokens.BOS] for _ in range(1)]
             ).unsqueeze(0)
         else:
-            generated = self._process_seed_input(seed_input=seed_input)
+            generated, col_idx_ids_override, token_type_ids_override, column_order = (
+                self._process_seed_input(seed_input=seed_input)
+            )
 
         generated = generated.to(self.model.device)
 
@@ -715,6 +931,8 @@ class TabularSampler(REaLSampler):
                     device=device,
                     as_numpy=True,
                     constrain_tokens_gen=constrain_tokens_gen,
+                    col_idx_ids_override=col_idx_ids_override,
+                    col_type_ids_seq_override=token_type_ids_override,
                     inputs=generated,
                     do_sample=True,
                     max_length=self.max_length,
@@ -735,6 +953,7 @@ class TabularSampler(REaLSampler):
                         sample_outputs=sample_outputs,
                         vocab=self.vocab,
                         validator=validator,
+                        column_order=column_order,
                     )
                     empty_limit = continuous_empty_limit
                     self.invalid_gen_samples -= len(synth_sample)
@@ -800,7 +1019,9 @@ class TabularSampler(REaLSampler):
 
         self.model.eval()
 
-        generated = self._process_seed_input(seed_input=seed_input)
+        generated, col_idx_ids_override, token_type_ids_override, column_order = (
+            self._process_seed_input(seed_input=seed_input)
+        )
 
         generated = generated.to(self.model.device)
 
@@ -814,6 +1035,8 @@ class TabularSampler(REaLSampler):
                 device=device,
                 as_numpy=as_numpy,
                 constrain_tokens_gen=constrain_tokens_gen,
+                col_idx_ids_override=col_idx_ids_override,
+                col_type_ids_seq_override=token_type_ids_override,
                 inputs=generated,
                 do_sample=do_sample,
                 max_length=self.max_length,
@@ -835,6 +1058,7 @@ class TabularSampler(REaLSampler):
                     vocab=self.vocab,
                     validator=validator,
                     output_cols=output_cols,
+                    column_order=column_order,
                 )
 
                 if synth_sample.shape[0] != expected_nout:
@@ -889,7 +1113,9 @@ class TabularSampler(REaLSampler):
             datasets.utils.disable_progress_bar()
 
         for i in range(0, len(data), batch):
-            seed_data = self._process_seed_input(data.iloc[i : i + batch])
+            seed_data, col_idx_ids_override, token_type_ids_override, column_order = (
+                self._process_seed_input(data.iloc[i : i + batch])
+            )
             if fillunk:
                 mode = seed_data.mode(dim=0).values
                 seed_data[seed_data == unk_id] = torch.tile(mode, (len(seed_data), 1))[
@@ -900,6 +1126,8 @@ class TabularSampler(REaLSampler):
                 device=device,
                 do_sample=True,
                 num_return_sequences=obs_sample,
+                col_idx_ids_override=col_idx_ids_override,
+                col_type_ids_seq_override=token_type_ids_override,
                 input_ids=seed_data.to(device),
                 max_length=self.max_length,
                 suppress_tokens=[unk_id],
@@ -910,6 +1138,7 @@ class TabularSampler(REaLSampler):
                 sample_outputs=sample_outputs,
                 vocab=self.vocab,
                 validator=None,
+                column_order=column_order,
             )
             # Reset the index so that we are sure that
             # the index is monotonically increasing.
