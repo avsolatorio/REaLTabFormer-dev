@@ -357,3 +357,43 @@ def test_numeric_quantile_encoding_end_to_end_dtype_and_distributional_fidelity(
     # strongly reject the null of equal distributions.
     ks_stat, _ = stats.ks_2samp(samples["price"].dropna(), df["price"])
     assert ks_stat < 0.2, f"KS statistic too high: {ks_stat}"
+
+
+# --- sensitivity-based training (_train_with_sensitivity): gen_kwargs=None crash ---
+
+
+def test_sensitivity_training_does_not_crash_with_default_gen_kwargs():
+    # Regression test: fit()'s own default is n_critic=5 (> 0), which
+    # routes to _train_with_sensitivity -- REaLTabFormer's DCR-bootstrap
+    # overfitting-protection mechanism, one of the two headline
+    # contributions of the original paper. That method's gen_kwargs
+    # parameter defaults to None, but was unpacked directly as
+    # `**gen_kwargs` when generating samples for each critic round --
+    # crashing with "argument after ** must be a mapping, not NoneType"
+    # for any caller who didn't happen to pass gen_kwargs explicitly,
+    # which is the ordinary way to call .fit(). Pre-existing since
+    # commit 73f23964, unrelated to any change this session made --
+    # only found because this session's experiments finally exercised
+    # n_critic>0 (every earlier test/experiment used n_critic=0, which
+    # routes around this code path entirely via the plain-fit branch).
+    rng = np.random.default_rng(RANDOM_SEED)
+    n = 40
+    df = pd.DataFrame({
+        "price": rng.normal(100, 20, size=n).round(2),
+        "gender": rng.choice(["m", "f"], size=n),
+    })
+
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=2,
+        batch_size=8,
+        random_state=RANDOM_SEED,
+    )
+    # n_critic=1 (not the 0 every other test in this file uses) forces at
+    # least one critic round -- the code path where gen_kwargs=None was
+    # unpacked and crashed -- within a fast, minimal test. num_bootstrap
+    # is dropped to keep the sensitivity-threshold bootstrap itself fast;
+    # correctness of that mechanism's own statistics isn't what's under
+    # test here, just that gen_kwargs=None doesn't crash it.
+    model.fit(df, device="cpu", n_critic=1, n_critic_stop=1, num_bootstrap=20)
+    assert model.model is not None

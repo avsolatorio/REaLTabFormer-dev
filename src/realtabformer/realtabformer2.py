@@ -1000,7 +1000,9 @@ class REaLTabFormer2:
             try:
                 # Generate samples
                 gen_df = self.sample(
-                    n_samples=gen_rounds * gen_total, device=device, **gen_kwargs
+                    n_samples=gen_rounds * gen_total,
+                    device=device,
+                    **(gen_kwargs or {}),
                 )
             except SampleEmptyLimitError:
                 # Continue training if the model is still not

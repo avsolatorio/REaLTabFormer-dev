@@ -376,6 +376,23 @@ def test_digit_entropy_weighting_composes_with_field_weights():
     assert "chunk_significance_weights" in model.vocab
 
 
+# --- sensitivity-based training (_train_with_sensitivity): gen_kwargs=None crash ---
+
+
+def test_sensitivity_training_does_not_crash_with_default_gen_kwargs():
+    # v2 counterpart of the same regression test in test_realtabformer.py
+    # -- see that test's docstring for the full explanation. Same
+    # pre-existing bug (commit 73f23964), same fix
+    # (`**(gen_kwargs or {})`), independently present in
+    # realtabformer2.py's own copy of _train_with_sensitivity.
+    df = _tiny_df(n_rows=40)
+    model = REaLTabFormer2(
+        model_type="tabular", epochs=2, batch_size=8, tabular_backbone="distilgpt2",
+    )
+    model.fit(df, device="cpu", n_critic=1, n_critic_stop=1, num_bootstrap=20)
+    assert model.model is not None
+
+
 def test_any_order_composes_with_digit_entropy_weighting():
     # Neither feature's own test suite exercises the other: any_order's
     # tests never pass digit_entropy_weighting, and digit_entropy_weighting's
