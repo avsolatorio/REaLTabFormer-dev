@@ -260,15 +260,36 @@ class REaLTabFormer2:
                 class accepts `token_type_ids` (GPT2-family backbones do; most others, e.g.
                 LLaMA/Mistral/GPT-NeoX-family, do not) -- raises `ValueError` at construction
                 time otherwise. Categorical columns are not pooled.
-            any_order: Beta. Requires `shared_numeric_vocab=True`. If True, training randomly
-                permutes each row's *original*-column order every batch (each numeric/datetime
-                column's own digit chunks always stay together and in order; only the order of
-                columns relative to each other is permuted), so the model is trained to be
-                robust to any column ordering instead of only the one fixed left-to-right order.
-                This lets `seed_input`/`sample_tabular_with_seed()`/`predict()` condition
-                generation on an *arbitrary subset* of columns (not just a prefix of the
-                training column order) -- see `rtf_sampler.py`'s `_process_seed_input`. Raises
-                `ValueError` at construction time if `shared_numeric_vocab` is not also True.
+            any_order: Beta. Tabular-only. If True, training randomly permutes each row's
+                *original*-column order every batch (each numeric/datetime column's own digit
+                chunks always stay together and in order; only the order of columns relative
+                to each other is permuted), so the model is trained to be robust to any column
+                ordering instead of only the one fixed left-to-right order. This lets
+                `seed_input`/`sample_tabular_with_seed()`/`predict()` condition generation on
+                an *arbitrary subset* of columns (not just a prefix of the training column
+                order) -- see `rtf_sampler.py`'s `_process_seed_input`.
+
+                Independent of `shared_numeric_vocab` (no longer required as of this fix; an
+                earlier version of this code required it only because it reused
+                `shared_numeric_vocab`'s `token_type_ids` machinery for column identity, not
+                because any_order mechanically needs it). Works, and is recommended, without
+                `shared_numeric_vocab`: the disjoint per-column-per-digit-chunk vocabulary
+                every non-pooled column already has (`price_00`'s digit tokens are already a
+                completely separate vocabulary range from `price_01`'s) makes every token
+                self-identifying regardless of where it lands after permutation -- no
+                position-dependent disambiguation needed at all.
+
+                Combining `any_order=True` with `shared_numeric_vocab=True` still works, but
+                has a known, measured quality cost specific to multi-chunk numeric columns:
+                `shared_numeric_vocab` pools digit tokens across columns, so a column's own
+                chunk-position-within-itself is no longer encoded by the token identity and
+                falls back on absolute sequence position -- which any_order's permutation
+                makes unreliable (the same chunk lands at a different absolute position every
+                batch). Confirmed empirically: on a real dataset, combining both hurt numeric
+                marginal fidelity substantially (fnlwgt KS 0.203->0.324) while categorical
+                columns, which don't have this within-column structure, were unaffected or
+                improved. Prefer `any_order=True, shared_numeric_vocab=False` unless you
+                specifically need `shared_numeric_vocab`'s embedding-pooling benefit too.
             training_args_kwargs: Keyword arguments for the `TrainingArguments` used in training
                 the model. Arguments such as `output_dir`, `num_train_epochs`,
                 `per_device_train_batch_size`, `per_device_eval_batch_size` if passed will be
@@ -290,14 +311,25 @@ class REaLTabFormer2:
             )
         self.shared_numeric_vocab = shared_numeric_vocab
 
-        if any_order and not shared_numeric_vocab:
+        if any_order and model_type != ModelType.tabular:
             raise ValueError(
-                "any_order=True requires shared_numeric_vocab=True -- any-order training "
-                "relies on the token_type_ids column-identity machinery that "
-                "shared_numeric_vocab already sets up."
+                "any_order is only supported for model_type='tabular' "
+                f"(got model_type={model_type!r})."
             )
         self.any_order = any_order
         self.column_blocks: Optional[List[List]] = None
+
+        # Pre-existing gap, found while testing any_order=True with
+        # shared_numeric_vocab=False for the first time (a combination no
+        # prior test exercised): unlike every other optional/beta
+        # attribute on this class, col_type_ids_seq was only ever assigned
+        # inside _fit_tabular's `if self.shared_numeric_vocab:` branch, so
+        # it didn't exist at all (not even as None) on a freshly
+        # constructed model, or after a shared_numeric_vocab=False fit --
+        # any code reading `model.col_type_ids_seq` in that case hit
+        # AttributeError instead of the expected None. Defaulted here for
+        # the same reason every other such attribute already is.
+        self.col_type_ids_seq: Optional[List[int]] = None
 
         if model_type not in ModelType.types():
             self._invalid_model_type(model_type)

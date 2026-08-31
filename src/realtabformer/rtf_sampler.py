@@ -716,7 +716,7 @@ class TabularSampler(REaLSampler):
 
     def _build_order_masks(
         self, column_order: List[str]
-    ) -> Tuple[Dict[int, list], List[int], List[str]]:
+    ) -> Tuple[Dict[int, list], Optional[List[int]], List[str]]:
         """REaLTabFormerV2-only, beta (`any_order`). Given a full
         permutation of *original* column names (every name in
         `self.columns`, in some order), build the position-indexed
@@ -724,9 +724,17 @@ class TabularSampler(REaLSampler):
         the flat processed-column-name order (for `_processes_sample`'s
         DataFrame construction) -- generalizes what `_fit_tabular`
         (realtabformer2.py) computes once for the canonical order to an
-        arbitrary order, via the same `column_blocks` structure and the
-        same `vocab["column_token_ids"]`/`vocab["column_type_ids"]`
-        lookups.
+        arbitrary order, via the same `column_blocks` structure and
+        `vocab["column_token_ids"]`.
+
+        `token_type_ids_seq` is only meaningful for a `shared_numeric_vocab`
+        fit (its vocab is the only one with a `column_type_ids` entry --
+        `any_order` no longer requires `shared_numeric_vocab`, and a plain
+        disjoint-vocab any_order model has no use for it, since every
+        token is already self-identifying regardless of position). Returns
+        `None` for it when absent, matching `col_type_ids_seq_override`'s
+        existing `None`-means-"don't touch token_type_ids" handling in
+        `_generate`.
         """
         assert self.column_blocks is not None
         block_by_name = {name: indices for name, indices in self.column_blocks}
@@ -741,11 +749,14 @@ class TabularSampler(REaLSampler):
             ix: self.vocab["column_token_ids"][col]
             for ix, col in enumerate(processed_column_order)
         }
-        token_type_ids_seq = (
-            [sptype_id]
-            + [self.vocab["column_type_ids"][col] for col in processed_column_order]
-            + [sptype_id]
-        )
+
+        token_type_ids_seq = None
+        if "column_type_ids" in self.vocab:
+            token_type_ids_seq = (
+                [sptype_id]
+                + [self.vocab["column_type_ids"][col] for col in processed_column_order]
+                + [sptype_id]
+            )
 
         return col_idx_ids, token_type_ids_seq, processed_column_order
 

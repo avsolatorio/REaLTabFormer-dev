@@ -96,7 +96,14 @@ def test_shared_numeric_vocab_end_to_end_fit_and_sample():
     # relative to the unpooled (per-column) baseline on the same data --
     # this is the entire point of the feature, not just "didn't crash".
     assert pooled_model.tabular_config.vocab_size < unpooled_model.tabular_config.vocab_size
-    assert not hasattr(unpooled_model, "col_type_ids_seq")
+    # col_type_ids_seq now always exists (defaulted to None in __init__,
+    # like every other optional/beta attribute) -- an unpooled model's
+    # stays None rather than the attribute being absent entirely, a
+    # pre-existing inconsistency found and fixed while decoupling
+    # any_order from shared_numeric_vocab (any code reading
+    # `model.col_type_ids_seq` on an unpooled model used to hit
+    # AttributeError instead of getting the expected None).
+    assert unpooled_model.col_type_ids_seq is None
 
 
 def test_shared_numeric_vocab_seed_input_preserves_numeric_value():
@@ -143,13 +150,35 @@ def test_shared_numeric_vocab_seed_input_preserves_numeric_value():
 # --- any_order (beta): arbitrary-subset conditioning -----------------------
 
 
-def test_any_order_requires_shared_numeric_vocab():
-    with pytest.raises(ValueError, match="shared_numeric_vocab"):
+def test_any_order_no_longer_requires_shared_numeric_vocab():
+    # any_order used to require shared_numeric_vocab=True purely because it
+    # reused shared_numeric_vocab's token_type_ids column-identity
+    # machinery, not because it mechanically needs it -- a disjoint
+    # per-column-per-digit-chunk vocabulary (every non-pooled column
+    # already has one) makes every token self-identifying regardless of
+    # where any_order's permutation moves it, no token_type_ids needed.
+    # Must not raise.
+    model = REaLTabFormer2(
+        model_type="tabular",
+        tabular_backbone="distilgpt2",
+        any_order=True,
+        shared_numeric_vocab=False,
+    )
+    assert model.any_order is True
+    assert model.shared_numeric_vocab is False
+    assert model.col_type_ids_seq is None
+
+
+def test_any_order_requires_tabular_model_type():
+    # The validation any_order actually needs (column_blocks/
+    # AnyOrderColumnCollator are tabular-only) -- previously reached only
+    # transitively via requiring shared_numeric_vocab, which also checks
+    # this; now checked directly since that requirement is gone.
+    with pytest.raises(ValueError, match="tabular"):
         REaLTabFormer2(
-            model_type="tabular",
+            model_type="relational",
             tabular_backbone="distilgpt2",
             any_order=True,
-            shared_numeric_vocab=False,
         )
 
 
@@ -296,6 +325,91 @@ def test_any_order_conditioning_shifts_dependent_column_distribution():
         f"low-seeded mean={seeded_low['a'].mean()}, "
         f"high-seeded mean={seeded_high['a'].mean()}"
     )
+
+
+# --- any_order without shared_numeric_vocab (the now-decoupled, recommended combination) ---
+
+
+def _fit_any_order_no_shared_vocab_model(df: pd.DataFrame) -> REaLTabFormer2:
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=1,
+        batch_size=8,
+        tabular_backbone="distilgpt2",
+        shared_numeric_vocab=False,
+        any_order=True,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+    return model
+
+
+def test_any_order_without_shared_vocab_end_to_end_fit_and_unconditional_sample():
+    df = _tiny_df(n_rows=60, seed=41)
+    model = _fit_any_order_no_shared_vocab_model(df)
+
+    assert model.col_type_ids_seq is None
+    block_names = [name for name, _ in model.column_blocks]
+    assert block_names == ["price", "age", "gender"]
+
+    samples = model.sample(n_samples=5, device="cpu", gen_batch=5)
+    assert len(samples) == 5
+    assert list(samples.columns) == list(df.columns)
+
+
+def test_any_order_without_shared_vocab_seed_on_last_column_only():
+    # Same claim as any_order's own shared_numeric_vocab=True test, for
+    # the decoupled combination: "gender" is the *last* column, impossible
+    # to condition on under fixed-order training. Checks both values, not
+    # just one, per the same rationale as the shared_numeric_vocab
+    # version -- a 50% chance of "passing" via the unrelated OOV-fallback
+    # path is exactly how a real seeding bug could slip past a
+    # single-value check.
+    df = _tiny_df(n_rows=60, seed=43)
+    model = _fit_any_order_no_shared_vocab_model(df)
+
+    for seed_val in ["m", "f"]:
+        seed_input = pd.DataFrame({"gender": [seed_val]})
+        samples = model.sample(
+            n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input
+        )
+        assert (samples["gender"] == seed_val).all(), (
+            f"seed_input gender={seed_val!r} not preserved without "
+            f"shared_numeric_vocab: {samples['gender'].tolist()}"
+        )
+
+
+def test_any_order_without_shared_vocab_seed_on_middle_column_skipping_earlier_column():
+    # The harder case: seeds on "age" (the middle column) while skipping
+    # "price" (the first column) entirely -- an arbitrary subset with a
+    # gap, not just a suffix.
+    df = _tiny_df(n_rows=60, seed=47)
+    model = _fit_any_order_no_shared_vocab_model(df)
+
+    seed_age = float(df["age"].iloc[0])
+    seed_input = pd.DataFrame({"age": [seed_age]})
+    samples = model.sample(n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input)
+
+    assert (samples["age"] == seed_age).all(), (
+        f"seed_input age={seed_age} was not preserved: {samples['age'].tolist()}"
+    )
+
+
+def test_any_order_without_shared_vocab_save_load_roundtrip_preserves_non_prefix_seeding(tmp_path):
+    df = _tiny_df(n_rows=60, seed=53)
+    model = _fit_any_order_no_shared_vocab_model(df)
+
+    save_dir = tmp_path / "any_order_no_shared_vocab_model"
+    model.save(save_dir)
+
+    reloaded = REaLTabFormer2.load_from_dir(save_dir / model.experiment_id)
+    assert reloaded.any_order is True
+    assert reloaded.shared_numeric_vocab is False
+    assert reloaded.column_blocks == model.column_blocks
+    assert reloaded.col_type_ids_seq is None
+
+    seed_input = pd.DataFrame({"gender": ["f"]})
+    samples = reloaded.sample(n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input)
+    assert (samples["gender"] == "f").all()
 
 
 # --- digit_entropy_weighting (beta): entropy-based digit-chunk loss weighting ---
