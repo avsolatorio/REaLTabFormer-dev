@@ -376,6 +376,76 @@ def test_digit_entropy_weighting_composes_with_field_weights():
     assert "chunk_significance_weights" in model.vocab
 
 
+def test_any_order_composes_with_digit_entropy_weighting():
+    # Neither feature's own test suite exercises the other: any_order's
+    # tests never pass digit_entropy_weighting, and digit_entropy_weighting's
+    # tests never set any_order=True. They touch genuinely different parts
+    # of the pipeline (AnyOrderColumnCollator permutes token_weights
+    # alongside input_ids/labels/token_type_ids every batch;
+    # chunk_significance_weights only decides what those per-token weights
+    # *are*, computed once from the untouched, canonically-ordered vocab)
+    # -- but "different code paths" isn't the same as "verified to compose
+    # correctly", and this session already found one real bug that only
+    # showed up when two independently-correct-looking features were
+    # combined and actually run. Checks three things a purely orthogonal
+    # pair could still get wrong together: entropy weights are computed
+    # normally, any-order-specific arbitrary-subset seeding still works
+    # with entropy weighting active, and unconditional sampling still
+    # works too.
+    rng = np.random.default_rng(31)
+    n = 300
+    price = np.round(rng.exponential(scale=50, size=n))
+    price = np.clip(price, 1, 999)
+    df = pd.DataFrame({
+        "price": price, "gender": rng.choice(["m", "f"], size=n),
+    })
+
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=1,
+        batch_size=8,
+        tabular_backbone="distilgpt2",
+        numeric_max_len=6,
+        numeric_precision=0,
+        numeric_nparts=1,
+        shared_numeric_vocab=True,
+        any_order=True,
+    )
+    model.fit(df, device="cpu", n_critic=0, digit_entropy_weighting=True)
+
+    # digit_entropy_weighting's own claim still holds under any_order:
+    # the heavy-tailed column's near-constant leading chunk gets a lower
+    # weight than its higher-variance trailing chunk.
+    weights = model.vocab["chunk_significance_weights"]
+    price_chunks = sorted(c for c in model.processed_columns if "price" in c)
+    assert len(price_chunks) > 1
+    assert weights[price_chunks[0]] < weights[price_chunks[-1]]
+
+    # any_order's own claim still holds under digit_entropy_weighting:
+    # column_blocks got built, and unconditional sampling works.
+    assert [name for name, _ in model.column_blocks] == ["price", "gender"]
+    samples = model.sample(n_samples=5, device="cpu", gen_batch=5)
+    assert len(samples) == 5
+    assert list(samples.columns) == list(df.columns)
+
+    # The specific thing that could plausibly break under composition:
+    # any-order's arbitrary-subset seeding (condition on "gender", the
+    # *last* column, impossible under fixed-order training) with the
+    # entropy-weighted model. Checks both values, not just one -- a 50%
+    # chance of "passing" by luck via the (unrelated) OOV-fallback path
+    # is exactly how a real seeding bug slipped past a single-value
+    # version of any_order's own seed test during its own development.
+    for seed_val in ["m", "f"]:
+        seed_input = pd.DataFrame({"gender": [seed_val]})
+        seeded = model.sample(
+            n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input
+        )
+        assert (seeded["gender"] == seed_val).all(), (
+            f"seed_input gender={seed_val!r} not preserved under "
+            f"any_order + digit_entropy_weighting: {seeded['gender'].tolist()}"
+        )
+
+
 # --- numeric_categorical_threshold: cardinality-aware numeric dispatch -----
 
 
