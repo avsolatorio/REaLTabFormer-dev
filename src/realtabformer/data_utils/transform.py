@@ -50,6 +50,90 @@ def fix_multi_decimal(v):
     return v
 
 
+# A single value recurring in at least this fraction of a column's rows
+# (e.g. the zero in a zero-inflated capital-gain/loss-style column) is
+# treated as a dedicated point mass by `_fit_quantile_breakpoints` rather
+# than left to consume its proportional share of `n_quantiles` breakpoints
+# via the plain QuantileTransformer fit. Below this, an ordinary tie in
+# continuous data isn't worth the extra fit complexity -- the boundary
+# grid-snap in `_apply_quantile_encoding` already makes it decode
+# correctly, just without the resolution optimization below.
+_POINT_MASS_THRESHOLD = 0.05
+
+
+def _fit_quantile_breakpoints(
+    valid: pd.Series, n_quantiles: int
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Fit the `(quantile_values, quantile_positions)` breakpoint arrays
+    for `valid`'s empirical distribution, `n_quantiles` at a time.
+
+    Detects a single dominant point mass -- one value recurring in at
+    least `_POINT_MASS_THRESHOLD` of rows, the pattern a zero-inflated
+    column like the UCI Adult dataset's `capital-gain`/`capital-loss`
+    columns has (>90% exact zeros there). A plain fit on the *full*
+    column spends a share of its `n_quantiles` breakpoints proportional
+    to that value's frequency describing the same repeated value over
+    and over -- e.g. 955 of 1000 breakpoints for a 95.5%-zero column --
+    leaving only the remainder to describe the part of the distribution
+    that actually varies. `_apply_quantile_encoding`'s boundary grid-snap
+    already makes this *correct* (the point mass decodes back exactly),
+    but it's a real resolution waste: confirmed on that exact column,
+    quantile encoding's Wasserstein distance to the training distribution
+    was still ~5x worse than the fixed-width baseline's after that fix,
+    even though the KS statistic (marginal shape) had fully recovered.
+
+    When a point mass is found, this excises it from the fit entirely --
+    `QuantileTransformer` only ever sees the *non*-dominant values, so
+    every one of its `n_quantiles` breakpoints describes genuine
+    variation -- then reserves the dominant value its own single
+    breakpoint, sized to its true empirical frequency `p0` and placed at
+    its correct rank: values below it get rescaled into `[0, below_frac)`,
+    values above into `[below_frac + p0, 1)`, and the dominant value
+    itself sits at the midpoint of the `[below_frac, below_frac + p0)`
+    gap in between. This is exactly what the *true* empirical CDF of the
+    untouched column already looks like (a vertical jump of height `p0`
+    at the dominant value) -- the only change is spending the finite
+    breakpoint budget on the part of the curve that isn't flat.
+
+    Falls back to a plain single fit (today's behavior, unchanged) when
+    no value clears `_POINT_MASS_THRESHOLD`, or when excising the
+    dominant value would leave nothing to fit (a column that actually is
+    just one repeated value, which `numeric_categorical_threshold`, not
+    this, is the intended fix for).
+    """
+    counts = valid.value_counts()
+    top_value = float(counts.index[0])
+    p0 = counts.iloc[0] / len(valid)
+    remainder = valid[valid != top_value]
+
+    if p0 < _POINT_MASS_THRESHOLD or remainder.empty:
+        n_q = min(n_quantiles, len(valid))
+        qt = QuantileTransformer(n_quantiles=n_q, output_distribution="uniform")
+        qt.fit(valid.to_numpy().reshape(-1, 1))
+        return qt.quantiles_.ravel(), qt.references_
+
+    n_q = min(n_quantiles, len(remainder))
+    qt = QuantileTransformer(n_quantiles=n_q, output_distribution="uniform")
+    qt.fit(remainder.to_numpy().reshape(-1, 1))
+    values = qt.quantiles_.ravel()
+    positions = qt.references_.copy()
+
+    # `remainder` excludes top_value by construction, so every fitted
+    # breakpoint value is strictly below or strictly above it -- these
+    # two masks partition `values` exactly, no third case.
+    below_mask = values < top_value
+    above_mask = ~below_mask
+    positions[below_mask] = positions[below_mask] * (1 - p0)
+    positions[above_mask] = positions[above_mask] * (1 - p0) + p0
+
+    below_frac = (remainder < top_value).mean() * (1 - p0)
+    insert_at = np.searchsorted(values, top_value)
+    values = np.insert(values, insert_at, top_value)
+    positions = np.insert(positions, insert_at, below_frac + p0 / 2)
+
+    return values, positions
+
+
 def _apply_quantile_encoding(
     series: pd.Series,
     transform_data: Dict,
@@ -100,11 +184,9 @@ def _apply_quantile_encoding(
                 "Consider increasing numeric_precision."
             )
 
-        n_q = min(n_quantiles, len(valid))
-        qt = QuantileTransformer(n_quantiles=n_q, output_distribution="uniform")
-        qt.fit(valid.to_numpy().reshape(-1, 1))
-        quantile_values = qt.quantiles_.ravel()
-        quantile_positions = qt.references_
+        quantile_values, quantile_positions = _fit_quantile_breakpoints(
+            valid, n_quantiles
+        )
 
         # Point-mass safety: a value that recurs many times (e.g. a
         # zero-inflated column) collapses a long run of quantile_positions
@@ -132,7 +214,11 @@ def _apply_quantile_encoding(
         # safety net for the (already-warned-about) case where distinct
         # values are packed closer together than the precision grid can
         # resolve -- it cannot introduce a *new* misordering, only leave
-        # the pre-existing one in place, deterministically.
+        # the pre-existing one in place, deterministically. Also covers
+        # `_fit_quantile_breakpoints`'s own explicitly-inserted point-mass
+        # position (e.g. `below_frac + p0 / 2`), which is just as capable
+        # of landing off-grid as any breakpoint QuantileTransformer itself
+        # produces.
         grid = 10 ** transform_data["numeric_precision"]
         quantile_positions = np.floor(quantile_positions * grid) / grid
         quantile_positions = np.maximum.accumulate(quantile_positions)

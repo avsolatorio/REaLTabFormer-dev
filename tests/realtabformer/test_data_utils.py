@@ -1325,6 +1325,141 @@ def test_numeric_quantile_encoding_precision_collision_warning():
         )
 
 
+def test_numeric_quantile_encoding_point_mass_reclaims_wasted_resolution():
+    # Follow-up to the boundary-precision fix: that fix made a zero-inflated
+    # column *decode correctly*, but a plain QuantileTransformer fit still
+    # spends a share of its n_quantiles breakpoints proportional to the
+    # point mass's own frequency re-describing the same repeated value --
+    # 955 of 1000 for a 95.5%-zero column -- leaving only the remainder to
+    # describe the part of the distribution that actually varies.
+    # `_fit_quantile_breakpoints` excises the dominant value from the fit
+    # entirely and gives it one reserved breakpoint instead, at its true
+    # rank and frequency, so this asserts that reallocation actually
+    # happens (not just that it doesn't crash).
+    rng = np.random.default_rng(1029)
+    n = 2400
+    n_zero = int(n * 0.955)
+    zeros = np.zeros(n_zero)
+    nonzero = rng.exponential(scale=500, size=n - n_zero) + 1
+    values = np.concatenate([zeros, nonzero])
+    rng.shuffle(values)
+    s = pd.Series(np.round(values, 0))
+
+    _, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+    quantile_values = np.array(transform_data["quantile_values"])
+
+    # Exactly one breakpoint describes the point mass -- not hundreds.
+    assert (quantile_values == 0).sum() == 1
+    # The rest of the (much smaller, now dominant-mass-free) breakpoint
+    # budget describes the nonzero remainder.
+    assert (quantile_values != 0).sum() >= min(1000, (s != 0).sum()) - 1
+
+
+def test_numeric_quantile_encoding_point_mass_round_trip_precision_improves():
+    # Direct before/after comparison on the nonzero remainder's round-trip
+    # fidelity: reclaiming the wasted breakpoints should make the
+    # remainder's decoded values *closer* to the originals, not just
+    # "still correct in shape" -- verified against a plain fit on the
+    # same data (bypassing `_fit_quantile_breakpoints`) as the baseline.
+    rng = np.random.default_rng(1029)
+    n = 2400
+    n_zero = int(n * 0.955)
+    zeros = np.zeros(n_zero)
+    nonzero = rng.exponential(scale=500, size=n - n_zero) + 1
+    values = np.concatenate([zeros, nonzero])
+    rng.shuffle(values)
+    s = pd.Series(np.round(values, 0))
+
+    formatted, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+    quantile_values = np.array(transform_data["quantile_values"])
+    quantile_positions = np.array(transform_data["quantile_positions"])
+    decoded = np.interp(formatted.astype(float).to_numpy(), quantile_positions, quantile_values)
+
+    nonzero_mask = s.to_numpy() != 0
+    rel_err = np.abs(decoded[nonzero_mask] - s.to_numpy()[nonzero_mask]) / s.to_numpy()[nonzero_mask]
+
+    # A plain (non-point-mass-aware) fit on the same data, for comparison --
+    # this is exactly what the previous implementation produced.
+    from sklearn.preprocessing import QuantileTransformer
+
+    valid = s.astype("float64")
+    qt = QuantileTransformer(n_quantiles=min(1000, len(valid)), output_distribution="uniform")
+    qt.fit(valid.to_numpy().reshape(-1, 1))
+    plain_values = qt.quantiles_.ravel()
+    plain_positions = qt.references_
+    plain_q = np.interp(valid.to_numpy(), plain_values, plain_positions)
+    plain_decoded = np.interp(plain_q, plain_positions, plain_values)
+    plain_rel_err = np.abs(plain_decoded[nonzero_mask] - valid.to_numpy()[nonzero_mask]) / valid.to_numpy()[nonzero_mask]
+
+    assert np.median(rel_err) < np.median(plain_rel_err)
+
+
+def test_numeric_quantile_encoding_mid_distribution_point_mass():
+    # The point mass doesn't have to sit at an extreme (min/max) of the
+    # column -- confirm the below/above rank split is handled generally,
+    # not just for the zero-at-the-boundary case every other test uses.
+    rng = np.random.default_rng(3)
+    below = rng.uniform(0, 100, size=200)
+    above = rng.uniform(300, 400, size=200)
+    mass = np.full(1000, 200.0)
+    values = np.concatenate([below, above, mass])
+    rng.shuffle(values)
+    s = pd.Series(values)
+
+    formatted, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+    quantile_values = np.array(transform_data["quantile_values"])
+    quantile_positions = np.array(transform_data["quantile_positions"])
+
+    mass_formatted = formatted.loc[s[s == 200.0].index]
+    assert mass_formatted.nunique() == 1
+
+    decoded = np.interp(formatted.astype(float).to_numpy(), quantile_positions, quantile_values)
+    mass_mask = s.to_numpy() == 200.0
+    assert np.allclose(decoded[mass_mask], 200.0, atol=1e-6)
+
+    below_mask = s.to_numpy() < 200
+    above_mask = s.to_numpy() > 200
+    below_err = np.abs(decoded[below_mask] - s.to_numpy()[below_mask])
+    above_err = np.abs(decoded[above_mask] - s.to_numpy()[above_mask])
+    assert np.median(below_err) < 1.0
+    assert np.median(above_err) < 1.0
+
+
+def test_numeric_quantile_encoding_below_threshold_point_mass_unaffected():
+    # A repeated value that *doesn't* clear _POINT_MASS_THRESHOLD (5%)
+    # must not trigger the excision path -- ordinary ties in continuous
+    # data shouldn't pay any extra fit complexity or behave differently
+    # from before this feature existed.
+    rng = np.random.default_rng(11)
+    s = pd.Series(np.concatenate([np.zeros(20), rng.exponential(scale=50, size=980) + 1]))
+
+    _, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+    quantile_values = np.array(transform_data["quantile_values"])
+    # A plain fit collapses ties onto repeated breakpoints rather than
+    # reserving one dedicated entry -- more than one breakpoint at 0.
+    assert (quantile_values == 0).sum() > 1
+
+
+def test_numeric_quantile_encoding_fully_constant_column_does_not_crash():
+    # A column with only one distinct value, ever: a pre-existing edge
+    # case (present before this feature too -- confirmed by reproducing
+    # it against the prior commit), not something this feature is meant
+    # to fix (a real user with a literally-constant numeric column should
+    # route it through numeric_categorical_threshold, or drop it -- it
+    # carries zero information either way). This only asserts it doesn't
+    # raise, so future changes don't silently make it worse.
+    s = pd.Series([5.0] * 200)
+    du.process_numeric_data(s, max_len=8, numeric_precision=4, quantile_encoding=True)
+
+
 def test_numeric_quantile_encoding_zero_inflated_point_mass_round_trip():
     # Regression test for a real bug found on the UCI Adult `capital-loss`
     # column (95.5% exact zeros, a long nonzero tail): a value that recurs
