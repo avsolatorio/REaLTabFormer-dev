@@ -1325,6 +1325,53 @@ def test_numeric_quantile_encoding_precision_collision_warning():
         )
 
 
+def test_numeric_quantile_encoding_zero_inflated_point_mass_round_trip():
+    # Regression test for a real bug found on the UCI Adult `capital-loss`
+    # column (95.5% exact zeros, a long nonzero tail): a value that recurs
+    # thousands of times collapses a long run of fitted quantile positions
+    # onto the same breakpoint, so every occurrence forward-transforms to
+    # one exact quantile position -- that run's right edge. If that edge's
+    # raw float (e.g. 0.954954954954955) isn't exactly representable at
+    # `numeric_precision` decimal digits, formatting-then-parsing it (what
+    # generation always does) rounds it onto the *other* side of the
+    # boundary, into the next distinct value's segment -- and because a
+    # point mass makes that segment's value jump sharply, the decoded
+    # value comes back completely wrong for the entire point mass, not
+    # just approximately imprecise. Confirmed end to end: before the fix,
+    # every zero-valued row in this reproduction decoded to a nonzero
+    # value; after, 100% decode back to exactly 0.
+    rng = np.random.default_rng(1029)
+    n = 2400
+    n_zero = int(n * 0.955)
+    zeros = np.zeros(n_zero)
+    nonzero = rng.exponential(scale=500, size=n - n_zero) + 1
+    values = np.concatenate([zeros, nonzero])
+    rng.shuffle(values)
+    s = pd.Series(np.round(values, 0))
+
+    formatted, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+    quantile_values = np.array(transform_data["quantile_values"])
+    quantile_positions = np.array(transform_data["quantile_positions"])
+
+    # Every zero-valued row must forward-transform to the exact same,
+    # grid-representable quantile string -- not spread across values that
+    # would round differently.
+    zero_formatted = formatted.loc[s[s == 0].index]
+    assert zero_formatted.nunique() == 1
+
+    # Decoding that string must recover exactly 0, for every zero row --
+    # not an interpolated near-miss.
+    decoded = np.interp(formatted.astype(float).to_numpy(), quantile_positions, quantile_values)
+    zero_mask = s.to_numpy() == 0
+    assert np.allclose(decoded[zero_mask], 0.0, atol=1e-9)
+
+    # The stored breakpoint positions must remain usable by np.interp,
+    # i.e. non-decreasing, after the fit-time precision-grid snap.
+    assert (np.diff(quantile_positions) >= 0).all()
+
+
 def test_numeric_quantile_encoding_digit_entropy_near_maximal_through_real_pipeline():
     # The concrete, numbers-backed claim this feature rests on: run the
     # *actual* process_data path (not a standalone prototype) on a

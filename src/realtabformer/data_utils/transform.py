@@ -105,6 +105,38 @@ def _apply_quantile_encoding(
         qt.fit(valid.to_numpy().reshape(-1, 1))
         quantile_values = qt.quantiles_.ravel()
         quantile_positions = qt.references_
+
+        # Point-mass safety: a value that recurs many times (e.g. a
+        # zero-inflated column) collapses a long run of quantile_positions
+        # onto the *same* quantile_values entry, so np.interp assigns every
+        # occurrence of that value to one exact position -- the run's right
+        # edge (its last, highest-index reference). If that edge's raw
+        # float, e.g. 0.954954954954955, isn't exactly representable at
+        # `numeric_precision` decimal digits, formatting it to a string and
+        # parsing it back (as generation always does) rounds it to the
+        # nearest grid point, e.g. "0.9550" -- which can land on the *other*
+        # side of the boundary into the next distinct value's segment.
+        # Where that segment's value jumps sharply (exactly what a point
+        # mass produces), this turns an imperceptible float-rounding nudge
+        # into a catastrophically wrong decoded value: confirmed on the
+        # UCI Adult `capital-loss` column (95.5% exact zeros), where every
+        # zero-valued row decoded to ~85 instead of 0.
+        #
+        # Fixed by snapping every stored position down to the
+        # numeric_precision grid before it is ever used, so formatting a
+        # position that's already grid-aligned is a no-op -- no rounding
+        # step remains that could cross a boundary. Flooring (not rounding)
+        # keeps each position on the same side of its true, unsnapped
+        # position, which is what preserves the boundary's correct side.
+        # A single monotonic non-decreasing pass afterwards is a cheap
+        # safety net for the (already-warned-about) case where distinct
+        # values are packed closer together than the precision grid can
+        # resolve -- it cannot introduce a *new* misordering, only leave
+        # the pre-existing one in place, deterministically.
+        grid = 10 ** transform_data["numeric_precision"]
+        quantile_positions = np.floor(quantile_positions * grid) / grid
+        quantile_positions = np.maximum.accumulate(quantile_positions)
+
         transform_data["quantile_values"] = quantile_values.tolist()
         transform_data["quantile_positions"] = quantile_positions.tolist()
 
