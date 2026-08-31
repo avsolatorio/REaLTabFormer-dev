@@ -7,6 +7,7 @@ tests, not a regression net for existing behavior. See
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats
 
 from realtabformer.realtabformer2 import REaLTabFormer2
 
@@ -465,3 +466,44 @@ def test_numeric_categorical_threshold_seed_input_on_demoted_column():
     samples = model.sample(n_samples=5, gen_batch=5, device="cpu", seed_input=seed_input)
     assert (samples["bedrooms"] == 3).all()
     assert samples["bedrooms"].dtype == df["bedrooms"].dtype
+
+
+# --- numeric_quantile_encoding: CDF-based numeric representation -----------
+
+
+def test_numeric_quantile_encoding_end_to_end_dtype_and_distributional_fidelity():
+    rng = np.random.default_rng(11)
+    n = 500
+    price = np.round(rng.lognormal(mean=6.0, sigma=2.0, size=n), 2)
+    price = np.clip(price, 0.01, 500000)
+    df = pd.DataFrame({
+        "price": price, "gender": rng.choice(["m", "f"], size=n),
+    })
+
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=25,
+        batch_size=16,
+        tabular_backbone="distilgpt2",
+        numeric_max_len=8,
+        numeric_precision=4,
+        numeric_nparts=1,
+        numeric_quantile_encoding=True,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+
+    samples = model.sample(n_samples=200, device="cpu", gen_batch=200)
+
+    # Explicit dtype-preservation bar, matching numeric_categorical_threshold's.
+    assert samples["price"].dtype == df["price"].dtype
+
+    # Bounded by the training range (np.interp's clamp-to-boundary
+    # extrapolation rule, the accepted tradeoff of choosing quantile
+    # encoding over magnitude+mantissa).
+    assert samples["price"].min() >= df["price"].min()
+    assert samples["price"].max() <= df["price"].max()
+
+    # Distributional fidelity, measured directly rather than argued from
+    # the inverse-transform-sampling theory alone.
+    ks_stat, _ = stats.ks_2samp(samples["price"].dropna(), df["price"])
+    assert ks_stat < 0.2, f"KS statistic too high: {ks_stat}"

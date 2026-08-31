@@ -180,6 +180,8 @@ class REaLTabFormer2:
         numeric_precision: int = 4,
         numeric_max_len: int = 10,
         numeric_categorical_threshold: Optional[int] = None,
+        numeric_quantile_encoding: bool = False,
+        numeric_quantile_bins: int = 1000,
         grokfast_args: Optional[Dict[str, Any]] = None,
         shared_numeric_vocab: bool = False,
         any_order: bool = False,
@@ -233,6 +235,23 @@ class REaLTabFormer2:
                 fit time per column and frozen (not re-evaluated against a seed_input's smaller
                 slice of the data). `None` (default) preserves today's dtype-only routing. Tabular
                 only for now -- not threaded through relational fitting.
+            numeric_quantile_encoding: Beta. If True, numeric columns are represented by their
+                quantile position under the column's own empirical distribution (`q = F(x)`,
+                uniform on `[0, 1)` for any continuous shape by the probability integral
+                transform) instead of a fixed absolute-decimal value -- every digit-chunk
+                position stays informative regardless of the column's shape (heavy-tailed,
+                bimodal, whatever), unlike the default encoding, which manufactures near-constant
+                leading chunks for heavy-tailed columns. Requires `numeric_precision > 0` (a
+                quantile needs fractional digits to have any resolution). Generated values are
+                clipped to the training range -- this cannot extrapolate beyond what was observed
+                in training, the tradeoff for not assuming any particular distribution shape.
+                Datetime columns are not supported (`process_datetime_data` hardcodes
+                `numeric_precision=0`, incompatible with a fractional quantile representation).
+                Tabular only for now -- not threaded through relational fitting.
+            numeric_quantile_bins: Number of quantile breakpoints fitted per column (mirrors
+                `sklearn.preprocessing.QuantileTransformer`'s own `n_quantiles` default of 1000).
+                Only used when `numeric_quantile_encoding=True`, and only at first fit -- later
+                calls (seed_input, etc.) replay the frozen, already-fitted breakpoints.
             shared_numeric_vocab: Beta. Tabular-only. If True, numeric/datetime partition
                 columns share one pooled value vocabulary (the same digit chunk in two
                 different numeric columns maps to the same token id) instead of each column
@@ -420,6 +439,8 @@ class REaLTabFormer2:
         self.numeric_precision = numeric_precision
         self.numeric_max_len = numeric_max_len
         self.numeric_categorical_threshold = numeric_categorical_threshold
+        self.numeric_quantile_encoding = numeric_quantile_encoding
+        self.numeric_quantile_bins = numeric_quantile_bins
 
         # A unique identifier for the experiment set after the
         # model is trained.
@@ -1535,6 +1556,8 @@ class REaLTabFormer2:
             numeric_nparts=self.numeric_nparts,
             target_col=self.target_col,
             numeric_categorical_threshold=self.numeric_categorical_threshold,
+            numeric_quantile_encoding=self.numeric_quantile_encoding,
+            numeric_quantile_bins=self.numeric_quantile_bins,
         )
         self.processed_columns = df.columns.to_list()
         if self.any_order:

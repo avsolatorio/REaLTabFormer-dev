@@ -1,5 +1,6 @@
 import json
 import random
+import warnings
 
 import numpy as np
 import pandas as pd
@@ -1202,3 +1203,212 @@ def test_numeric_categorical_threshold_decision_frozen_and_replayed():
         seed, col_transform_data=ctd, numeric_categorical_threshold=0
     )
     assert du.is_categorical_col(seed_pr2.columns.tolist()[0])
+
+
+# --- numeric_quantile_encoding: CDF-based numeric representation -----------
+
+
+def _heavy_tailed_series(n=300, seed=3):
+    rng = np.random.default_rng(seed)
+    return pd.Series(
+        np.round(rng.lognormal(mean=4.0, sigma=1.5, size=n), 2), name="price"
+    )
+
+
+def test_numeric_quantile_encoding_round_trip_recovers_observed_values():
+    s = _heavy_tailed_series()
+    formatted, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+    assert transform_data["quantile_encoding"] is True
+
+    quantile_values = np.array(transform_data["quantile_values"])
+    quantile_positions = np.array(transform_data["quantile_positions"])
+
+    q = formatted.astype(float).to_numpy()
+    recovered = np.interp(q, quantile_positions, quantile_values)
+
+    rel_err = np.abs(recovered - s.to_numpy()) / s.to_numpy()
+    # Recovery is exact up to the rounding introduced by formatting `q` to
+    # `numeric_precision` decimal digits and the piecewise-linear
+    # interpolation between the 1000 fitted breakpoints -- both small,
+    # bounded sources of error, not a fidelity failure.
+    assert np.median(rel_err) < 0.01
+    assert rel_err.max() < 0.05
+
+
+def test_numeric_quantile_encoding_interpolates_monotonically_between_points():
+    s = _heavy_tailed_series()
+    _, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+    quantile_values = np.array(transform_data["quantile_values"])
+    quantile_positions = np.array(transform_data["quantile_positions"])
+
+    sorted_unique = np.sort(s.unique())
+    lo, hi = sorted_unique[10], sorted_unique[11]
+    mid = (lo + hi) / 2
+
+    q_lo, q_mid, q_hi = np.interp([lo, mid, hi], quantile_values, quantile_positions)
+    assert q_lo <= q_mid <= q_hi
+
+
+def test_numeric_quantile_encoding_clips_out_of_range_values():
+    s = _heavy_tailed_series()
+    _, transform_data = du.process_numeric_data(
+        s, max_len=8, numeric_precision=4, quantile_encoding=True
+    )
+
+    # Forward direction: values far outside the observed range clip to the
+    # training min/max quantile position instead of extrapolating.
+    too_big = pd.Series([s.max() * 100])
+    too_small = pd.Series([s.min() / 100])
+
+    formatted_big, _ = du.process_numeric_data(
+        too_big, max_len=8, numeric_precision=4,
+        transform_data=dict(transform_data), quantile_encoding=True,
+    )
+    formatted_small, _ = du.process_numeric_data(
+        too_small, max_len=8, numeric_precision=4,
+        transform_data=dict(transform_data), quantile_encoding=True,
+    )
+    assert formatted_big.iloc[0] == "1.0000"
+    assert formatted_small.iloc[0] == "0.0000"
+
+
+def test_numeric_quantile_encoding_requires_positive_precision():
+    s = _heavy_tailed_series()
+    with pytest.raises(AssertionError, match="numeric_precision > 0"):
+        du.process_numeric_data(
+            s, max_len=8, numeric_precision=0, quantile_encoding=True
+        )
+
+
+def test_numeric_quantile_encoding_requires_sufficient_max_len():
+    s = _heavy_tailed_series()
+    with pytest.raises(AssertionError, match="too small to hold a quantile-encoded"):
+        du.process_numeric_data(
+            s, max_len=3, numeric_precision=4, quantile_encoding=True
+        )
+
+
+def test_numeric_quantile_encoding_default_off_leaves_transform_data_unchanged():
+    # "Zero footprint when unused": a column that never opts into quantile
+    # encoding must not grow any new transform_data keys because the
+    # feature exists elsewhere in the model.
+    s = pd.Series([1.0, 2.0, 3.0])
+    _, transform_data = du.process_numeric_data(s, max_len=8, numeric_precision=4)
+    assert "quantile_encoding" not in transform_data
+    assert "quantile_values" not in transform_data
+    assert "quantile_positions" not in transform_data
+
+
+def test_numeric_quantile_encoding_precision_collision_warning():
+    rng = np.random.default_rng(7)
+
+    # High-cardinality column, low precision: more distinct values than
+    # `10 ** numeric_precision` distinguishable quantile levels -- distinct
+    # values collide onto the same reconstructed value, so this must warn.
+    high_card = pd.Series(rng.random(200) * 1000)
+    with pytest.warns(UserWarning, match="unique values but"):
+        du.process_numeric_data(
+            high_card, max_len=8, numeric_precision=1, quantile_encoding=True
+        )
+
+    # Low-cardinality column, ample precision: comfortably under the
+    # threshold, must stay silent.
+    low_card = pd.Series([1.0, 2.0, 3.0] * 50)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        du.process_numeric_data(
+            low_card, max_len=8, numeric_precision=4, quantile_encoding=True
+        )
+
+
+def test_numeric_quantile_encoding_digit_entropy_near_maximal_through_real_pipeline():
+    # The concrete, numbers-backed claim this feature rests on: run the
+    # *actual* process_data path (not a standalone prototype) on a
+    # heavy-tailed column and confirm the resulting digit-chunk columns
+    # carry close to maximal per-position entropy, unlike the fixed-width
+    # encoding's near-constant leading chunks.
+    rng = np.random.default_rng(7)
+    price = np.clip(np.round(rng.lognormal(mean=6.0, sigma=2.0, size=2000), 2), 0.01, 500000)
+    df = pd.DataFrame({"price": price})
+
+    pr_df, _, _ = du.process_data(
+        df, numeric_max_len=8, numeric_precision=4, numeric_nparts=1,
+        numeric_quantile_encoding=True,
+    )
+    price_cols = sorted(c for c in pr_df.columns if "price" in c)
+    # "0" + "." + 4 fractional digits.
+    assert len(price_cols) == 6
+
+    def norm_entropy(col):
+        chars = pr_df[col].str.split(du.SPECIAL_COL_SEP).str[-1]
+        _, counts = np.unique(chars, return_counts=True)
+        p = counts / counts.sum()
+        h = -(p * np.log2(p)).sum()
+        return h / np.log2(10)
+
+    # Positions 0 ("0") and 1 (".") are structurally constant for any
+    # quantile value in [0, 1) -- known, separately-flagged wasted
+    # positions, not a bug. The 4 fractional-digit positions carry
+    # essentially maximal entropy.
+    entropies = [norm_entropy(c) for c in price_cols]
+    assert entropies[0] < 0.01
+    assert entropies[1] < 0.01
+    assert all(e > 0.9 for e in entropies[2:])
+
+
+def test_numeric_quantile_encoding_mutually_exclusive_with_categorical_threshold():
+    # Both flags set on the same fit, on different columns: the
+    # low-cardinality column is demoted to categorical and never reaches
+    # quantile encoding; the high-cardinality column is quantile-encoded
+    # and never demoted.
+    df = _bedrooms_price_df()
+    pr_df, ctd, _ = du.process_data(
+        df, numeric_max_len=8, numeric_precision=4, numeric_nparts=1,
+        numeric_categorical_threshold=10,
+        numeric_quantile_encoding=True,
+    )
+
+    bedroom_cols = [c for c in pr_df.columns if "bedrooms" in c]
+    price_cols = [c for c in pr_df.columns if "price" in c]
+
+    assert len(bedroom_cols) == 1
+    assert du.is_categorical_col(bedroom_cols[0])
+    assert ctd["bedrooms"] == {"treated_as_categorical": True}
+
+    assert all(du.is_numeric_col(c) for c in price_cols)
+    assert ctd["price"]["quantile_encoding"] is True
+
+
+def test_numeric_quantile_encoding_composes_with_digit_entropy_weighting():
+    # digit_entropy_weighting (compute_chunk_significance_weights) is
+    # generic over whatever digit-chunk columns exist -- verify directly
+    # that it runs cleanly on quantile-encoded columns and produces sane,
+    # non-degenerate weights rather than trusting the "should be fine"
+    # reasoning.
+    rng = np.random.default_rng(7)
+    price = np.clip(np.round(rng.lognormal(mean=6.0, sigma=2.0, size=500), 2), 0.01, 500000)
+    df = pd.DataFrame({"price": price, "gender": rng.choice(["m", "f"], size=500)})
+
+    pr_df, _, _ = du.process_data(
+        df, numeric_max_len=8, numeric_precision=4, numeric_nparts=1,
+        numeric_quantile_encoding=True,
+    )
+
+    vocab = du.build_vocab(
+        pr_df,
+        special_tokens=du.SpecialTokens.tokens(),
+        add_columns=False,
+        compute_chunk_significance=True,
+    )
+    weights = vocab["chunk_significance_weights"]
+    price_cols = [c for c in pr_df.columns if "price" in c]
+    assert set(price_cols).issubset(weights.keys())
+
+    price_weights = [weights[c] for c in price_cols]
+    # The constant "0"/"." positions get pulled toward the floor; the
+    # near-maximal-entropy fractional-digit positions get pulled above it.
+    assert min(price_weights) < 1.0 < max(price_weights)

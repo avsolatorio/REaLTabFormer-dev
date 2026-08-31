@@ -415,6 +415,43 @@ class REaLSampler:
                         raise ValueError(f"Unknown column dtype for {col}...")
 
                 if is_numeric_col(col):
+                    # numeric_quantile_encoding (beta, v1 and v2 both).
+                    # `group_series` at this point holds the recovered
+                    # *quantile* value (q -- process_data's forward
+                    # transform, data_utils/transform.py::_apply_quantile_encoding,
+                    # ran x -> q before formatting/chunking), not the
+                    # original column's value. Invert it back via the same
+                    # `np.interp` mechanism, against the same stored
+                    # breakpoint arrays, before anything downstream (the
+                    # Int64Dtype cast attempt right below, then
+                    # `_convert_to_table`'s final dtype cast) sees it.
+                    # `col` here is only partition-decoded (e.g.
+                    # "00___NUMERIC___price"), not yet the original column
+                    # name -- `_convert_to_table` doesn't run
+                    # `decode_processed_column` until later, so
+                    # `col_transform_data` (keyed by the original name,
+                    # e.g. "price") must be looked up with that name
+                    # explicitly here, the same way the existing
+                    # `mean_date` lookup in `_convert_to_table` does after
+                    # its own decode.
+                    quantile_transform_data = self.col_transform_data.get(
+                        decode_processed_column(col), {}
+                    )
+                    if "quantile_values" in quantile_transform_data:
+                        quantile_values = np.array(
+                            quantile_transform_data["quantile_values"]
+                        )
+                        quantile_positions = np.array(
+                            quantile_transform_data["quantile_positions"]
+                        )
+                        valid = group_series.notna()
+                        group_series = group_series.astype("float64")
+                        group_series.loc[valid] = np.interp(
+                            group_series.loc[valid].to_numpy(),
+                            quantile_positions,
+                            quantile_values,
+                        )
+
                     try:
                         # Try to force convert values to Int64Dtype
                         group_series = group_series.astype(pd.Int64Dtype())

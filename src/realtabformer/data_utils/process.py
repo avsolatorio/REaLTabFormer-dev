@@ -244,6 +244,8 @@ def process_data(
     col_transform_data: Dict = None,
     target_col: str = None,
     numeric_categorical_threshold: int = None,
+    numeric_quantile_encoding: bool = False,
+    numeric_quantile_bins: int = 1000,
 ) -> Tuple[pd.DataFrame, Dict, Dict[str, str]]:
     # This should receive a dataframe with dtypes that have already been
     # properly categorized between numeric and categorical.
@@ -287,6 +289,8 @@ def process_data(
             max_len=numeric_max_len,
             numeric_precision=numeric_precision,
             transform_data=td,
+            quantile_encoding=numeric_quantile_encoding,
+            quantile_n_bins=numeric_quantile_bins,
         ),
         col_transform_data,
         numeric_nparts,

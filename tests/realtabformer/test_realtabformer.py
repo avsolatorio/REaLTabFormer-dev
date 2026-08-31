@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+from scipy import stats
 from transformers import EncoderDecoderConfig
 from transformers.models.gpt2 import GPT2Config
 
@@ -313,3 +314,46 @@ def test_numeric_categorical_threshold_end_to_end_dtype_round_trip():
     assert samples["rating"].dtype == df["rating"].dtype
     assert samples["price"].dtype == df["price"].dtype
     assert samples["bedrooms"].dropna().isin([1, 2, 3, 4, 5]).all()
+
+
+# --- numeric_quantile_encoding: CDF-based numeric representation -----------
+
+
+def test_numeric_quantile_encoding_end_to_end_dtype_and_distributional_fidelity():
+    rng = np.random.default_rng(11)
+    n = 500
+    price = np.round(rng.lognormal(mean=6.0, sigma=2.0, size=n), 2)
+    price = np.clip(price, 0.01, 500000)
+    df = pd.DataFrame({
+        "price": price, "gender": rng.choice(["m", "f"], size=n),
+    })
+
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=25,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        numeric_max_len=8,
+        numeric_precision=4,
+        numeric_nparts=1,
+        numeric_quantile_encoding=True,
+    )
+    model.fit(df, device="cpu", n_critic=0)
+
+    samples = model.sample(n_samples=200, device="cpu")
+
+    # Explicit dtype-preservation bar, matching numeric_categorical_threshold's.
+    assert samples["price"].dtype == df["price"].dtype
+
+    # Bounded by the training range (np.interp's clamp-to-boundary
+    # extrapolation rule, the accepted tradeoff of choosing quantile
+    # encoding over magnitude+mantissa).
+    assert samples["price"].min() >= df["price"].min()
+    assert samples["price"].max() <= df["price"].max()
+
+    # Distributional fidelity, measured directly rather than argued from
+    # the inverse-transform-sampling theory alone: a two-sample KS test
+    # between the generated sample and the training data should not
+    # strongly reject the null of equal distributions.
+    ks_stat, _ = stats.ks_2samp(samples["price"].dropna(), df["price"])
+    assert ks_stat < 0.2, f"KS statistic too high: {ks_stat}"

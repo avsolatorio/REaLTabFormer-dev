@@ -2,7 +2,9 @@ import time
 import warnings
 from typing import Dict, Tuple, TypedDict
 
+import numpy as np
 import pandas as pd
+from sklearn.preprocessing import QuantileTransformer
 
 from .columns import encode_partition_numeric_col
 from .constants import INVALID_NUMS_RE, NUMERIC_NA_TOKEN
@@ -36,6 +38,9 @@ class NumericTransformData(TypedDict, total=False):
     ljust: int
     mean_date: int
     numeric_nparts: int
+    quantile_encoding: bool
+    quantile_values: list
+    quantile_positions: list
 
 
 def fix_multi_decimal(v):
@@ -45,11 +50,77 @@ def fix_multi_decimal(v):
     return v
 
 
+def _apply_quantile_encoding(
+    series: pd.Series,
+    transform_data: Dict,
+    is_transform: bool,
+    n_quantiles: int = 1000,
+) -> Tuple[pd.Series, Dict]:
+    """Transform `series` (raw numeric values) to its quantile position
+    `q` under the column's own empirical distribution, `q ~ Uniform(0, 1)`
+    by the probability integral transform -- makes every digit-chunk
+    position of the eventual formatted string informative regardless of
+    the column's shape (heavy-tailed, bimodal, whatever), unlike fixed
+    absolute-precision formatting, which manufactures near-constant
+    leading chunks for heavy-tailed columns (see the digit_entropy_weighting/
+    numeric_categorical_threshold docstrings this is the representation-level
+    counterpart to).
+
+    Only the *breakpoints* used to compute `q` are fitted with
+    `sklearn.preprocessing.QuantileTransformer` (already a project
+    dependency -- see rtf_analyze.py) -- reusing its tested
+    duplicate-handling/subsampling logic for that one step. Its fitted
+    object is not what gets persisted: `quantiles_`/`references_` are
+    pulled out as plain Python lists into `transform_data` (JSON-safe,
+    sklearn-version-independent, stored exactly like `mx_sig`/`zfill`/
+    `ljust` already are), and every actual forward/inverse mapping --
+    here, and later at decode time in `rtf_sampler.py::_recover_data_values`
+    -- is a single `np.interp` call against those stored arrays.
+    `np.interp`'s default clamp-to-boundary behavior for out-of-range
+    input *is* the extrapolation rule: a quantile value generated outside
+    what was observed in training clips to the training min/max, rather
+    than attempting to model a parametric tail.
+    """
+    numeric_series = series.astype("float64")
+    na_mask = numeric_series.isna()
+    valid = numeric_series[~na_mask]
+
+    if is_transform:
+        quantile_values = np.array(transform_data["quantile_values"])
+        quantile_positions = np.array(transform_data["quantile_positions"])
+    else:
+        n_unique = valid.nunique()
+        max_levels = 10**transform_data["numeric_precision"]
+        if n_unique > max_levels:
+            warnings.warn(
+                f"Column {series.name!r} has {n_unique} unique values but "
+                f"numeric_precision={transform_data['numeric_precision']} only "
+                f"supports {max_levels} distinguishable quantile levels -- "
+                "distinct values may collide onto the same reconstructed value. "
+                "Consider increasing numeric_precision."
+            )
+
+        n_q = min(n_quantiles, len(valid))
+        qt = QuantileTransformer(n_quantiles=n_q, output_distribution="uniform")
+        qt.fit(valid.to_numpy().reshape(-1, 1))
+        quantile_values = qt.quantiles_.ravel()
+        quantile_positions = qt.references_
+        transform_data["quantile_values"] = quantile_values.tolist()
+        transform_data["quantile_positions"] = quantile_positions.tolist()
+
+    transformed = numeric_series.copy()
+    transformed[~na_mask] = np.interp(valid.to_numpy(), quantile_values, quantile_positions)
+
+    return transformed, transform_data
+
+
 def process_numeric_data(
     series: pd.Series,
     max_len: int = 10,
     numeric_precision: int = 4,
     transform_data: Dict = None,
+    quantile_encoding: bool = False,
+    quantile_n_bins: int = 1000,
 ) -> Tuple[pd.Series, NumericTransformData]:
     is_transform = True
 
@@ -63,18 +134,57 @@ def process_numeric_data(
         )
         max_len = transform_data["max_len"]
         numeric_precision = transform_data["numeric_precision"]
+        # A frozen fit-time decision, like every other key here -- replayed,
+        # never re-decided from whatever the caller happens to pass.
+        quantile_encoding = transform_data.get("quantile_encoding", False)
     else:
         transform_data["max_len"] = max_len
         transform_data["numeric_precision"] = numeric_precision
+        # Only stamped when actually used -- `.get("quantile_encoding",
+        # False)` above already treats an absent key as False on replay,
+        # so leaving it out entirely when unused keeps a default
+        # (non-quantile) column's transform_data byte-identical to
+        # before this feature existed, instead of growing an inert key
+        # on every column regardless of whether anyone asked for this.
+        if quantile_encoding:
+            transform_data["quantile_encoding"] = quantile_encoding
+
+    if quantile_encoding:
+        assert numeric_precision > 0, (
+            "quantile_encoding requires numeric_precision > 0 -- a quantile "
+            "value with zero fractional digits has no resolution at all."
+        )
+        # "0." + numeric_precision digits, or the formatted quantile string
+        # would be silently truncated by the max_len slice further below.
+        assert max_len >= numeric_precision + 2, (
+            f"max_len ({max_len}) is too small to hold a quantile-encoded "
+            f"value at numeric_precision={numeric_precision} (needs at least "
+            f"{numeric_precision + 2}, for \"0.\" plus the precision digits)."
+        )
+        series, transform_data = _apply_quantile_encoding(
+            series, transform_data, is_transform, n_quantiles=quantile_n_bins
+        )
 
     # Note that at this point, we should have casted int-like values to
     # pd.Int64Dtype but just to be very sure, let's do that again here.
-    try:
-        series = series.astype(pd.Int64Dtype())
-    except TypeError:
-        pass
-    except ValueError:
-        pass
+    #
+    # Skipped entirely for quantile-encoded values: a quantile is always a
+    # fractional [0, 1) value by construction and must always go through
+    # the decimal-precision formatting path below, never the integer/zfill
+    # path -- but a quantile that happens to land exactly on a whole
+    # number (0.0, or 1.0 at the clipped boundary of an out-of-range
+    # input) casts to Int64Dtype *successfully*, which would otherwise
+    # silently misroute it into the wrong (no-decimal-point) formatting
+    # branch and corrupt the encoding. Confirmed empirically: an
+    # out-of-range seed value clipping to exactly q=1.0 formatted as
+    # "001000" (the zfill branch) instead of "1.0000" without this guard.
+    if not quantile_encoding:
+        try:
+            series = series.astype(pd.Int64Dtype())
+        except TypeError:
+            pass
+        except ValueError:
+            pass
 
     if series.dtype == pd.Int64Dtype():
         series = series.astype(str)
