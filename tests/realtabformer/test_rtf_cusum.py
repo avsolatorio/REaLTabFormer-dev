@@ -400,6 +400,51 @@ def test_fit_cusum_saves_alarm_checkpoint_matching_final_model(tmp_path):
         assert torch.equal(saved_state[key], current_state[key].cpu())
 
 
+def test_fit_cusum_alarm_checkpoint_reloadable_via_load_from_dir(tmp_path):
+    # Regression test for a real bug: the alarm callback only wrote
+    # HF-format weights (model.safetensors/config.json), which
+    # REaLTabFormer.load_from_dir cannot read -- it needs the
+    # rtf_config.json/rtf_model.pt pair that only REaLTabFormer.save()
+    # produces. Confirms the checkpoint is actually a loadable
+    # REaLTabFormer model, not just a bag of HF weights.
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=30,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+        checkpoints_dir=str(tmp_path / "checkpoints"),
+    )
+    trainer = model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+    )
+    mon = model.cusum_monitor
+    assert mon.alarm_step is not None, "expected this config to trigger an alarm"
+
+    ckpt_path = Path(mon.alarm_checkpoint_dir)
+    assert (ckpt_path / "rtf_config.json").exists()
+    assert (ckpt_path / "rtf_model.pt").exists()
+
+    reloaded = REaLTabFormer.load_from_dir(ckpt_path)
+    assert reloaded.vocab.keys() == model.vocab.keys()
+    assert reloaded.processed_columns == model.processed_columns
+
+    current_state = trainer.model.state_dict()
+    reloaded_state = reloaded.model.state_dict()
+    assert reloaded_state.keys() == current_state.keys()
+    for key in current_state:
+        assert torch.equal(reloaded_state[key].cpu(), current_state[key].cpu())
+
+    samples = reloaded.sample(10, device="cpu")
+    assert len(samples) == 10
+
+
 def test_fit_default_path_unaffected_by_cusum_module():
     df = _tiny_df(n=60)
     model = REaLTabFormer(

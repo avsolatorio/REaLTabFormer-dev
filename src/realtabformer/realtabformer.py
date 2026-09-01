@@ -1754,6 +1754,17 @@ class REaLTabFormer:
         )
 
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+
+        if monitor.alarm_step is not None:
+            # The callback only writes HF-format weights; load_from_dir
+            # needs the rtf_config.json/rtf_model.pt pair too.
+            self.save(
+                path=self.checkpoints_dir,
+                experiment_id="cusum_alarm",
+                allow_overwrite=True,
+                verbose=False,
+            )
+
         return trainer
 
     def sample(
@@ -2040,6 +2051,8 @@ class REaLTabFormer:
         rtf_attrs = self.__dict__.copy()
         rtf_attrs.pop("model", None)
         rtf_attrs.pop("dataset", None)
+        # Not JSON-serializable and not needed to reload the model.
+        rtf_attrs.pop("cusum_monitor", None)
 
         # We don't need to store the `parent_config`
         # since a saved model should have the weights loaded from
