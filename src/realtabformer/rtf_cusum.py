@@ -213,6 +213,7 @@ class CUSUMOverfittingMonitor:
 
         self.cusum_S: float = 0.0
         self.alarm_step: Optional[int] = None
+        self.alarm_checkpoint_dir: Optional[str] = None
         self.history: List[Tuple[int, float, float, float]] = []  # (step, Delta, Z, S)
 
     def extend_horizon(self, total_checks_horizon: int) -> None:
@@ -381,11 +382,33 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
     """Runs the periodic CUSUM check and requests training stop when it
     fires. Requires the training dataset to be indexable by row (a plain
     ``datasets.Dataset`` with ``input_ids``/``labels`` columns works).
+
+    Saves the exact model state at the moment the alarm fires to
+    ``alarm_checkpoint_dir`` (if given), via a direct
+    ``model.save_pretrained(...)`` call -- independent of HF's own
+    step-based checkpoint/``should_save`` machinery and, critically, of
+    ``load_best_model_at_end`` (which -- if left enabled -- reloads
+    whatever checkpoint had the best held-out eval loss once
+    ``trainer.train()`` returns, for ANY stop reason, silently replacing
+    the alarm-point model with an unrelated one picked by a different
+    criterion). The caller (``_train_with_cusum``) also disables
+    ``load_best_model_at_end`` for this path so the in-memory model
+    stays exactly where training stopped, but this explicit, on-disk
+    save is the actual guarantee: the alarm-point weights exist on disk
+    the instant the alarm fires, regardless of any other mechanism's
+    later behavior. Still sets ``control.should_save = True`` too, for
+    interoperability with ``resume_from_checkpoint``.
     """
 
-    def __init__(self, monitor: CUSUMOverfittingMonitor, train_dataset) -> None:
+    def __init__(
+        self,
+        monitor: CUSUMOverfittingMonitor,
+        train_dataset,
+        alarm_checkpoint_dir: Optional[str] = None,
+    ) -> None:
         self.monitor = monitor
         self.train_dataset = train_dataset
+        self.alarm_checkpoint_dir = alarm_checkpoint_dir
 
     def _get_rows(self, indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         rows = self.train_dataset[indices]
@@ -454,4 +477,7 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         if alarmed:
             control.should_training_stop = True
             control.should_save = True
+            if self.alarm_checkpoint_dir is not None:
+                model.save_pretrained(self.alarm_checkpoint_dir)
+                self.monitor.alarm_checkpoint_dir = self.alarm_checkpoint_dir
         return control

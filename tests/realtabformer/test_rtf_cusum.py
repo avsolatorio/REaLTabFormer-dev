@@ -1,9 +1,11 @@
 import math
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
+from transformers.models.gpt2 import GPT2LMHeadModel
 
 from realtabformer.realtabformer import REaLTabFormer
 from realtabformer.rtf_cusum import (
@@ -352,6 +354,50 @@ def test_fit_cusum_path_runs_and_can_sample():
     samples = model.sample(n_samples=5, device="cpu")
     assert len(samples) <= 5
     assert list(samples.columns) == list(df.columns)
+
+
+def test_fit_cusum_saves_alarm_checkpoint_matching_final_model(tmp_path):
+    # Regression test for a real bug: `load_best_model_at_end` defaults
+    # to True, which -- left on -- reloads whatever checkpoint had the
+    # best held-out eval loss once trainer.train() returns, silently
+    # replacing the exact alarm-point model with one picked by an
+    # unrelated criterion. Confirms both halves of the fix: the flag is
+    # off for this path, and the on-disk alarm checkpoint is bit-for-bit
+    # identical to the model actually left in memory (and therefore to
+    # whatever `.sample()` uses afterward).
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=30,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+        checkpoints_dir=str(tmp_path / "checkpoints"),
+    )
+    trainer = model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+    )
+    mon = model.cusum_monitor
+    assert mon.alarm_step is not None, "expected this config to trigger an alarm"
+    assert trainer.args.load_best_model_at_end is False
+    assert mon.alarm_checkpoint_dir is not None
+
+    ckpt_path = Path(mon.alarm_checkpoint_dir)
+    assert (ckpt_path / "model.safetensors").exists() or (
+        ckpt_path / "pytorch_model.bin"
+    ).exists()
+
+    saved = GPT2LMHeadModel.from_pretrained(str(ckpt_path))
+    saved_state = saved.state_dict()
+    current_state = trainer.model.state_dict()
+    assert saved_state.keys() == current_state.keys()
+    for key in saved_state:
+        assert torch.equal(saved_state[key], current_state[key].cpu())
 
 
 def test_fit_default_path_unaffected_by_cusum_module():

@@ -1665,6 +1665,24 @@ class REaLTabFormer:
         # without any error. Only disabled for this opt-in path.
         self.training_args_kwargs["remove_unused_columns"] = False
 
+        # `load_best_model_at_end` defaults to True -- if left on, HF's
+        # Trainer reloads whatever checkpoint had the best held-out eval
+        # loss once `trainer.train()` returns, for ANY stop reason,
+        # silently replacing the exact alarm-point model with one picked
+        # by an unrelated criterion (and, since it's on by default, also
+        # attaches its own patience-based `EarlyStoppingCallback`, a
+        # second, independent stopping mechanism that could halt
+        # training before the CUSUM detector ever gets a say). Found
+        # while explicitly checking whether the alarm-point model is
+        # actually what ends up usable after training -- confirmed the
+        # answer was no. Disabled specifically for this path; the
+        # explicit `model.save_pretrained(...)` in
+        # `CUSUMEarlyStoppingCallback.on_step_end` is the real guarantee
+        # regardless.
+        self.training_args_kwargs["load_best_model_at_end"] = False
+
+        alarm_checkpoint_dir = (self.checkpoints_dir / "cusum_alarm").as_posix()
+
         trainer: CUSUMTrainer = self._fit_tabular(
             df,
             device=device,
@@ -1697,7 +1715,9 @@ class REaLTabFormer:
             callback_dataset = callback_dataset.rename_column("label_ids", "labels")
 
         trainer.add_callback(
-            CUSUMEarlyStoppingCallback(monitor, callback_dataset)
+            CUSUMEarlyStoppingCallback(
+                monitor, callback_dataset, alarm_checkpoint_dir=alarm_checkpoint_dir
+            )
         )
 
         trainer.train(resume_from_checkpoint=resume_from_checkpoint)
