@@ -1,0 +1,26 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 100,
+    "batch_size": 32,
+    "device": "cuda",
+    "cusum_check_every": 20,
+    "alarm_step": 7240,
+    "global_step": 7240,
+    "steps_per_epoch": 282,
+    "effective_epochs": 25.673758865248228,
+    "elapsed_s": 1209.7614653110504,
+    "mu0": 0.5211764889303595,
+    "sigma0": 0.9955215056105943,
+    "cusum_h": 8.641893294339773,
+    "cooldown_steps_final": 40,
+    "alarm_checkpoint_dir": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/cusum_validation/results/cusum_ep100_1788295822_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 45522,
+    "dcr_synth_mean": 0.920494579162776,
+    "dcr_synth_min": 0.0,
+    "dcr_test_mean": 1.2003299913189371,
+    "frac_suspicious": 0.13710747456877487
+  }
+}
