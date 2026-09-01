@@ -2,6 +2,7 @@
 for tabular and relational data.
 """
 
+import inspect
 import json
 import logging
 import math
@@ -12,7 +13,7 @@ import time
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -86,6 +87,38 @@ def _validate_get_device(device: str) -> str:
         device = _device
 
     return device
+
+
+def _build_training_args(cls: Type, kwargs: Dict[str, Any]):
+    """Constructs ``cls(**kwargs)`` (``TrainingArguments`` or
+    ``Seq2SeqTrainingArguments``), dropping any key ``cls.__init__``
+    doesn't actually accept instead of raising ``TypeError``.
+
+    Found necessary in practice, not preemptively: `training_args_kwargs`
+    is a fixed dict of parameter names built once, but which parameters
+    a given `transformers` release's `TrainingArguments` accepts can
+    (and does) drift between versions -- this repo's own dependency
+    constraint on `transformers` has no upper bound, so a fresh install
+    can land on a release where a previously-standard argument no
+    longer exists, breaking construction outright. Filtering against
+    the actually-installed class's real signature adapts to whatever
+    version is present, rather than requiring this file to be kept in
+    lockstep with every `transformers` release. Warns (once per
+    dropped key, per call) so a silently-ignored argument doesn't go
+    completely unnoticed.
+    """
+    accepted = set(inspect.signature(cls.__init__).parameters)
+    dropped = [k for k in kwargs if k not in accepted]
+    if dropped:
+        warnings.warn(
+            f"{cls.__name__} in the installed transformers version does not "
+            f"accept the following argument(s), which were dropped: "
+            f"{sorted(dropped)}. This can happen when the installed "
+            f"transformers release differs from what this argument set was "
+            f"written against."
+        )
+    filtered = {k: v for k, v in kwargs.items() if k in accepted}
+    return cls(**filtered)
 
 
 class REaLTabFormer:
@@ -1415,7 +1448,7 @@ class REaLTabFormer:
         # instantiate trainer
         trainer = Seq2SeqTrainer(
             model=self.model,
-            args=Seq2SeqTrainingArguments(**training_args_kwargs),
+            args=_build_training_args(Seq2SeqTrainingArguments, training_args_kwargs),
             callbacks=callbacks,
             data_collator=RelationalDataCollator(),
             **dataset,
@@ -1604,7 +1637,7 @@ class REaLTabFormer:
             target_epochs=target_epochs,
             save_epochs=None,
             model=self.model,
-            args=TrainingArguments(**training_args_kwargs),
+            args=_build_training_args(TrainingArguments, training_args_kwargs),
             data_collator=None,  # Use the default_data_collator
             callbacks=callbacks,
             compute_loss_func=compute_loss_func,
