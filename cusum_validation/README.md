@@ -19,7 +19,7 @@ From the repo root, in an environment with the package installed
 (`pip install -e .`) and a CUDA-capable PyTorch:
 
 ```bash
-cd experiments/cusum_full_adult
+cd cusum_validation
 python run_experiment.py --mode cusum --epochs 1000 --device cuda
 ```
 
@@ -42,7 +42,22 @@ throughout the rest of this research.
   fires) -- run this separately, deliberately, once you know whether
   the cusum run is worth comparing against (no point running the full
   expensive schedule twice if the detector fires early).
-- `--mode both`: runs both sequentially in one invocation.
+- `--mode sensitivity`: trains with the *existing*, pre-CUSUM
+  `overfitting_detection_method="sensitivity"` mechanism (bootstrap-DCR
+  with periodic `.generate()` calls) -- the actually meaningful
+  baseline for this research thread, since CUSUM's whole point was to
+  replace/improve on this specific method, not just to beat "no
+  stopping at all" (`--mode full` answers that separate question).
+  Substantially more expensive per check by design (a `num_bootstrap`
+  round bootstrap plus a real generation call every `n_critic` epochs)
+  -- expect this to take meaningfully longer than `--mode cusum` at the
+  same epoch ceiling. Tunable via `--sensitivity-n-critic` (default 5),
+  `--sensitivity-n-critic-stop` (default 2), `--sensitivity-num-bootstrap`
+  (default 500) -- all matching the existing method's own defaults.
+- `--mode both`: runs cusum + full sequentially (unchanged from before
+  sensitivity mode was added).
+- `--mode all`: runs cusum + full + sensitivity sequentially, into one
+  `run_id`'s `summary.json`, for a direct three-way comparison.
 
 Other flags: `--batch-size` (default 32), `--cusum-check-every`
 (default 20, in optimizer steps), `--output-dir` (default `results/`),
@@ -71,7 +86,7 @@ killed or timed-out run still leaves something usable:
   local use/debugging; `.gitignore` in this directory already excludes
   them).
 
-**After running, `git add experiments/cusum_full_adult/results/*.json*`
+**After running, `git add cusum_validation/results/*.json*`
 and commit** (the JSON/JSONL files are small; the checkpoint
 directories are gitignored). That gives Claude everything needed to
 read the results back in a later session -- the trajectory file in

@@ -324,9 +324,91 @@ def run_full(args, run_id, full_df):
     print(f"\nWrote {summary_path}", flush=True)
 
 
+def run_sensitivity(args, run_id, full_df):
+    """The EXISTING bootstrap-DCR overfitting_detection_method="sensitivity"
+    (the default, pre-CUSUM mechanism) -- the actually meaningful
+    baseline for this whole research thread, since CUSUM's point was to
+    replace/improve on this, not just to beat "no stopping at all"
+    (that's what --mode full is for). Substantially more expensive per
+    check than CUSUM by design: a `--cusum-check-every`-style periodic
+    check here means a `num_bootstrap`-round bootstrap plus a real
+    `.generate()` call every `n_critic` epochs, which is exactly the
+    cost CUSUM exists to avoid -- expect this mode to take meaningfully
+    longer than --mode cusum at the same epoch ceiling.
+    """
+    bench = SyntheticDataBench(
+        data=full_df,
+        target_col="income",
+        categorical=True,
+        target_pos_val=">50K",
+        test_size=0.2,
+        random_state=RANDOM_SEED,
+    )
+    train_df = bench.train_df.reset_index(drop=True)
+    test_df = bench.test_df
+
+    results_dir = Path(args.output_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = results_dir / f"{run_id}_summary.json"
+
+    print(
+        f"\n=== RUN: overfitting_detection_method='sensitivity' (existing "
+        f"bootstrap-DCR mechanism), epochs={args.epochs}, "
+        f"n_critic={args.sensitivity_n_critic}, "
+        f"num_bootstrap={args.sensitivity_num_bootstrap}, "
+        f"device={args.device} ===",
+        flush=True,
+    )
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        random_state=RANDOM_SEED,
+        checkpoints_dir=str(results_dir / f"{run_id}_ckpt_sensitivity"),
+    )
+    t0 = time.time()
+    trainer = model.fit(
+        train_df,
+        device=args.device,
+        target_col="income",
+        n_critic=args.sensitivity_n_critic,
+        n_critic_stop=args.sensitivity_n_critic_stop,
+        num_bootstrap=args.sensitivity_num_bootstrap,
+    )
+    elapsed = time.time() - t0
+    print(f"\nRUN done in {elapsed:.1f}s.", flush=True)
+
+    existing = {}
+    if summary_path.exists():
+        existing = json.loads(summary_path.read_text())
+    existing["sensitivity_training"] = dict(
+        epochs_ceiling=args.epochs,
+        batch_size=args.batch_size,
+        device=args.device,
+        n_critic=args.sensitivity_n_critic,
+        n_critic_stop=args.sensitivity_n_critic_stop,
+        num_bootstrap=args.sensitivity_num_bootstrap,
+        elapsed_s=elapsed,
+    )
+    summary_path.write_text(json.dumps(existing, indent=2))
+
+    measure_dcr(
+        model, bench, train_df, test_df, args.device, "sensitivity_stop", summary_path
+    )
+    print(f"\nWrote {summary_path}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=["cusum", "full", "both"], default="cusum")
+    parser.add_argument(
+        "--mode",
+        choices=["cusum", "full", "sensitivity", "both", "all"],
+        default="cusum",
+        help="'both' runs cusum + full (unchanged from before sensitivity "
+        "mode was added). 'all' runs cusum + full + sensitivity "
+        "sequentially, all into the same run_id's summary.json for a "
+        "direct 3-way comparison.",
+    )
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument(
@@ -335,6 +417,16 @@ def main():
         help="Defaults to cuda if available, else cpu.",
     )
     parser.add_argument("--cusum-check-every", type=int, default=20)
+    parser.add_argument(
+        "--sensitivity-n-critic",
+        type=int,
+        default=5,
+        help="Epoch interval between sensitivity checks (each one runs a "
+        "bootstrap round plus a real .generate() call) -- the existing "
+        "method's own default.",
+    )
+    parser.add_argument("--sensitivity-n-critic-stop", type=int, default=2)
+    parser.add_argument("--sensitivity-num-bootstrap", type=int, default=500)
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(
         "--run-id",
@@ -353,10 +445,12 @@ def main():
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
-    if args.mode in ("cusum", "both"):
+    if args.mode in ("cusum", "both", "all"):
         run_cusum(args, args.run_id, full_df)
-    if args.mode in ("full", "both"):
+    if args.mode in ("full", "both", "all"):
         run_full(args, args.run_id, full_df)
+    if args.mode in ("sensitivity", "all"):
+        run_sensitivity(args, args.run_id, full_df)
 
     print("\nDone. Commit the new files under results/ to share them.", flush=True)
 
