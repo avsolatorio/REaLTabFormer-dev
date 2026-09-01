@@ -100,3 +100,50 @@ On the CPU environment this was developed on, one epoch on the full
 faster, but 1000 epochs is still a long run regardless -- consider
 starting with a shorter `--epochs` (e.g. 100-200) to sanity-check
 timing on your hardware before committing to the full 1000.
+
+## Results so far: 100-epoch three-way comparison, and a real CUSUM bug
+
+`--mode all --epochs 100` results are committed under `results/`
+(`cusum_ep100_*`, `full_ep100_*`, `sensitivity_ep100_*`). Summary:
+`full` (no stopping) reached `frac_suspicious=0.576` (badly
+memorized); `cusum` stopped at step 7240/28200 (~epoch 25.7) and got
+`frac_suspicious=0.137`; `sensitivity` (the existing bootstrap-DCR
+mechanism) stopped earlier and got `frac_suspicious=0.054` --
+notably better than CUSUM despite CUSUM being ~27% cheaper in
+wall-clock time. Both stopping mechanisms crushed the unrestricted
+baseline, but sensitivity found the meaningfully better stopping
+point on this run.
+
+Replaying `cusum_ep100_1788295822_cusum_trajectory.jsonl` after the
+fact found why: `sigma0` (the calibrated noise scale CUSUM's z-score
+is divided by) came out to 0.9955, but first-differencing the actual
+351-check post-warmup trajectory shows the true steady-state
+check-to-check noise is only ~0.029 -- `sigma0` was calibrated
+**~34x too large**. The mechanism: the 10-check warmup window used to
+calibrate `sigma0` happens right when the cooled reference pool first
+becomes eligible, which is dominated by rows whose baseline was
+captured at/near model initialization -- the population-level swing
+from "near-random init" to "a few hundred steps in" is large and
+itself noisy check-to-check, nothing to do with memorization, but it
+inflated the calibrated noise scale by orders of magnitude and made
+the detector far more conservative (slower to fire) than it should
+have been.
+
+Fixed in the library (see `rtf_cusum.py`'s module docstring,
+"Calibration" bullet, for the full writeup): a new
+`warmup_settle_checks` (defaults to `warmup_checks` itself) discards
+that many checks before calibration starts collecting, so calibration
+lands once the pool's row-age mix has stabilized; `sigma0` is also now
+estimated via first-differencing (`_robust_noise_std`) rather than raw
+std, as defense-in-depth against any residual drift in the window that
+follows. Validated via unit tests and by replaying this real run's
+z-sequence (delta/target_far retuning alone -- without the sigma0 fix
+-- only pulled the alarm forward by ~300 of 7240 steps, confirming
+`sigma0` and not those knobs was the dominant lever). **Not yet
+validated against a real re-run** -- the fix should make CUSUM fire
+meaningfully earlier, but confirming it actually closes (or beats) the
+gap with sensitivity's `frac_suspicious=0.054` needs a fresh `--mode
+cusum` (or `--mode all`) run on real hardware. The trajectory JSONL
+now tags each line's `phase` as `"settle"`, `"warmup"`, or
+`"post_calibration"` specifically so a re-run can show directly how
+much smaller the recalibrated `sigma0` comes out.

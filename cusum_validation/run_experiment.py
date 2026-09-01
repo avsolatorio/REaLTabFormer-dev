@@ -28,10 +28,13 @@ Results are written incrementally to `results/` (see --output-dir) as
 the run progresses, specifically so a killed/timed-out/interrupted run
 still leaves usable, committable data:
   - `<run_id>_cusum_trajectory.jsonl`: one line per CUSUM check (mode=cusum
-    only), appended in real time as training proceeds -- step, Delta,
-    Z, cusum_S, mu0, sigma0, cusum_h. This is the file to look at if
-    the run gets cut off before finishing; the CUSUM trend up to that
-    point is fully visible even without a final summary.
+    only), appended in real time as training proceeds. Each line's
+    `phase` is one of `"settle"` (discarded, pre-calibration -- just
+    `step`), `"warmup"` (a raw calibration-window sample -- `step`,
+    `delta`), or `"post_calibration"` (a real detection check -- step,
+    Delta, Z, cusum_S, mu0, sigma0, cusum_h). This is the file to look
+    at if the run gets cut off before finishing; the CUSUM trend up to
+    that point is fully visible even without a final summary.
   - `<run_id>_summary.json`: written once, at the end of the run --
     full config, alarm_step (if any), timing, and the DCR ground-truth
     comparison (frac_suspicious, dcr_synth mean, etc.).
@@ -116,10 +119,13 @@ def attach_trajectory_logger(trajectory_path: Path):
     orig_maybe_check = rtf_cusum.CUSUMOverfittingMonitor.maybe_check
 
     def logged_maybe_check(self, step, model, get_rows):
+        settle_before = self._settle_checks_remaining
+        warmup_before = len(self._warmup_deltas)
         fired = orig_maybe_check(self, step, model, get_rows)
         if self.history and self.history[-1][0] == step:
             _, delta, z, cusum_s = self.history[-1]
             record = dict(
+                phase="post_calibration",
                 step=step,
                 delta=delta,
                 z=z,
@@ -129,6 +135,22 @@ def attach_trajectory_logger(trajectory_path: Path):
                 cusum_h=self.cusum_h,
                 alarm_step=self.alarm_step,
             )
+            with open(trajectory_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        elif self._settle_checks_remaining != settle_before:
+            # A settle check was consumed (discarded, no Delta kept) --
+            # logged mainly so it's visible how many checks the settle
+            # window actually cost in real steps.
+            record = dict(phase="settle", step=step)
+            with open(trajectory_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        elif len(self._warmup_deltas) != warmup_before:
+            # A calibration-window sample was collected -- logged raw
+            # (unlike post-calibration checks, mu0/sigma0 aren't set
+            # yet) specifically so a real run can directly confirm
+            # whether the settle window actually avoided the volatile
+            # early-training transient this fix targets.
+            record = dict(phase="warmup", step=step, delta=self._warmup_deltas[-1])
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
         return fired
@@ -376,7 +398,23 @@ def run_sensitivity(args, run_id, full_df):
         num_bootstrap=args.sensitivity_num_bootstrap,
     )
     elapsed = time.time() - t0
-    print(f"\nRUN done in {elapsed:.1f}s.", flush=True)
+    global_step = trainer.state.global_step
+    # Same derivation run_cusum uses (real Trainer settings, not a
+    # guessed batch/accumulation combo) -- so the two are comparable.
+    steps_per_epoch = max(
+        1,
+        len(train_df)
+        // (
+            trainer.args.per_device_train_batch_size
+            * trainer.args.gradient_accumulation_steps
+        ),
+    )
+    stopped_epoch = global_step / steps_per_epoch
+    print(
+        f"\nRUN done in {elapsed:.1f}s. global_step={global_step} "
+        f"(~epoch {stopped_epoch:.1f} of {args.epochs} ceiling)",
+        flush=True,
+    )
 
     existing = {}
     if summary_path.exists():
@@ -389,6 +427,9 @@ def run_sensitivity(args, run_id, full_df):
         n_critic_stop=args.sensitivity_n_critic_stop,
         num_bootstrap=args.sensitivity_num_bootstrap,
         elapsed_s=elapsed,
+        global_step=global_step,
+        steps_per_epoch=steps_per_epoch,
+        stopped_epoch=stopped_epoch,
     )
     summary_path.write_text(json.dumps(existing, indent=2))
 

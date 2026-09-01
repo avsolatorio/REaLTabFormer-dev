@@ -39,9 +39,25 @@ feature was built from):
   mechanism unusable on a large dataset trained for only one or two
   epochs, since it could never accumulate enough steps to even start.
 - Calibration: "normal," non-memorization-driven improvement is
-  estimated from the first few checks once the cooldown pool becomes
+  estimated from a window of checks once the cooldown pool becomes
   available (assumed safe -- real memorization is a many-exposure
-  phenomenon, not something that appears in the first few checks).
+  phenomenon, not something that appears in the first few checks). Two
+  refinements found necessary from replaying a real training run's
+  logged trajectory (a 100-epoch full-Adult-dataset run): (1) the pool
+  right as it first becomes eligible is dominated by rows whose
+  first-exposure baseline was captured at/near model initialization --
+  the population-level swing from "near-random init" to "a few hundred
+  steps in" is large and itself noisy check-to-check, which has nothing
+  to do with memorization but inflates the calibrated noise scale by
+  orders of magnitude if measured there. ``warmup_settle_checks``
+  discards that many checks before calibration starts collecting, so
+  calibration lands once the pool's mix of row ages has stabilized.
+  (2) even past that point, the metric keeps drifting slowly for a
+  while (ordinary learning-curve improvement, not memorization) --
+  ``sigma0`` is estimated via first-differencing the calibration window
+  rather than its raw standard deviation, since raw std conflates that
+  drift with actual check-to-check noise and further inflates the
+  scale (`_robust_noise_std`).
 - Stopping rule: the classical Gaussian mean-shift CUSUM (Page, 1954)
   on the calibration-normalized z-score of each check's paired
   improvement. Lorden's theorem (1971) is the reason this is a
@@ -51,11 +67,12 @@ feature was built from):
 
 Known limitation, stated plainly: like any reactive/sequential
 detector, this needs at least a little data past the true change point
-before it can fire -- concretely, at least ``warmup_checks`` post-cooldown
-checks before it can make any decision at all. It cannot tell you in
-advance whether a single, non-repeatable epoch of training already
-overfit; that requires a second, later measurement to compare against,
-which by construction doesn't exist yet after only one epoch.
+before it can fire -- concretely, at least ``warmup_settle_checks +
+warmup_checks`` post-cooldown checks before it can make any decision at
+all. It cannot tell you in advance whether a single, non-repeatable
+epoch of training already overfit; that requires a second, later
+measurement to compare against, which by construction doesn't exist
+yet after only one epoch.
 """
 
 from __future__ import annotations
@@ -149,6 +166,26 @@ def calibrate_gaussian_cusum_threshold(
     return float(np.quantile(max_S, target_quantile))
 
 
+def _robust_noise_std(values: Sequence[float]) -> float:
+    """Successive-difference ("Rice estimator") noise scale.
+
+    Robust to a slow trend within ``values`` -- the raw std of a
+    trending window conflates genuine drift with actual check-to-check
+    noise, inflating the estimate. First-differencing cancels a
+    slow/linear trend almost entirely while preserving the noise term:
+    each first difference has variance ``2 * sigma**2`` under i.i.d.
+    noise (hence the ``sqrt(2)`` correction), so this is consistent for
+    the true noise scale whether or not a trend is present.
+    """
+    arr = np.asarray(values, dtype=float)
+    if arr.size < 2:
+        return 1e-6
+    diffs = np.diff(arr)
+    if diffs.size == 1:
+        return max(float(abs(diffs[0])) / math.sqrt(2), 1e-6)
+    return max(float(np.std(diffs, ddof=1)) / math.sqrt(2), 1e-6)
+
+
 class CUSUMOverfittingMonitor:
     """Owns all state for the CUSUM overfitting detector.
 
@@ -165,6 +202,7 @@ class CUSUMOverfittingMonitor:
         check_every: int = 20,
         cooldown_steps: int = 40,
         warmup_checks: int = 10,
+        warmup_settle_checks: Optional[int] = None,
         seen_pool_size: int = 256,
         min_seen_pool: int = 32,
         delta: float = 0.5,
@@ -178,11 +216,23 @@ class CUSUMOverfittingMonitor:
             raise ValueError("cooldown_steps must be non-negative.")
         if warmup_checks < 2:
             raise ValueError("warmup_checks must be at least 2 to estimate a variance.")
+        if warmup_settle_checks is not None and warmup_settle_checks < 0:
+            raise ValueError("warmup_settle_checks must be non-negative.")
 
         self.floor_log_prob = float(math.log(1.0 / vocab_size))
         self.check_every = check_every
         self.cooldown_steps = cooldown_steps
         self.warmup_checks = warmup_checks
+        # Defaults to warmup_checks itself (a "settle" window as long as
+        # the calibration window that follows it) -- see the module
+        # docstring's "Calibration" bullet for why this exists: the pool
+        # right as it first becomes eligible is dominated by rows whose
+        # baseline was captured at/near model init, which makes the
+        # earliest checks a bad place to calibrate "normal" noise from.
+        self.warmup_settle_checks = (
+            warmup_checks if warmup_settle_checks is None else warmup_settle_checks
+        )
+        self._settle_checks_remaining = self.warmup_settle_checks
         self.seen_pool_size = seen_pool_size
         self.min_seen_pool = min_seen_pool
         self.delta = delta
@@ -299,6 +349,13 @@ class CUSUMOverfittingMonitor:
         if len(pool) < self.min_seen_pool:
             return False
 
+        if self.mu0 is None and self._settle_checks_remaining > 0:
+            # Consume settle checks without paying for a forward pass --
+            # the calibration window hasn't started yet, so there's
+            # nothing to score against.
+            self._settle_checks_remaining -= 1
+            return False
+
         sample_size = min(self.seen_pool_size, len(pool))
         sample_idx = self._rng.choice(pool, size=sample_size, replace=False).tolist()
 
@@ -325,7 +382,7 @@ class CUSUMOverfittingMonitor:
             self._warmup_deltas.append(Delta)
             if len(self._warmup_deltas) >= self.warmup_checks:
                 self.mu0 = float(np.mean(self._warmup_deltas))
-                self.sigma0 = max(float(np.std(self._warmup_deltas, ddof=1)), 1e-6)
+                self.sigma0 = _robust_noise_std(self._warmup_deltas)
             return False
 
         if np.isnan(var) or var <= 0:

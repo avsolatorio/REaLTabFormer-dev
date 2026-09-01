@@ -10,6 +10,7 @@ from transformers.models.gpt2 import GPT2LMHeadModel
 from realtabformer.realtabformer import REaLTabFormer
 from realtabformer.rtf_cusum import (
     CUSUMOverfittingMonitor,
+    _robust_noise_std,
     calibrate_gaussian_cusum_threshold,
     compute_gated_row_scores,
 )
@@ -125,6 +126,11 @@ def _make_monitor(**overrides):
         check_every=5,
         cooldown_steps=3,
         warmup_checks=3,
+        # Tests below exercise cooldown/calibration/CUSUM-accumulation
+        # logic independently of the settle-skip mechanism (which has
+        # its own dedicated tests) -- default it off here so existing
+        # check counts don't need to change.
+        warmup_settle_checks=0,
         seen_pool_size=32,
         min_seen_pool=4,
         delta=0.5,
@@ -143,6 +149,58 @@ def test_monitor_rejects_bad_config():
         _make_monitor(cooldown_steps=-1)
     with pytest.raises(ValueError):
         _make_monitor(warmup_checks=1)
+    with pytest.raises(ValueError):
+        _make_monitor(warmup_settle_checks=-1)
+
+
+def test_monitor_warmup_settle_checks_defaults_to_warmup_checks():
+    # Constructed directly (not via _make_monitor, which pins
+    # warmup_settle_checks=0 for the tests that don't exercise it) to
+    # check the library's own real default.
+    mon = CUSUMOverfittingMonitor(vocab_size=50, warmup_checks=7)
+    assert mon.warmup_settle_checks == 7
+    assert mon._settle_checks_remaining == 7
+
+
+# ---------------------------------------------------------------------
+# _robust_noise_std
+# ---------------------------------------------------------------------
+def test_robust_noise_std_recovers_true_noise_under_linear_trend():
+    # Regression test for a real bug found by replaying a real training
+    # run's logged CUSUM trajectory: the calibration window's raw std
+    # conflates a slow trend (ordinary, non-memorization improvement)
+    # with actual check-to-check noise, inflating sigma0 by orders of
+    # magnitude and delaying detection. A linear ramp + small iid noise
+    # is the textbook case first-differencing is built to handle: the
+    # constant per-step increment cancels out of every difference,
+    # leaving only `2 * true_noise**2` per difference (hence /sqrt(2)).
+    rng = np.random.default_rng(RANDOM_SEED)
+    true_noise = 0.02
+    trend = np.linspace(0.1, 0.3, 10)
+    values = trend + rng.normal(0.0, true_noise, size=10)
+
+    raw_std = float(np.std(values, ddof=1))
+    robust = _robust_noise_std(values)
+
+    assert robust < raw_std / 2  # trend contamination dominated raw std
+    assert abs(robust - true_noise) < abs(raw_std - true_noise)
+
+
+def test_robust_noise_std_matches_raw_std_scale_without_trend():
+    # With no trend, differencing shouldn't produce a wildly different
+    # answer -- both estimators should land in the same ballpark.
+    rng = np.random.default_rng(RANDOM_SEED)
+    values = rng.normal(0.5, 0.05, size=20)
+    raw_std = float(np.std(values, ddof=1))
+    robust = _robust_noise_std(values)
+    assert 0.3 * raw_std < robust < 3.0 * raw_std
+
+
+def test_robust_noise_std_handles_degenerate_inputs():
+    assert _robust_noise_std([]) == 1e-6
+    assert _robust_noise_std([1.0]) == 1e-6
+    # Two points -> a single difference; still a positive estimate.
+    assert _robust_noise_std([1.0, 1.2]) > 0
 
 
 def test_monitor_adjust_cooldown_caps_when_it_would_never_fit():
@@ -310,6 +368,84 @@ def test_monitor_calibrates_then_accumulates_and_can_fire():
     # Firing again afterwards must not double-report.
     again = mon.maybe_check(step + 1, model, get_rows)
     assert again is False
+
+
+def test_monitor_settle_checks_are_discarded_before_calibration():
+    # Regression test for a real bug found by replaying a real training
+    # run's logged CUSUM trajectory: calibrating sigma0/mu0 from checks
+    # right as the reference pool first becomes eligible lands on the
+    # most volatile window of training (dominated by rows whose
+    # baseline was captured at/near model init), inflating sigma0 by
+    # orders of magnitude and delaying detection. Settle checks must be
+    # consumed silently -- no warmup sample collected, no history, mu0
+    # stays unset -- before calibration starts.
+    torch.manual_seed(RANDOM_SEED)
+    V = 30
+    mon = _make_monitor(
+        cooldown_steps=1,
+        min_seen_pool=8,
+        warmup_checks=3,
+        warmup_settle_checks=2,
+        check_every=1,
+        total_checks_horizon=40,
+    )
+
+    class ConstLM(torch.nn.Module):
+        def __init__(self, vocab_size):
+            super().__init__()
+            self.vocab_size = vocab_size
+            self.training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = mode
+            return self
+
+        def forward(self, input_ids, labels):
+            B, T = labels.shape
+            logits = torch.randn(B, T, self.vocab_size) * 0.1
+
+            class Out:
+                pass
+
+            out = Out()
+            out.logits = logits
+            return out
+
+        def parameters(self):
+            return iter([torch.nn.Parameter(torch.zeros(1))])
+
+    model = ConstLM(V)
+    row_ids = list(range(20))
+    T = 3
+    row_labels = torch.randint(1, V, (len(row_ids), T + 1))
+    row_labels[:, 0] = -1
+    labels_by_id = {idx: row_labels[i : i + 1] for i, idx in enumerate(row_ids)}
+
+    def get_rows(indices):
+        return None, torch.cat([labels_by_id[i] for i in indices], dim=0)
+
+    logits = model(None, row_labels).logits
+    mon.record_batch(row_ids, logits, row_labels, step=1)
+
+    for step in (2, 3):  # warmup_settle_checks=2 -> both must be no-ops
+        fired = mon.maybe_check(step, model, get_rows)
+        assert fired is False
+        assert len(mon._warmup_deltas) == 0
+        assert mon.mu0 is None
+    assert mon._settle_checks_remaining == 0
+
+    for step in (4, 5):  # first 2 of warmup_checks=3
+        mon.maybe_check(step, model, get_rows)
+        assert mon.mu0 is None
+    mon.maybe_check(6, model, get_rows)  # 3rd -> calibration completes
+    assert mon.mu0 is not None
+    assert mon.sigma0 is not None
+    assert len(mon._warmup_deltas) == 3
+    assert mon.history == []  # calibration checks aren't post-calibration history
 
 
 # ---------------------------------------------------------------------

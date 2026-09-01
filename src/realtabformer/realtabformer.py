@@ -500,6 +500,7 @@ class REaLTabFormer:
         cusum_check_every: int = 20,
         cusum_cooldown_steps: int = 40,
         cusum_warmup_checks: int = 10,
+        cusum_warmup_settle_checks: Optional[int] = None,
         cusum_delta: float = 0.5,
         cusum_target_far: float = 0.01,
     ) -> Trainer:
@@ -567,7 +568,13 @@ class REaLTabFormer:
               Minimum steps since a row was last trained on before it's eligible as a
               reference point.
             cusum_warmup_checks: Only used when `overfitting_detection_method="cusum"`.
-              Number of early checks used to calibrate normal (non-memorization) improvement.
+              Number of checks used to calibrate normal (non-memorization) improvement,
+              once collection starts (see `cusum_warmup_settle_checks`).
+            cusum_warmup_settle_checks: Only used when `overfitting_detection_method="cusum"`.
+              Number of checks to discard before calibration starts collecting, so
+              calibration doesn't land on the highly volatile window right as the
+              reference pool first becomes eligible (dominated by rows whose baseline
+              was captured at/near model init). Defaults to `cusum_warmup_checks` itself.
             cusum_delta: Only used when `overfitting_detection_method="cusum"`. Target
               effect size (in standard-error units) the detector is tuned to catch.
             cusum_target_far: Only used when `overfitting_detection_method="cusum"`. Target
@@ -613,6 +620,7 @@ class REaLTabFormer:
                     cusum_check_every=cusum_check_every,
                     cusum_cooldown_steps=cusum_cooldown_steps,
                     cusum_warmup_checks=cusum_warmup_checks,
+                    cusum_warmup_settle_checks=cusum_warmup_settle_checks,
                     cusum_delta=cusum_delta,
                     cusum_target_far=cusum_target_far,
                 )
@@ -1656,6 +1664,7 @@ class REaLTabFormer:
         cusum_check_every: int = 20,
         cusum_cooldown_steps: int = 40,
         cusum_warmup_checks: int = 10,
+        cusum_warmup_settle_checks: Optional[int] = None,
         cusum_delta: float = 0.5,
         cusum_target_far: float = 0.01,
         cusum_seen_pool_size: int = 256,
@@ -1678,9 +1687,15 @@ class REaLTabFormer:
               reference pool. Deliberately a small, fixed step count
               (not scaled to epoch length), so it's satisfiable within
               a single epoch even on a very large dataset.
-            cusum_warmup_checks: Number of early post-cooldown checks
-              used to calibrate what "normal," non-memorization-driven
-              improvement looks like.
+            cusum_warmup_checks: Number of checks used to calibrate what
+              "normal," non-memorization-driven improvement looks like,
+              once collection starts (see `cusum_warmup_settle_checks`).
+            cusum_warmup_settle_checks: Number of checks to discard
+              before calibration starts collecting -- the pool right as
+              it first becomes eligible is dominated by rows whose
+              baseline was captured at/near model init, making it a bad
+              window to calibrate "normal" noise from. Defaults to
+              `cusum_warmup_checks` itself.
             cusum_delta: Target effect size (in standard-error units)
               the CUSUM is tuned to detect.
             cusum_target_far: Target false-alarm rate for the CUSUM
@@ -1728,6 +1743,7 @@ class REaLTabFormer:
             check_every=cusum_check_every,
             cooldown_steps=cusum_cooldown_steps,
             warmup_checks=cusum_warmup_checks,
+            warmup_settle_checks=cusum_warmup_settle_checks,
             seen_pool_size=cusum_seen_pool_size,
             min_seen_pool=cusum_min_seen_pool,
             delta=cusum_delta,
