@@ -1,0 +1,365 @@
+"""
+Long-horizon CUSUM overfitting-detection validation on the full Adult
+(Census Income) dataset -- meant to be run on a GPU, not the CPU-only
+environment this feature was developed and validated on.
+
+Background (continues an earlier research thread validating the CUSUM
+detector added in this branch, not tracked in this repo): on a
+2400-row subsample
+of Adult, the CUSUM detector fired at ~epoch 40 of a 75-epoch schedule,
+and stopping there instead of training the full schedule roughly halved
+the fraction of suspiciously-close synthetic samples (0.445 vs 0.890
+frac_suspicious). On the FULL 45k-row dataset, a 25-epoch run (the most
+that was practical on CPU) never fired -- frac_suspicious stayed at
+~0.059, essentially the natural non-memorized baseline rate. That's
+consistent with theory (a larger, more diverse dataset should be more
+overfitting-resistant for a fixed model size) but leaves open whether
+memorization ever emerges on the full dataset given enough epochs, and
+if so, whether the detector still catches it with a meaningful lead
+time. This script runs a much longer horizon (default 1000 epochs) to
+find out.
+
+Usage:
+    python run_experiment.py --mode cusum --epochs 1000 --device cuda
+    python run_experiment.py --mode full  --epochs 1000 --device cuda
+    python run_experiment.py --mode both  --epochs 1000 --device cuda
+
+Results are written incrementally to `results/` (see --output-dir) as
+the run progresses, specifically so a killed/timed-out/interrupted run
+still leaves usable, committable data:
+  - `<run_id>_cusum_trajectory.jsonl`: one line per CUSUM check (mode=cusum
+    only), appended in real time as training proceeds -- step, Delta,
+    Z, cusum_S, mu0, sigma0, cusum_h. This is the file to look at if
+    the run gets cut off before finishing; the CUSUM trend up to that
+    point is fully visible even without a final summary.
+  - `<run_id>_summary.json`: written once, at the end of the run --
+    full config, alarm_step (if any), timing, and the DCR ground-truth
+    comparison (frac_suspicious, dcr_synth mean, etc.).
+
+After running, commit the `results/` directory's new files back to the
+repo (they're plain JSON/JSONL, small, and are exactly what the
+research log needs to pick this validation back up).
+"""
+
+import argparse
+import json
+import sys
+import time
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+
+from realtabformer.realtabformer import REaLTabFormer
+from realtabformer.rtf_analyze import SyntheticDataBench
+
+warnings.filterwarnings("ignore")
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DATA_DIR = SCRIPT_DIR / "data"
+RANDOM_SEED = 1029
+COLUMNS = [
+    "age",
+    "workclass",
+    "fnlwgt",
+    "education",
+    "education-num",
+    "marital-status",
+    "occupation",
+    "relationship",
+    "race",
+    "sex",
+    "capital-gain",
+    "capital-loss",
+    "hours-per-week",
+    "native-country",
+    "income",
+]
+
+
+def load_adult() -> pd.DataFrame:
+    train_raw = pd.read_csv(
+        DATA_DIR / "adult.data",
+        header=None,
+        names=COLUMNS,
+        skipinitialspace=True,
+        na_values="?",
+    )
+    test_raw = pd.read_csv(
+        DATA_DIR / "adult.test",
+        header=None,
+        names=COLUMNS,
+        skipinitialspace=True,
+        na_values="?",
+        skiprows=1,
+    )
+    full = pd.concat([train_raw, test_raw], axis=0, ignore_index=True)
+    full["income"] = full["income"].str.rstrip(".").str.strip()
+    full = full.dropna().reset_index(drop=True)
+    full = full.drop(columns=["education", "native-country"])
+    return full
+
+
+def attach_trajectory_logger(trajectory_path: Path):
+    """Monkey-patches CUSUMOverfittingMonitor.maybe_check to append one
+    JSON line per check to `trajectory_path`, in addition to its normal
+    behavior. Done here, in the experiment script, rather than in the
+    library itself -- the library has no business knowing about
+    experiment-specific output paths; this is the same non-invasive
+    wrap-and-append pattern used for debugging tracing earlier in this
+    feature's own development.
+    """
+    from realtabformer import rtf_cusum
+
+    orig_maybe_check = rtf_cusum.CUSUMOverfittingMonitor.maybe_check
+
+    def logged_maybe_check(self, step, model, get_rows):
+        fired = orig_maybe_check(self, step, model, get_rows)
+        if self.history and self.history[-1][0] == step:
+            _, delta, z, cusum_s = self.history[-1]
+            record = dict(
+                step=step,
+                delta=delta,
+                z=z,
+                cusum_S=cusum_s,
+                mu0=self.mu0,
+                sigma0=self.sigma0,
+                cusum_h=self.cusum_h,
+                alarm_step=self.alarm_step,
+            )
+            with open(trajectory_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        return fired
+
+    rtf_cusum.CUSUMOverfittingMonitor.maybe_check = logged_maybe_check
+
+
+def measure_dcr(model, bench, train_df, test_df, device, label, summary_path):
+    n_needed = len(train_df) + len(test_df) + 300
+    samples = model.sample(n_samples=n_needed, device=device)
+    samples = samples.dropna().reset_index(drop=True)
+    print(f"[{label}] generated {len(samples)} valid samples", flush=True)
+    result = dict(label=label, n_samples_generated=len(samples))
+    if len(samples) >= len(train_df) + len(test_df):
+        bench.register_synthetic_data(samples)
+        dcr_synth = bench.get_dcr(is_test=False)
+        dcr_test = bench.get_dcr(is_test=True)
+        threshold = dcr_test.quantile(0.05)
+        frac_suspicious = float((dcr_synth < threshold).mean())
+        result.update(
+            dcr_synth_mean=float(dcr_synth.mean()),
+            dcr_synth_min=float(dcr_synth.min()),
+            dcr_test_mean=float(dcr_test.mean()),
+            frac_suspicious=frac_suspicious,
+        )
+        print(
+            f"[{label}] DCR: synth_mean={result['dcr_synth_mean']:.4f} "
+            f"frac_suspicious={frac_suspicious:.4f}",
+            flush=True,
+        )
+    else:
+        result["error"] = "not enough valid samples for DCR bench"
+        print(f"[{label}] not enough valid samples for DCR bench", flush=True)
+
+    # Write/merge into the summary file incrementally -- if this is the
+    # first result written, create the file; if a summary already
+    # exists (e.g. mode=both, cusum result written first), merge in.
+    existing = {}
+    if summary_path.exists():
+        existing = json.loads(summary_path.read_text())
+    existing[label] = result
+    summary_path.write_text(json.dumps(existing, indent=2))
+    return result
+
+
+def run_cusum(args, run_id, full_df):
+    bench = SyntheticDataBench(
+        data=full_df,
+        target_col="income",
+        categorical=True,
+        target_pos_val=">50K",
+        test_size=0.2,
+        random_state=RANDOM_SEED,
+    )
+    train_df = bench.train_df.reset_index(drop=True)
+    test_df = bench.test_df
+
+    results_dir = Path(args.output_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    trajectory_path = results_dir / f"{run_id}_cusum_trajectory.jsonl"
+    summary_path = results_dir / f"{run_id}_summary.json"
+    trajectory_path.write_text("")  # truncate/create fresh
+
+    attach_trajectory_logger(trajectory_path)
+
+    print(
+        f"\n=== RUN: overfitting_detection_method='cusum', "
+        f"epochs={args.epochs}, device={args.device} ===",
+        flush=True,
+    )
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        random_state=RANDOM_SEED,
+        checkpoints_dir=str(results_dir / f"{run_id}_ckpt_cusum"),
+    )
+    t0 = time.time()
+    trainer = model.fit(
+        train_df,
+        device=args.device,
+        overfitting_detection_method="cusum",
+        cusum_check_every=args.cusum_check_every,
+    )
+    elapsed = time.time() - t0
+    mon = model.cusum_monitor
+    steps_per_epoch = max(
+        1,
+        len(trainer.train_dataset)
+        // (
+            trainer.args.per_device_train_batch_size
+            * trainer.args.gradient_accumulation_steps
+        ),
+    )
+    print(
+        f"\nRUN done in {elapsed:.1f}s. alarm_step={mon.alarm_step} "
+        f"global_step={trainer.state.global_step} "
+        f"effective_epochs={trainer.state.global_step / steps_per_epoch:.2f} "
+        f"alarm_checkpoint_dir={mon.alarm_checkpoint_dir}",
+        flush=True,
+    )
+
+    # Write the training-run facts into the summary immediately, before
+    # the (much cheaper, but still non-zero) DCR measurement -- so even
+    # if sampling/DCR fails, the core "did it fire, when, how long did
+    # training take" facts are already on disk.
+    existing = {}
+    if summary_path.exists():
+        existing = json.loads(summary_path.read_text())
+    existing["cusum_training"] = dict(
+        epochs_ceiling=args.epochs,
+        batch_size=args.batch_size,
+        device=args.device,
+        cusum_check_every=args.cusum_check_every,
+        alarm_step=mon.alarm_step,
+        global_step=trainer.state.global_step,
+        steps_per_epoch=steps_per_epoch,
+        effective_epochs=trainer.state.global_step / steps_per_epoch,
+        elapsed_s=elapsed,
+        mu0=mon.mu0,
+        sigma0=mon.sigma0,
+        cusum_h=mon.cusum_h,
+        cooldown_steps_final=mon.cooldown_steps,
+        alarm_checkpoint_dir=mon.alarm_checkpoint_dir,
+    )
+    summary_path.write_text(json.dumps(existing, indent=2))
+
+    measure_dcr(
+        model,
+        bench,
+        train_df,
+        test_df,
+        args.device,
+        "cusum_stop_at_alarm",
+        summary_path,
+    )
+    print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
+
+
+def run_full(args, run_id, full_df):
+    bench = SyntheticDataBench(
+        data=full_df,
+        target_col="income",
+        categorical=True,
+        target_pos_val=">50K",
+        test_size=0.2,
+        random_state=RANDOM_SEED,
+    )
+    train_df = bench.train_df.reset_index(drop=True)
+    test_df = bench.test_df
+
+    results_dir = Path(args.output_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = results_dir / f"{run_id}_summary.json"
+
+    print(
+        f"\n=== RUN: overfitting_detection_method='none' (full schedule), "
+        f"epochs={args.epochs}, device={args.device} ===",
+        flush=True,
+    )
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        random_state=RANDOM_SEED,
+        checkpoints_dir=str(results_dir / f"{run_id}_ckpt_full"),
+    )
+    t0 = time.time()
+    trainer = model.fit(
+        train_df, device=args.device, overfitting_detection_method="none"
+    )
+    elapsed = time.time() - t0
+    print(
+        f"\nRUN done in {elapsed:.1f}s. global_step={trainer.state.global_step}",
+        flush=True,
+    )
+
+    existing = {}
+    if summary_path.exists():
+        existing = json.loads(summary_path.read_text())
+    existing["full_training"] = dict(
+        epochs_ceiling=args.epochs,
+        batch_size=args.batch_size,
+        device=args.device,
+        global_step=trainer.state.global_step,
+        elapsed_s=elapsed,
+    )
+    summary_path.write_text(json.dumps(existing, indent=2))
+
+    measure_dcr(
+        model, bench, train_df, test_df, args.device, "full_schedule", summary_path
+    )
+    print(f"\nWrote {summary_path}", flush=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=["cusum", "full", "both"], default="cusum")
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Defaults to cuda if available, else cpu.",
+    )
+    parser.add_argument("--cusum-check-every", type=int, default=20)
+    parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
+    parser.add_argument(
+        "--run-id",
+        default=None,
+        help="Prefix for output files; defaults to mode+epochs+timestamp.",
+    )
+    args = parser.parse_args()
+
+    if args.run_id is None:
+        args.run_id = f"{args.mode}_ep{args.epochs}_{int(time.time())}"
+
+    print(f"Loading Adult data from {DATA_DIR} ...", flush=True)
+    full_df = load_adult()
+    print(f"full cleaned dataset: {len(full_df)} rows", flush=True)
+
+    torch.manual_seed(RANDOM_SEED)
+    np.random.seed(RANDOM_SEED)
+
+    if args.mode in ("cusum", "both"):
+        run_cusum(args, args.run_id, full_df)
+    if args.mode in ("full", "both"):
+        run_full(args, args.run_id, full_df)
+
+    print("\nDone. Commit the new files under results/ to share them.", flush=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
