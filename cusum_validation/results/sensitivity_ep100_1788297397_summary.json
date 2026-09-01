@@ -1,0 +1,19 @@
+{
+  "sensitivity_training": {
+    "epochs_ceiling": 100,
+    "batch_size": 32,
+    "device": "cuda:1",
+    "n_critic": 5,
+    "n_critic_stop": 2,
+    "num_bootstrap": 500,
+    "elapsed_s": 1662.1433856487274
+  },
+  "sensitivity_stop": {
+    "label": "sensitivity_stop",
+    "n_samples_generated": 45522,
+    "dcr_synth_mean": 1.1722516819410276,
+    "dcr_synth_min": 3.779376182200256e-05,
+    "dcr_test_mean": 1.2003299913189371,
+    "frac_suspicious": 0.054068996019460414
+  }
+}

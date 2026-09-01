@@ -1,0 +1,17 @@
+{
+  "full_training": {
+    "epochs_ceiling": 100,
+    "batch_size": 32,
+    "device": "cuda",
+    "global_step": 14200,
+    "elapsed_s": 2434.558484315872
+  },
+  "full_schedule": {
+    "label": "full_schedule",
+    "n_samples_generated": 45522,
+    "dcr_synth_mean": 0.4543330219709268,
+    "dcr_synth_min": 0.0,
+    "dcr_test_mean": 1.2003299913189371,
+    "frac_suspicious": 0.5760725342768687
+  }
+}
