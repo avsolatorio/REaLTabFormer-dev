@@ -1,0 +1,457 @@
+"""CUSUM-based, generation-free overfitting/memorization detection.
+
+Replaces (as an opt-in alternative to) the bootstrap-DCR sensitivity
+mechanism in ``_train_with_sensitivity`` with a training-time monitor
+that requires no ``.generate()`` calls and no additional held-out data.
+
+Design summary (full derivation, literature grounding, and the
+experiments that led to each choice are in the research log this
+feature was built from):
+
+- Per-token statistic: a "gated" (Winsorized) log-likelihood --
+  ``log P(true_token)`` when the model's argmax already matches the
+  true token, and a fixed floor (``log(1/vocab_size)``, "no better than
+  a uniform guess") when it doesn't. This is continuous (unlike a
+  binary exact-match indicator, which collapses to an unobservably rare
+  event over a whole row) and bounded (unlike raw negative
+  log-likelihood, whose unbounded penalty for wrong tokens can inject
+  large outliers from ordinarily-hard rows).
+- Per-row score: the mean gated statistic over a row's own valid target
+  positions -- computed for free from the same forward pass already
+  needed for the training loss (``reduction="none"`` instead of the
+  batch mean).
+- Reference: each row's own score at its one-time first exposure
+  (before its first gradient update -- a genuinely prequential,
+  zero-cost snapshot), compared against its own score later in
+  training. This survives exhaustion of "never-yet-trained" rows in
+  multi-epoch training on a fixed-size dataset (a real bug found and
+  fixed during development: comparing two *populations* -- fresh vs.
+  seen -- breaks once the fresh population runs out, which happens at
+  the end of epoch 1 regardless of dataset size).
+- Cooldown: a row only enters the comparison pool once at least
+  ``cooldown_steps`` training steps have passed since it was last
+  trained on. This excludes the ordinary post-gradient-step "recency
+  bump" (a row just updated on fits it directly; that fit's extra
+  contribution beyond the general training trend fades within roughly
+  10-20 steps, confirmed by direct measurement) from being mistaken for
+  memorization. Deliberately a small, fixed step count, not scaled to
+  epoch length -- an epoch-scaled cooldown would make the whole
+  mechanism unusable on a large dataset trained for only one or two
+  epochs, since it could never accumulate enough steps to even start.
+- Calibration: "normal," non-memorization-driven improvement is
+  estimated from the first few checks once the cooldown pool becomes
+  available (assumed safe -- real memorization is a many-exposure
+  phenomenon, not something that appears in the first few checks).
+- Stopping rule: the classical Gaussian mean-shift CUSUM (Page, 1954)
+  on the calibration-normalized z-score of each check's paired
+  improvement. Lorden's theorem (1971) is the reason this is a
+  principled choice, not just a heuristic: CUSUM minimizes the
+  worst-case expected detection delay among all stopping rules for a
+  given false-alarm-rate constraint.
+
+Known limitation, stated plainly: like any reactive/sequential
+detector, this needs at least a little data past the true change point
+before it can fire -- concretely, at least ``warmup_checks`` post-cooldown
+checks before it can make any decision at all. It cannot tell you in
+advance whether a single, non-repeatable epoch of training already
+overfit; that requires a second, later measurement to compare against,
+which by construction doesn't exist yet after only one epoch.
+"""
+
+from __future__ import annotations
+
+import math
+import warnings
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+from transformers import (
+    TrainerCallback,
+    TrainerControl,
+    TrainerState,
+    TrainingArguments,
+)
+
+from .rtf_trainer import ResumableTrainer
+
+
+def compute_gated_row_scores(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    floor_log_prob: float,
+) -> torch.Tensor:
+    """Per-row mean gated log-likelihood.
+
+    ``logits``: (batch, seq_len, vocab) raw model output.
+    ``labels``: (batch, seq_len) target ids, with ``-100`` at positions
+      to ignore (matches HF's causal-LM convention).
+
+    Uses the standard causal-LM shift (predictions at position i predict
+    the token at position i+1), matches HF's own internal loss
+    computation exactly (verified bit-for-bit against
+    ``ForCausalLMLoss`` during development).
+    """
+    shift_logits = logits[:, :-1, :]
+    shift_labels = labels[:, 1:]
+
+    valid = shift_labels != -100
+    safe_labels = shift_labels.clamp(min=0)
+
+    log_probs = F.log_softmax(shift_logits, dim=-1)
+    true_log_prob = log_probs.gather(-1, safe_labels.unsqueeze(-1)).squeeze(-1)
+
+    argmax_pred = shift_logits.argmax(-1)
+    correct = argmax_pred == shift_labels
+
+    gated = torch.where(
+        correct, true_log_prob, torch.full_like(true_log_prob, floor_log_prob)
+    )
+    gated = torch.where(valid, gated, torch.zeros_like(gated))
+
+    row_sum = gated.sum(dim=1)
+    row_count = valid.sum(dim=1).clamp(min=1)
+    return row_sum / row_count
+
+
+def calibrate_gaussian_cusum_threshold(
+    delta: float,
+    n_checks_horizon: int,
+    target_quantile: float = 0.99,
+    n_sims: int = 3000,
+    seed: Optional[int] = None,
+) -> float:
+    """Monte-Carlo calibration of the CUSUM decision threshold ``h``.
+
+    Simulates the null hypothesis (a stream of iid standard-normal
+    z-scores -- i.e. no real shift) ``n_sims`` times over a horizon of
+    ``n_checks_horizon`` checks, and returns the ``target_quantile``
+    quantile of each simulated run's maximum CUSUM path. This bounds
+    the false-alarm rate at the actual scale of the real run (its
+    number of checks), rather than reusing a threshold calibrated for a
+    different horizon.
+    """
+    rng = np.random.default_rng(seed)
+    llr_delta = delta
+    llr_offset = delta**2 / 2
+    max_S = np.empty(n_sims)
+    for s in range(n_sims):
+        z = rng.normal(0.0, 1.0, size=n_checks_horizon)
+        llr = llr_delta * z - llr_offset
+        running_max = 0.0
+        acc = 0.0
+        for x in llr:
+            acc = max(0.0, acc + x)
+            if acc > running_max:
+                running_max = acc
+        max_S[s] = running_max
+    return float(np.quantile(max_S, target_quantile))
+
+
+class CUSUMOverfittingMonitor:
+    """Owns all state for the CUSUM overfitting detector.
+
+    One instance is shared between the ``CUSUMTrainer`` (which feeds it
+    per-row scores for free during each training step's forward pass)
+    and the ``CUSUMEarlyStoppingCallback`` (which periodically asks it
+    to run the actual detection check, using a resampled reference
+    pool).
+    """
+
+    def __init__(
+        self,
+        vocab_size: int,
+        check_every: int = 20,
+        cooldown_steps: int = 40,
+        warmup_checks: int = 10,
+        seen_pool_size: int = 256,
+        min_seen_pool: int = 32,
+        delta: float = 0.5,
+        target_quantile: float = 0.99,
+        total_checks_horizon: Optional[int] = None,
+        random_state: Optional[int] = None,
+    ) -> None:
+        if check_every <= 0:
+            raise ValueError("check_every must be a positive integer.")
+        if cooldown_steps < 0:
+            raise ValueError("cooldown_steps must be non-negative.")
+        if warmup_checks < 2:
+            raise ValueError("warmup_checks must be at least 2 to estimate a variance.")
+
+        self.floor_log_prob = float(math.log(1.0 / vocab_size))
+        self.check_every = check_every
+        self.cooldown_steps = cooldown_steps
+        self.warmup_checks = warmup_checks
+        self.seen_pool_size = seen_pool_size
+        self.min_seen_pool = min_seen_pool
+        self.delta = delta
+        self.target_quantile = target_quantile
+        self.random_state = random_state
+        self._rng = np.random.default_rng(random_state)
+
+        # Calibrated lazily: the false-alarm-rate guarantee is only
+        # meaningful once we know how many checks the run will actually
+        # have. If the caller doesn't know the horizon up front (e.g.
+        # training length isn't fixed ahead of time), a generous default
+        # horizon is used and can be widened later via `extend_horizon`.
+        self._horizon = total_checks_horizon or 1000
+        self.cusum_h = calibrate_gaussian_cusum_threshold(
+            delta=self.delta,
+            n_checks_horizon=self._horizon,
+            target_quantile=self.target_quantile,
+            seed=self.random_state,
+        )
+
+        self.baseline_score: Dict[int, float] = {}
+        self.last_seen_step: Dict[int, int] = {}
+        self.seen_indices: Set[int] = set()
+
+        self.mu0: Optional[float] = None
+        self.sigma0: Optional[float] = None
+        self._warmup_deltas: List[float] = []
+
+        self.cusum_S: float = 0.0
+        self.alarm_step: Optional[int] = None
+        self.history: List[Tuple[int, float, float, float]] = []  # (step, Delta, Z, S)
+
+    def extend_horizon(self, total_checks_horizon: int) -> None:
+        """Recalibrate ``cusum_h`` once the true check horizon is known."""
+        if total_checks_horizon <= self._horizon:
+            return
+        self._horizon = total_checks_horizon
+        self.cusum_h = calibrate_gaussian_cusum_threshold(
+            delta=self.delta,
+            n_checks_horizon=self._horizon,
+            target_quantile=self.target_quantile,
+            seed=self.random_state,
+        )
+
+    def adjust_cooldown_for_steps_per_epoch(self, steps_per_epoch: int) -> None:
+        """Caps ``cooldown_steps`` against the ACTUAL observed steps-per-
+        epoch, found necessary the hard way: a row only stops being
+        "recently touched" once ``cooldown_steps`` have passed since its
+        last training step, but if the training loop cycles back through
+        the whole dataset faster than that (i.e. ``cooldown_steps >=
+        steps_per_epoch`` -- possible even at "reasonable" dataset sizes,
+        since HF's default `gradient_accumulation_steps` multiplies how
+        much data one optimizer step covers, shrinking steps_per_epoch
+        well below what a naive per-row-batch-size estimate would
+        suggest), EVERY row gets re-touched and its cooldown clock reset
+        before it can ever qualify -- the reference pool stays
+        permanently empty and the detector never activates, silently.
+        Caps at half an epoch's worth of steps so every row spends at
+        least part of each cycle eligible, regardless of dataset size,
+        batch size, or gradient accumulation -- a no-op whenever the
+        configured cooldown already comfortably fits (the common case
+        on any reasonably-sized dataset).
+        """
+        if steps_per_epoch <= 0:
+            return
+        safe_cap = max(1, steps_per_epoch // 2)
+        if self.cooldown_steps > safe_cap:
+            self.cooldown_steps = safe_cap
+
+    def record_batch(
+        self,
+        row_idx: Sequence[int],
+        logits: torch.Tensor,
+        labels: torch.Tensor,
+        step: int,
+    ) -> None:
+        """Called once per training step, from inside the loss
+        computation -- costs nothing extra beyond a per-row (rather
+        than batch-mean) reduction of a quantity already computed.
+        """
+        with torch.no_grad():
+            scores = compute_gated_row_scores(logits, labels, self.floor_log_prob)
+        scores_list = scores.detach().to("cpu").tolist()
+        for idx, score in zip(row_idx, scores_list):
+            idx = int(idx)
+            if idx not in self.baseline_score:
+                self.baseline_score[idx] = float(score)
+            self.seen_indices.add(idx)
+            self.last_seen_step[idx] = step
+
+    def _cooled_pool(self, step: int) -> List[int]:
+        cooldown = self.cooldown_steps
+        return [
+            idx
+            for idx in self.seen_indices
+            if (step - self.last_seen_step[idx]) >= cooldown
+        ]
+
+    def maybe_check(
+        self,
+        step: int,
+        model: torch.nn.Module,
+        get_rows,
+    ) -> bool:
+        """Run one detection check, if enough cooled reference rows are
+        available. Returns True exactly on the step the alarm fires
+        (i.e. once, not on every subsequent step after firing).
+
+        ``get_rows(indices)`` must return ``(input_ids, labels)`` torch
+        tensors for the given row indices from the training dataset.
+        """
+        pool = self._cooled_pool(step)
+        if len(pool) < self.min_seen_pool:
+            return False
+
+        sample_size = min(self.seen_pool_size, len(pool))
+        sample_idx = self._rng.choice(pool, size=sample_size, replace=False).tolist()
+
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            input_ids, labels = get_rows(sample_idx)
+            outputs = model(input_ids=input_ids, labels=labels)
+            current = compute_gated_row_scores(
+                outputs.logits, labels, self.floor_log_prob
+            )
+        if was_training:
+            model.train()
+
+        current_np = current.detach().to("cpu").numpy()
+        base_np = np.array([self.baseline_score[idx] for idx in sample_idx])
+        paired_diff = current_np - base_np
+
+        n = len(sample_idx)
+        Delta = float(paired_diff.mean())
+        var = float(paired_diff.var(ddof=1)) if n > 1 else float("nan")
+
+        if self.mu0 is None:
+            self._warmup_deltas.append(Delta)
+            if len(self._warmup_deltas) >= self.warmup_checks:
+                self.mu0 = float(np.mean(self._warmup_deltas))
+                self.sigma0 = max(float(np.std(self._warmup_deltas, ddof=1)), 1e-6)
+            return False
+
+        if np.isnan(var) or var <= 0:
+            return False
+
+        se = float(np.sqrt(var / n + self.sigma0**2))
+        if se <= 0:
+            return False
+
+        z = (Delta - self.mu0) / se
+        llr = self.delta * z - self.delta**2 / 2
+        self.cusum_S = max(0.0, self.cusum_S + llr)
+        self.history.append((step, Delta, z, self.cusum_S))
+
+        if self.cusum_S >= self.cusum_h and self.alarm_step is None:
+            self.alarm_step = step
+            return True
+        return False
+
+
+class CUSUMTrainer(ResumableTrainer):
+    """``ResumableTrainer`` that also feeds per-row gated scores to a
+    ``CUSUMOverfittingMonitor``, for free, from the training forward
+    pass already being computed.
+
+    The dataset must have an ``idx`` integer column identifying each
+    row (added by ``REaLTabFormer._fit_tabular(..., add_row_idx=True)``)
+    -- it's popped out of ``inputs`` before being passed to the model,
+    since the model itself doesn't accept it as a forward argument.
+    """
+
+    def __init__(
+        self, *args, cusum_monitor: Optional[CUSUMOverfittingMonitor] = None, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.cusum_monitor = cusum_monitor
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        row_idx = inputs.pop("idx", None)
+        loss, outputs = super().compute_loss(
+            model, inputs, return_outputs=True, **kwargs
+        )
+        if row_idx is not None and self.cusum_monitor is not None and model.training:
+            self.cusum_monitor.record_batch(
+                row_idx.detach().to("cpu").tolist(),
+                outputs.logits,
+                inputs["labels"],
+                self.state.global_step,
+            )
+        return (loss, outputs) if return_outputs else loss
+
+
+class CUSUMEarlyStoppingCallback(TrainerCallback):
+    """Runs the periodic CUSUM check and requests training stop when it
+    fires. Requires the training dataset to be indexable by row (a plain
+    ``datasets.Dataset`` with ``input_ids``/``labels`` columns works).
+    """
+
+    def __init__(self, monitor: CUSUMOverfittingMonitor, train_dataset) -> None:
+        self.monitor = monitor
+        self.train_dataset = train_dataset
+
+    def _get_rows(self, indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        rows = self.train_dataset[indices]
+        device = next(self._model.parameters()).device
+        # torch.as_tensor (not torch.tensor) since the dataset may already
+        # be torch-formatted (`set_format(type="torch", ...)`, used when
+        # this feature is threaded on top of a branch that also needs
+        # field_weights/digit_entropy_weighting's own extra columns) --
+        # re-wrapping an existing tensor via torch.tensor(...) triggers a
+        # UserWarning and an avoidable copy; as_tensor is a no-op then.
+        input_ids = torch.as_tensor(rows["input_ids"], device=device)
+        labels = torch.as_tensor(rows["labels"], device=device)
+        return input_ids, labels
+
+    def on_train_begin(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        effective_batch_size = max(
+            1, args.per_device_train_batch_size * args.gradient_accumulation_steps
+        )
+        steps_per_epoch = max(1, len(self.train_dataset) // effective_batch_size)
+        prior_cooldown = self.monitor.cooldown_steps
+        self.monitor.adjust_cooldown_for_steps_per_epoch(steps_per_epoch)
+        if self.monitor.cooldown_steps != prior_cooldown:
+            warnings.warn(
+                f"cusum_cooldown_steps={prior_cooldown} would never be "
+                f"satisfiable at this training's actual steps-per-epoch "
+                f"({steps_per_epoch}, from per_device_train_batch_size="
+                f"{args.per_device_train_batch_size} x "
+                f"gradient_accumulation_steps="
+                f"{args.gradient_accumulation_steps}) -- every row would be "
+                f"re-touched before it could cool down, and the detector "
+                f"would never activate. Capped to "
+                f"{self.monitor.cooldown_steps} steps instead."
+            )
+
+        total_steps = (
+            state.max_steps if state.max_steps and state.max_steps > 0 else None
+        )
+        if total_steps:
+            horizon = total_steps // self.monitor.check_every + 10
+            self.monitor.extend_horizon(horizon)
+        return control
+
+    def on_step_end(
+        self,
+        args: TrainingArguments,
+        state: TrainerState,
+        control: TrainerControl,
+        **kwargs,
+    ):
+        step = state.global_step
+        if step == 0 or step % self.monitor.check_every != 0:
+            return control
+
+        model = kwargs.get("model")
+        if model is None:
+            return control
+        self._model = model
+
+        alarmed = self.monitor.maybe_check(step, model, self._get_rows)
+        if alarmed:
+            control.should_training_stop = True
+            control.should_save = True
+        return control

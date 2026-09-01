@@ -46,6 +46,11 @@ from .data_utils import (
     process_data,
 )
 from .rtf_analyze import SyntheticDataBench
+from .rtf_cusum import (
+    CUSUMEarlyStoppingCallback,
+    CUSUMOverfittingMonitor,
+    CUSUMTrainer,
+)
 from .rtf_datacollator import RelationalDataCollator
 from .rtf_exceptions import SampleEmptyLimitError
 from .rtf_sampler import RelationalSampler, TabularSampler
@@ -458,6 +463,12 @@ class REaLTabFormer:
         predict_fields: Optional[List[str]] = None,
         digit_entropy_weighting: bool = False,
         digit_entropy_weight_floor: float = 0.1,
+        overfitting_detection_method: str = "sensitivity",
+        cusum_check_every: int = 20,
+        cusum_cooldown_steps: int = 40,
+        cusum_warmup_checks: int = 10,
+        cusum_delta: float = 0.5,
+        cusum_target_far: float = 0.01,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
 
@@ -511,6 +522,23 @@ class REaLTabFormer:
             save_full_every_epoch: The number of epochs to save the full model. Only used for tabular data with sensitivity training.
             gen_kwargs: Additional keyword arguments to pass to the model's `generate` method. Example: `{"gen_batch": 128}`.
             predict_fields: All other fields will be considered as features for prediction, this means their labels will be set to -100.
+            overfitting_detection_method: One of `"sensitivity"` (default, the existing
+              bootstrap-DCR mechanism controlled by `n_critic`/`n_critic_stop`/etc.),
+              `"cusum"` (a generation-free, training-time detector based on sequential
+              change-point detection -- no `.generate()` calls, works at any epoch-count
+              scale, but only for the tabular `model_type`), or `"none"` (train for the
+              full `epochs` with no early stopping, equivalent to `n_critic=0`).
+            cusum_check_every: Only used when `overfitting_detection_method="cusum"`. How
+              often (in training steps) to run the detection check.
+            cusum_cooldown_steps: Only used when `overfitting_detection_method="cusum"`.
+              Minimum steps since a row was last trained on before it's eligible as a
+              reference point.
+            cusum_warmup_checks: Only used when `overfitting_detection_method="cusum"`.
+              Number of early checks used to calibrate normal (non-memorization) improvement.
+            cusum_delta: Only used when `overfitting_detection_method="cusum"`. Target
+              effect size (in standard-error units) the detector is tuned to catch.
+            cusum_target_far: Only used when `overfitting_detection_method="cusum"`. Target
+              false-alarm rate for the detector's decision threshold.
 
         Returns:
             Trainer
@@ -536,8 +564,26 @@ class REaLTabFormer:
             torch.manual_seed(self.random_state)
             torch.cuda.manual_seed_all(self.random_state)
 
+        if overfitting_detection_method not in ("sensitivity", "cusum", "none"):
+            raise ValueError(
+                "overfitting_detection_method must be one of "
+                '"sensitivity", "cusum", "none" -- '
+                f"got {overfitting_detection_method!r}."
+            )
+
         if self.model_type == ModelType.tabular:
-            if n_critic <= 0:
+            if overfitting_detection_method == "cusum":
+                trainer = self._train_with_cusum(
+                    df,
+                    device,
+                    resume_from_checkpoint=resume_from_checkpoint,
+                    cusum_check_every=cusum_check_every,
+                    cusum_cooldown_steps=cusum_cooldown_steps,
+                    cusum_warmup_checks=cusum_warmup_checks,
+                    cusum_delta=cusum_delta,
+                    cusum_target_far=cusum_target_far,
+                )
+            elif overfitting_detection_method == "none" or n_critic <= 0:
                 # NOTE: field_weights/predict_fields/compute_loss_func were
                 # previously silently dropped on this path (pre-existing
                 # gap, unrelated to digit_entropy_weighting) -- fixed here
@@ -1388,6 +1434,8 @@ class REaLTabFormer:
         predict_fields: Optional[List[str]] = None,
         digit_entropy_weighting: bool = False,
         digit_entropy_weight_floor: float = 0.1,
+        add_row_idx: bool = False,
+        trainer_cls: Optional[type] = None,
     ) -> Trainer:
         self._extract_column_info(df)
         df, self.col_transform_data, self.orig_to_processed_col_map = process_data(
@@ -1453,6 +1501,13 @@ class REaLTabFormer:
             chunk_significance_weights=chunk_significance_weights,
         )
 
+        if add_row_idx:
+            # Opt-in only (used by the "cusum" overfitting-detection
+            # path): a stable per-row identifier that survives the
+            # default data collator, needed to track each row's own
+            # first-exposure baseline score across training steps.
+            dataset = dataset.add_column("idx", list(range(len(dataset))))
+
         # Store the sequence length for the processed data
         self.tabular_max_length = len(dataset[0]["input_ids"])
 
@@ -1463,6 +1518,13 @@ class REaLTabFormer:
 
         if field_weights is not None or chunk_significance_weights is not None:
             dataset_columns.append("token_weights")
+
+        if add_row_idx:
+            # Without this, `set_format`'s column restriction below would
+            # silently strip `idx` too, the same failure mode as
+            # `remove_unused_columns` stripping it further downstream --
+            # confirmed the hard way once already, not assumed safe here.
+            dataset_columns.append("idx")
 
         for split in dataset.keys():
             dataset[split] = dataset[split].rename_column("label_ids", "labels")
@@ -1492,6 +1554,7 @@ class REaLTabFormer:
             num_train_epochs=num_train_epochs,
             target_epochs=target_epochs,
             compute_loss_func=compute_loss_func,
+            trainer_cls=trainer_cls,
         )
 
     def _build_tabular_trainer(
@@ -1500,6 +1563,7 @@ class REaLTabFormer:
         num_train_epochs: int = None,
         target_epochs: int = None,
         compute_loss_func: Optional[Callable] = None,
+        trainer_cls: Optional[type] = None,
     ) -> Trainer:
         device = torch.device(device)
 
@@ -1535,7 +1599,8 @@ class REaLTabFormer:
             ]
 
         assert self.dataset
-        trainer = ResumableTrainer(
+        trainer_class = trainer_cls or ResumableTrainer
+        trainer = trainer_class(
             target_epochs=target_epochs,
             save_epochs=None,
             model=self.model,
@@ -1548,6 +1613,94 @@ class REaLTabFormer:
             **self.trainer_kwargs,
         )
 
+        return trainer
+
+    def _train_with_cusum(
+        self,
+        df: pd.DataFrame,
+        device,
+        resume_from_checkpoint: Union[bool, str] = False,
+        cusum_check_every: int = 20,
+        cusum_cooldown_steps: int = 40,
+        cusum_warmup_checks: int = 10,
+        cusum_delta: float = 0.5,
+        cusum_target_far: float = 0.01,
+        cusum_seen_pool_size: int = 256,
+        cusum_min_seen_pool: int = 32,
+    ) -> Trainer:
+        """Train with the CUSUM-based, generation-free overfitting
+        detector (see `rtf_cusum.py`) instead of the bootstrap-DCR
+        sensitivity mechanism (`_train_with_sensitivity`). Training
+        stops automatically once the detector fires; `self.epochs`
+        acts as an upper bound on training length, not a committed
+        total -- the actual number of epochs trained is data-driven.
+
+        Args:
+            cusum_check_every: How often (in training steps) to run the
+              detection check. Continuous/seamless, not tied to epoch
+              boundaries -- this is what lets the same mechanism work
+              whether the dataset needs 2 epochs or 200.
+            cusum_cooldown_steps: Minimum number of steps since a row
+              was last trained on before it's eligible for the
+              reference pool. Deliberately a small, fixed step count
+              (not scaled to epoch length), so it's satisfiable within
+              a single epoch even on a very large dataset.
+            cusum_warmup_checks: Number of early post-cooldown checks
+              used to calibrate what "normal," non-memorization-driven
+              improvement looks like.
+            cusum_delta: Target effect size (in standard-error units)
+              the CUSUM is tuned to detect.
+            cusum_target_far: Target false-alarm rate for the CUSUM
+              threshold, calibrated via Monte Carlo simulation against
+              the actual training length.
+            cusum_seen_pool_size: Max number of cooled rows sampled per
+              check.
+            cusum_min_seen_pool: Minimum cooled-pool size required
+              before a check can run at all.
+        """
+        # HF's Trainer defaults to stripping any dataset column not in
+        # the model's forward() signature (`remove_unused_columns=True`)
+        # -- that would silently drop the `idx` column added below
+        # before it ever reaches `compute_loss`, disabling the detector
+        # without any error. Only disabled for this opt-in path.
+        self.training_args_kwargs["remove_unused_columns"] = False
+
+        trainer: CUSUMTrainer = self._fit_tabular(
+            df,
+            device=device,
+            add_row_idx=True,
+            trainer_cls=CUSUMTrainer,
+        )
+
+        monitor = CUSUMOverfittingMonitor(
+            vocab_size=len(self.vocab["id2token"]),
+            check_every=cusum_check_every,
+            cooldown_steps=cusum_cooldown_steps,
+            warmup_checks=cusum_warmup_checks,
+            seen_pool_size=cusum_seen_pool_size,
+            min_seen_pool=cusum_min_seen_pool,
+            delta=cusum_delta,
+            target_quantile=1 - cusum_target_far,
+            random_state=self.random_state,
+        )
+        trainer.cusum_monitor = monitor
+        self.cusum_monitor = monitor
+
+        # The callback reads rows directly from the dataset, bypassing
+        # the collator -- so it needs the collator's implicit
+        # `label_ids` -> `labels` rename applied explicitly here. A
+        # separate renamed reference, not a mutation of `self.dataset`:
+        # the trainer's own copy is untouched and keeps working via the
+        # collator's existing auto-rename.
+        callback_dataset = self.dataset["train_dataset"]
+        if "label_ids" in callback_dataset.column_names:
+            callback_dataset = callback_dataset.rename_column("label_ids", "labels")
+
+        trainer.add_callback(
+            CUSUMEarlyStoppingCallback(monitor, callback_dataset)
+        )
+
+        trainer.train(resume_from_checkpoint=resume_from_checkpoint)
         return trainer
 
     def sample(
