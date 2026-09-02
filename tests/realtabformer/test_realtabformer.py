@@ -3,6 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from scipy import stats
 from transformers import EncoderDecoderConfig
 from transformers.models.gpt2 import GPT2Config
@@ -397,3 +398,45 @@ def test_sensitivity_training_does_not_crash_with_default_gen_kwargs():
     # test here, just that gen_kwargs=None doesn't crash it.
     model.fit(df, device="cpu", n_critic=1, n_critic_stop=1, num_bootstrap=20)
     assert model.model is not None
+
+
+def test_sensitivity_training_saves_reloadable_checkpoint(tmp_path):
+    # Regression test for the same bug class fixed for the cusum path:
+    # _train_with_sensitivity picked the best-discriminator model via
+    # trainer.save_model()/from_pretrained() (raw HF weights only), but
+    # never wrote a REaLTabFormer-loadable checkpoint (rtf_config.json +
+    # rtf_model.pt) anywhere -- load_from_dir on that directory failed.
+    rng = np.random.default_rng(RANDOM_SEED)
+    n = 40
+    df = pd.DataFrame(
+        {
+            "price": rng.normal(100, 20, size=n).round(2),
+            "gender": rng.choice(["m", "f"], size=n),
+        }
+    )
+
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=2,
+        batch_size=8,
+        random_state=RANDOM_SEED,
+        checkpoints_dir=str(tmp_path / "checkpoints"),
+    )
+    model.fit(df, device="cpu", n_critic=1, n_critic_stop=1, num_bootstrap=20)
+
+    ckpt_path = Path(model.checkpoints_dir) / "sensitivity_best"
+    assert (ckpt_path / "rtf_config.json").exists()
+    assert (ckpt_path / "rtf_model.pt").exists()
+
+    reloaded = REaLTabFormer.load_from_dir(ckpt_path)
+    assert reloaded.vocab.keys() == model.vocab.keys()
+    assert reloaded.processed_columns == model.processed_columns
+
+    current_state = model.model.state_dict()
+    reloaded_state = reloaded.model.state_dict()
+    assert reloaded_state.keys() == current_state.keys()
+    for key in current_state:
+        assert torch.equal(reloaded_state[key].cpu(), current_state[key].cpu())
+
+    samples = reloaded.sample(10, device="cpu")
+    assert len(samples) == 10
