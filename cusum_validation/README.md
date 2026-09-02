@@ -44,6 +44,38 @@ The first four are the "small" scale point, `churn2` is "medium",
 `adult` is "large" -- see `DATASET_CONFIGS` in `run_experiment.py` for
 the exact target/type wiring each one uses.
 
+## Running the whole battery at once
+
+`run_all_experiments.py` runs `--mode all` (cusum + full + sensitivity)
+against every non-Adult dataset in one call, instead of invoking
+`run_experiment.py` by hand once per dataset:
+
+```bash
+python run_all_experiments.py --epochs 300 --device cuda
+```
+
+Each dataset runs as its own subprocess (a fresh Python process --
+nothing leaks between runs) in size order (`diabetes`, `insurance`,
+`abalone`, `wilt`, `churn2`), streaming output live to the console and
+saving it to its own file under `results/logs/` (gitignored -- not
+meant to be committed, unlike `results/*_summary.json`). A failure on
+one dataset is logged and the batch moves on rather than aborting, so
+a crash partway through doesn't cost you results already collected.
+`adult` is excluded by default -- it already has extensive committed
+results, is far more expensive, and typically wants a different
+`--epochs` ceiling -- pass it explicitly via `--datasets` if you want
+it in the same batch:
+
+```bash
+# Just the two datasets from the open abalone question:
+python run_all_experiments.py --datasets abalone churn2 --epochs 300 --device cuda
+
+# Everything, including adult, with adult's own longer epoch ceiling
+# handled separately:
+python run_all_experiments.py --epochs 300 --device cuda
+python run_experiment.py --dataset adult --mode all --epochs 1000 --device cuda
+```
+
 ## Modes
 
 - `--mode cusum` (default): trains with
