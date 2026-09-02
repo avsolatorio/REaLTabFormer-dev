@@ -143,23 +143,28 @@ class SyntheticDataBench:
 
         assert train.shape[0] == synthetic.shape[0]
 
+        def _predict(fitted_model, X):
+            # predict_proba on a binary classifier returns an (n, 2)
+            # array (P(class=0), P(class=1)) -- take the positive-class
+            # column so this is a 1-D Series-compatible score, matching
+            # what an AUC-style comparison against `actual` needs.
+            # Falls back to hard-label .predict() for estimators without
+            # predict_proba (e.g. some SVMs).
+            try:
+                proba = fitted_model.predict_proba(X)
+            except AttributeError:
+                return fitted_model.predict(X)
+            if proba.ndim == 2 and proba.shape[1] == 2:
+                return proba[:, 1]
+            return proba
+
         # Train the model on the original training data
         model.fit(train.drop(target_col, axis=1), train[target_col])
-
-        # Make predictions on the test data using the original training data
-        try:
-            original_predictions = model.predict_proba(test.drop(target_col, axis=1))
-        except AttributeError:
-            original_predictions = model.predict(test.drop(target_col, axis=1))
+        original_predictions = _predict(model, test.drop(target_col, axis=1))
 
         # Train the model on the synthetic training data
         model.fit(synthetic.drop(target_col, axis=1), synthetic[target_col])
-
-        # Make predictions on the test data using the synthetic training data
-        try:
-            synthetic_predictions = model.predict_proba(test.drop(target_col, axis=1))
-        except AttributeError:
-            synthetic_predictions = model.predict(test.drop(target_col, axis=1))
+        synthetic_predictions = _predict(model, test.drop(target_col, axis=1))
 
         # Return a dataframe with the actual values and predictions from both training sets
         return pd.DataFrame(

@@ -196,6 +196,54 @@ def measure_dcr(model, bench, train_df, test_df, device, label, summary_path):
     return result
 
 
+def measure_utility(bench, label, summary_path):
+    """TSTR-vs-TRTR utility check -- a different question than
+    measure_dcr's frac_suspicious. DCR alone can't distinguish "the
+    model stopped too early to have learned anything useful yet" from
+    "the model learned the distribution well and just isn't
+    memorizing" -- both look identical on a pure privacy metric. This
+    trains the SAME classifier once on the real training data (TRTR)
+    and once on the synthetic data (TSTR), scores both on the same
+    real held-out test set, and compares ROC-AUC: a small gap means
+    the synthetic data is nearly as useful for downstream modeling as
+    the real thing; a large gap means the generator hasn't actually
+    learned the data's structure yet, regardless of what DCR says.
+
+    Requires bench.synth_train_df to already be populated -- i.e.
+    measure_dcr's register_synthetic_data call must have run (and
+    succeeded) first.
+    """
+    if bench.synth_train_df is None:
+        print(
+            f"[{label}] skipping utility check -- no synthetic data registered",
+            flush=True,
+        )
+        return None
+
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.metrics import roc_auc_score
+
+    clf = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)
+    preds = bench.get_ml_efficiency(clf)
+    trtr_auc = float(roc_auc_score(preds["actual"], preds["original_predictions"]))
+    tstr_auc = float(roc_auc_score(preds["actual"], preds["synthetic_predictions"]))
+    gap = trtr_auc - tstr_auc
+
+    print(
+        f"[{label}] utility: TRTR AUC={trtr_auc:.4f} TSTR AUC={tstr_auc:.4f} "
+        f"gap={gap:+.4f} (closer to 0 = synthetic data is as useful as real)",
+        flush=True,
+    )
+
+    result = dict(trtr_auc=trtr_auc, tstr_auc=tstr_auc, auc_gap=gap)
+    existing = {}
+    if summary_path.exists():
+        existing = json.loads(summary_path.read_text())
+    existing[f"{label}_utility"] = result
+    summary_path.write_text(json.dumps(existing, indent=2))
+    return result
+
+
 def run_cusum(args, run_id, full_df):
     bench = SyntheticDataBench(
         data=full_df,
@@ -287,6 +335,7 @@ def run_cusum(args, run_id, full_df):
         "cusum_stop_at_alarm",
         summary_path,
     )
+    measure_utility(bench, "cusum_stop_at_alarm", summary_path)
     print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
 
 
@@ -343,6 +392,7 @@ def run_full(args, run_id, full_df):
     measure_dcr(
         model, bench, train_df, test_df, args.device, "full_schedule", summary_path
     )
+    measure_utility(bench, "full_schedule", summary_path)
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -436,6 +486,42 @@ def run_sensitivity(args, run_id, full_df):
     measure_dcr(
         model, bench, train_df, test_df, args.device, "sensitivity_stop", summary_path
     )
+    measure_utility(bench, "sensitivity_stop", summary_path)
+    print(f"\nWrote {summary_path}", flush=True)
+
+
+def run_from_checkpoint(args, run_id, full_df):
+    """Re-measure DCR + utility for an ALREADY-TRAINED checkpoint --
+    no retraining, just reload and score. Rebuilds the same
+    SyntheticDataBench split (same RANDOM_SEED, same full_df) any of
+    the run_* functions would have used, so results are directly
+    comparable to a fresh run's. Useful specifically for checking
+    whether a run you already have (e.g. one that stopped very early)
+    actually learned something, without spending more GPU time on a
+    fresh training run just to find out.
+    """
+    bench = SyntheticDataBench(
+        data=full_df,
+        target_col="income",
+        categorical=True,
+        target_pos_val=">50K",
+        test_size=0.2,
+        random_state=RANDOM_SEED,
+    )
+    train_df = bench.train_df.reset_index(drop=True)
+    test_df = bench.test_df
+
+    results_dir = Path(args.output_dir)
+    results_dir.mkdir(parents=True, exist_ok=True)
+    summary_path = results_dir / f"{run_id}_summary.json"
+
+    print(f"\n=== RUN: re-scoring checkpoint at {args.checkpoint_dir} ===", flush=True)
+    model = REaLTabFormer.load_from_dir(args.checkpoint_dir)
+
+    measure_dcr(
+        model, bench, train_df, test_df, args.device, "checkpoint_recheck", summary_path
+    )
+    measure_utility(bench, "checkpoint_recheck", summary_path)
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -443,12 +529,23 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--mode",
-        choices=["cusum", "full", "sensitivity", "both", "all"],
+        choices=["cusum", "full", "sensitivity", "both", "all", "checkpoint"],
         default="cusum",
         help="'both' runs cusum + full (unchanged from before sensitivity "
         "mode was added). 'all' runs cusum + full + sensitivity "
         "sequentially, all into the same run_id's summary.json for a "
-        "direct 3-way comparison.",
+        "direct 3-way comparison. 'checkpoint' skips training entirely "
+        "and re-scores DCR + utility for an already-trained checkpoint "
+        "(pass --checkpoint-dir) -- e.g. to check whether a run that "
+        "stopped very early actually learned something, without "
+        "spending more GPU time retraining just to find out.",
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        default=None,
+        help="Only used with --mode checkpoint: path to an alarm_checkpoint_dir "
+        "from a previous run's summary.json (must contain rtf_config.json "
+        "and rtf_model.pt -- REaLTabFormer.load_from_dir's format).",
     )
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -476,6 +573,9 @@ def main():
     )
     args = parser.parse_args()
 
+    if args.mode == "checkpoint" and not args.checkpoint_dir:
+        parser.error("--mode checkpoint requires --checkpoint-dir")
+
     if args.run_id is None:
         args.run_id = f"{args.mode}_ep{args.epochs}_{int(time.time())}"
 
@@ -492,6 +592,8 @@ def main():
         run_full(args, args.run_id, full_df)
     if args.mode in ("sensitivity", "all"):
         run_sensitivity(args, args.run_id, full_df)
+    if args.mode == "checkpoint":
+        run_from_checkpoint(args, args.run_id, full_df)
 
     print("\nDone. Commit the new files under results/ to share them.", flush=True)
 

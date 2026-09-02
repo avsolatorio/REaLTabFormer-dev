@@ -58,6 +58,11 @@ throughout the rest of this research.
   sensitivity mode was added).
 - `--mode all`: runs cusum + full + sensitivity sequentially, into one
   `run_id`'s `summary.json`, for a direct three-way comparison.
+- `--mode checkpoint` (pass `--checkpoint-dir <path to an
+  alarm_checkpoint_dir>`): skips training entirely and re-scores DCR +
+  utility for an already-trained checkpoint. For re-checking a run you
+  already have -- e.g. one that stopped unusually early -- without
+  spending more GPU time on a fresh training run just to find out.
 
 Other flags: `--batch-size` (default 32), `--cusum-check-every`
 (default 20, in optimizer steps), `--output-dir` (default `results/`),
@@ -80,7 +85,8 @@ killed or timed-out run still leaves something usable:
   measurement runs, so even a DCR-measurement failure still leaves the
   core "did it fire, when" answer on disk. The DCR comparison
   (`frac_suspicious`, `dcr_synth_mean`, etc.) is added once sampling
-  completes.
+  completes, followed by a `<label>_utility` block (`trtr_auc`,
+  `tstr_auc`, `auc_gap`) -- see "Utility check" below.
 - `<run_id>_ckpt_cusum/` and `<run_id>_ckpt_full/`: full HF Trainer
   checkpoints (large -- do not commit these, they're for your own
   local use/debugging; `.gitignore` in this directory already excludes
@@ -139,11 +145,58 @@ std, as defense-in-depth against any residual drift in the window that
 follows. Validated via unit tests and by replaying this real run's
 z-sequence (delta/target_far retuning alone -- without the sigma0 fix
 -- only pulled the alarm forward by ~300 of 7240 steps, confirming
-`sigma0` and not those knobs was the dominant lever). **Not yet
-validated against a real re-run** -- the fix should make CUSUM fire
-meaningfully earlier, but confirming it actually closes (or beats) the
-gap with sensitivity's `frac_suspicious=0.054` needs a fresh `--mode
-cusum` (or `--mode all`) run on real hardware. The trajectory JSONL
-now tags each line's `phase` as `"settle"`, `"warmup"`, or
-`"post_calibration"` specifically so a re-run can show directly how
-much smaller the recalibrated `sigma0` comes out.
+`sigma0` and not those knobs was the dominant lever).
+
+**Confirmed against a real re-run** (`cusum_ep100_1788308715_*`, same
+batch=32 as the original baseline): `sigma0` came out to `0.0385` --
+essentially matching the ~0.029 true noise level independently derived
+above, from a totally different computation. The trajectory's `phase`
+tags show it working as designed: 10 `"settle"` checks (steps 40-220,
+discarded), 10 `"warmup"` checks (steps 240-420, tightly clustered
+`delta` values -- nothing like the old run's wild early spread), then
+`cusum_S` crosses threshold at step **1120** instead of 7240 (an 84%
+cut in detection delay), giving `frac_suspicious=0.053` -- statistically
+indistinguishable from sensitivity's `0.054`, for 241s vs.
+sensitivity's 1662s (~7x cheaper). A `batch_size=128` run on the *old*
+code (`cusum_ep100_1788300530_*`) landed in between (`sigma0=0.322`,
+`frac_suspicious=0.076`) -- consistent with the diagnosis, since larger
+batches happen to average out some of the early-transient volatility
+even without the fix.
+
+## Open question: did the early-stopped run actually learn anything?
+
+The fixed run above stopped at only ~4 effective epochs -- much
+earlier than any prior run. Low `frac_suspicious` this early is
+ambiguous on its own: it could mean "correctly caught the right
+stopping point," or it could just mean "hasn't trained long enough to
+memorize *or* learn anything useful yet" -- DCR/`frac_suspicious`
+can't tell those apart, since an undertrained model trivially looks
+"not memorized." That's what the utility check below is for.
+
+## Utility check (TSTR vs. TRTR)
+
+`measure_utility` (called automatically after `measure_dcr` in every
+mode, including `--mode checkpoint`) answers a different question than
+DCR: not "is the synthetic data suspiciously close to training rows"
+but "did the model learn anything useful." It trains the same
+classifier (`LogisticRegression`, predicting `income`) once on the
+real training split (TRTR) and once on the registered synthetic data
+(TSTR), scores both against the same real held-out test set, and
+reports ROC-AUC for each plus `auc_gap = trtr_auc - tstr_auc`. A gap
+near 0 means the synthetic data is nearly as useful as the real thing
+for downstream modeling; a large gap means the generator hasn't
+learned the data's structure yet, regardless of what `frac_suspicious`
+says.
+
+This fixed a real, previously-unexercised bug in
+`SyntheticDataBench.measure_ml_efficiency` along the way: any binary
+classifier with `predict_proba` (the common case) crashed it outright,
+since `predict_proba`'s `(n, 2)` array can't go into a single
+DataFrame column -- it now takes the positive-class column.
+
+To check a run you already have without retraining:
+```bash
+python run_experiment.py --mode checkpoint \
+    --checkpoint-dir results/cusum_ep100_1788308715_ckpt_cusum/cusum_alarm \
+    --run-id cusum_ep100_1788308715_recheck
+```
