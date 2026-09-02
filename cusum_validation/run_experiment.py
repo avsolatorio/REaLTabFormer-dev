@@ -158,9 +158,15 @@ def attach_trajectory_logger(trajectory_path: Path):
     rtf_cusum.CUSUMOverfittingMonitor.maybe_check = logged_maybe_check
 
 
-def measure_dcr(model, bench, train_df, test_df, device, label, summary_path):
+def measure_dcr(
+    model, bench, train_df, test_df, device, label, summary_path, gen_batch=None
+):
     n_needed = len(train_df) + len(test_df) + 300
-    samples = model.sample(n_samples=n_needed, device=device)
+    samples = model.sample(
+        n_samples=n_needed,
+        device=device,
+        **({"gen_batch": gen_batch} if gen_batch else {}),
+    )
     samples = samples.dropna().reset_index(drop=True)
     print(f"[{label}] generated {len(samples)} valid samples", flush=True)
     result = dict(label=label, n_samples_generated=len(samples))
@@ -334,6 +340,7 @@ def run_cusum(args, run_id, full_df):
         args.device,
         "cusum_stop_at_alarm",
         summary_path,
+        gen_batch=args.gen_batch,
     )
     measure_utility(bench, "cusum_stop_at_alarm", summary_path)
     print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
@@ -390,7 +397,14 @@ def run_full(args, run_id, full_df):
     summary_path.write_text(json.dumps(existing, indent=2))
 
     measure_dcr(
-        model, bench, train_df, test_df, args.device, "full_schedule", summary_path
+        model,
+        bench,
+        train_df,
+        test_df,
+        args.device,
+        "full_schedule",
+        summary_path,
+        gen_batch=args.gen_batch,
     )
     measure_utility(bench, "full_schedule", summary_path)
     print(f"\nWrote {summary_path}", flush=True)
@@ -446,6 +460,7 @@ def run_sensitivity(args, run_id, full_df):
         n_critic=args.sensitivity_n_critic,
         n_critic_stop=args.sensitivity_n_critic_stop,
         num_bootstrap=args.sensitivity_num_bootstrap,
+        gen_kwargs={"gen_batch": args.gen_batch} if args.gen_batch else None,
     )
     elapsed = time.time() - t0
     global_step = trainer.state.global_step
@@ -484,7 +499,14 @@ def run_sensitivity(args, run_id, full_df):
     summary_path.write_text(json.dumps(existing, indent=2))
 
     measure_dcr(
-        model, bench, train_df, test_df, args.device, "sensitivity_stop", summary_path
+        model,
+        bench,
+        train_df,
+        test_df,
+        args.device,
+        "sensitivity_stop",
+        summary_path,
+        gen_batch=args.gen_batch,
     )
     measure_utility(bench, "sensitivity_stop", summary_path)
     print(f"\nWrote {summary_path}", flush=True)
@@ -519,7 +541,14 @@ def run_from_checkpoint(args, run_id, full_df):
     model = REaLTabFormer.load_from_dir(args.checkpoint_dir)
 
     measure_dcr(
-        model, bench, train_df, test_df, args.device, "checkpoint_recheck", summary_path
+        model,
+        bench,
+        train_df,
+        test_df,
+        args.device,
+        "checkpoint_recheck",
+        summary_path,
+        gen_batch=args.gen_batch,
     )
     measure_utility(bench, "checkpoint_recheck", summary_path)
     print(f"\nWrote {summary_path}", flush=True)
@@ -553,6 +582,16 @@ def main():
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Defaults to cuda if available, else cpu.",
+    )
+    parser.add_argument(
+        "--gen-batch",
+        type=int,
+        default=None,
+        help="Batch size for .sample()'s generation loop -- controls wall-clock "
+        "only, not correctness. Applies to every mode's final DCR/utility "
+        "sampling, and (sensitivity mode only) each periodic critic-round "
+        ".generate() call during training too. Defaults to REaLTabFormer's own "
+        "default (128) if unset; raise it if the GPU still has headroom.",
     )
     parser.add_argument("--cusum-check-every", type=int, default=20)
     parser.add_argument(
