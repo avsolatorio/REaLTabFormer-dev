@@ -1,0 +1,15 @@
+{
+  "checkpoint_recheck": {
+    "label": "checkpoint_recheck",
+    "n_samples_generated": 45522,
+    "dcr_synth_mean": 1.1817787605289343,
+    "dcr_synth_min": 0.0007464267959836832,
+    "dcr_test_mean": 1.2003299913189371,
+    "frac_suspicious": 0.05451127819548872
+  },
+  "checkpoint_recheck_utility": {
+    "trtr_auc": 0.9093962761272137,
+    "tstr_auc": 0.9069465098083918,
+    "auc_gap": 0.0024497663188219887
+  }
+}
