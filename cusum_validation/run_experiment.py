@@ -1,28 +1,38 @@
 """
-Long-horizon CUSUM overfitting-detection validation on the full Adult
-(Census Income) dataset -- meant to be run on a GPU, not the CPU-only
+CUSUM overfitting-detection validation, across datasets of very
+different scale -- meant to be run on a GPU, not the CPU-only
 environment this feature was developed and validated on.
 
 Background (continues an earlier research thread validating the CUSUM
 detector added in this branch, not tracked in this repo): on a
-2400-row subsample
-of Adult, the CUSUM detector fired at ~epoch 40 of a 75-epoch schedule,
-and stopping there instead of training the full schedule roughly halved
-the fraction of suspiciously-close synthetic samples (0.445 vs 0.890
-frac_suspicious). On the FULL 45k-row dataset, a 25-epoch run (the most
-that was practical on CPU) never fired -- frac_suspicious stayed at
-~0.059, essentially the natural non-memorized baseline rate. That's
-consistent with theory (a larger, more diverse dataset should be more
-overfitting-resistant for a fixed model size) but leaves open whether
-memorization ever emerges on the full dataset given enough epochs, and
-if so, whether the detector still catches it with a meaningful lead
-time. This script runs a much longer horizon (default 1000 epochs) to
-find out.
+2400-row subsample of Adult, the CUSUM detector fired at ~epoch 40 of
+a 75-epoch schedule, and stopping there instead of training the full
+schedule roughly halved the fraction of suspiciously-close synthetic
+samples (0.445 vs 0.890 frac_suspicious). On the FULL 45k-row Adult
+dataset (the "large" scale point -- see `--dataset`), long-horizon runs
+confirmed the fixed detector (settle-skip + robust sigma0 calibration +
+delta ensemble) matches the existing sensitivity mechanism's privacy
+and utility outcomes at a fraction of the wall-clock cost. A CPU-only
+follow-up investigation across five much smaller datasets ("small":
+diabetes/insurance/abalone/wilt, 768-4839 rows; "medium": churn2,
+10,000 rows) found the same pattern holds on most of them, but not
+uniformly -- abalone specifically showed a real utility gap versus
+sensitivity (CUSUM stopping meaningfully earlier), and neither of the
+two obvious fixes tried (relaxing the cooldown safety-cap, or
+explicitly using the delta ensemble instead of the single-tracker
+default) closed it. This script exists to let that investigation
+continue on real GPU hardware instead of a disk- and CPU-constrained
+local sandbox.
 
 Usage:
-    python run_experiment.py --mode cusum --epochs 1000 --device cuda
-    python run_experiment.py --mode full  --epochs 1000 --device cuda
-    python run_experiment.py --mode both  --epochs 1000 --device cuda
+    python run_experiment.py --dataset adult    --mode cusum --epochs 1000 --device cuda
+    python run_experiment.py --dataset abalone  --mode all   --epochs 300  --device cuda
+    python run_experiment.py --dataset diabetes --mode both  --epochs 300  --device cuda
+
+`--dataset` selects which dataset to run against (see `DATASET_CONFIGS`
+for the full list and each one's target column/type). All datasets
+smaller than Adult are bundled in `data/` and load offline; no
+network access or separate download needed for any of them.
 
 Results are written incrementally to `results/` (see --output-dir) as
 the run progresses, specifically so a killed/timed-out/interrupted run
@@ -106,6 +116,82 @@ def load_adult() -> pd.DataFrame:
     full = full.dropna().reset_index(drop=True)
     full = full.drop(columns=["education", "native-country"])
     return full
+
+
+def _load_arff_data_section(path: Path, columns: list) -> pd.DataFrame:
+    """Minimal ARFF data-section reader -- avoids scipy.io.arff's byte-string
+    handling for nominal attributes, which is more friction than it's worth
+    for these small, simple files."""
+    lines = path.read_text().splitlines()
+    start = (
+        next(i for i, line in enumerate(lines) if line.strip().lower() == "@data") + 1
+    )
+    rows = [line.split(",") for line in lines[start:] if line.strip()]
+    return pd.DataFrame(rows, columns=columns)
+
+
+def load_diabetes() -> pd.DataFrame:
+    # Pima Indians Diabetes -- 768 rows, 8 numeric features, binary target.
+    cols = ["preg", "plas", "pres", "skin", "insu", "mass", "pedi", "age", "class"]
+    df = _load_arff_data_section(DATA_DIR / "diabetes.arff", cols)
+    for c in cols[:-1]:
+        df[c] = pd.to_numeric(df[c])
+    return df
+
+
+def load_insurance() -> pd.DataFrame:
+    # 1,338 rows, mixed types, continuous regression target ("charges").
+    return pd.read_csv(DATA_DIR / "insurance.csv")
+
+
+def load_abalone() -> pd.DataFrame:
+    # 4,177 rows, one categorical feature (Sex), continuous regression
+    # target ("Rings", conventionally treated as continuous -- age proxy).
+    cols = [
+        "Sex",
+        "Length",
+        "Diameter",
+        "Height",
+        "Whole_weight",
+        "Shucked_weight",
+        "Viscera_weight",
+        "Shell_weight",
+        "Rings",
+    ]
+    df = _load_arff_data_section(DATA_DIR / "abalone.arff", cols)
+    for c in cols[1:]:
+        df[c] = pd.to_numeric(df[c])
+    return df
+
+
+def load_wilt() -> pd.DataFrame:
+    # 4,839 rows, 5 numeric features, binary target ("Class", "2" = the
+    # minority "diseased tree" class). Bundled as a CSV (fetched once via
+    # sklearn's fetch_openml) rather than fetched at runtime, matching
+    # every other dataset here being self-contained/offline.
+    df = pd.read_csv(DATA_DIR / "wilt.csv")
+    df["Class"] = df["Class"].astype(str)
+    return df
+
+
+def load_churn2() -> pd.DataFrame:
+    # 10,000 rows -- the "medium" scale point between the ~1-5k-row small
+    # datasets and Adult's 45k. Binary target ("Exited").
+    df = pd.read_csv(DATA_DIR / "churn2.csv")
+    return df.drop(columns=["RowNumber", "CustomerId", "Surname"])
+
+
+# Each entry: (loader, target_col, categorical, target_pos_val). Small
+# datasets are numbered by row count so `--dataset` choices sort roughly
+# small-to-large in --help output.
+DATASET_CONFIGS = {
+    "diabetes": (load_diabetes, "class", True, "tested_positive"),
+    "insurance": (load_insurance, "charges", False, None),
+    "abalone": (load_abalone, "Rings", False, None),
+    "wilt": (load_wilt, "Class", True, "2"),
+    "churn2": (load_churn2, "Exited", True, 1),
+    "adult": (load_adult, "income", True, ">50K"),
+}
 
 
 def attach_trajectory_logger(trajectory_path: Path):
@@ -212,18 +298,21 @@ def measure_dcr(
     return result
 
 
-def measure_utility(bench, label, summary_path):
+def measure_utility(bench, label, summary_path, categorical: bool = True):
     """TSTR-vs-TRTR utility check -- a different question than
     measure_dcr's frac_suspicious. DCR alone can't distinguish "the
     model stopped too early to have learned anything useful yet" from
     "the model learned the distribution well and just isn't
     memorizing" -- both look identical on a pure privacy metric. This
-    trains the SAME classifier once on the real training data (TRTR)
-    and once on the synthetic data (TSTR), scores both on the same
-    real held-out test set, and compares ROC-AUC: a small gap means
-    the synthetic data is nearly as useful for downstream modeling as
-    the real thing; a large gap means the generator hasn't actually
+    trains the SAME model once on the real training data (TRTR) and
+    once on the synthetic data (TSTR), scores both on the same real
+    held-out test set, and compares performance: a small gap means the
+    synthetic data is nearly as useful for downstream modeling as the
+    real thing; a large gap means the generator hasn't actually
     learned the data's structure yet, regardless of what DCR says.
+    Classification targets use ROC-AUC (LogisticRegression);
+    regression targets use R^2 (LinearRegression) -- set `categorical`
+    to match the dataset's own target type.
 
     Requires bench.synth_train_df to already be populated -- i.e.
     measure_dcr's register_synthetic_data call must have run (and
@@ -236,22 +325,33 @@ def measure_utility(bench, label, summary_path):
         )
         return None
 
-    from sklearn.linear_model import LogisticRegression
-    from sklearn.metrics import roc_auc_score
+    if categorical:
+        from sklearn.linear_model import LogisticRegression
+        from sklearn.metrics import roc_auc_score
 
-    clf = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)
-    preds = bench.get_ml_efficiency(clf)
-    trtr_auc = float(roc_auc_score(preds["actual"], preds["original_predictions"]))
-    tstr_auc = float(roc_auc_score(preds["actual"], preds["synthetic_predictions"]))
-    gap = trtr_auc - tstr_auc
+        model = LogisticRegression(max_iter=1000, random_state=RANDOM_SEED)
+        score_fn = roc_auc_score
+        metric = "auc"
+    else:
+        from sklearn.linear_model import LinearRegression
+        from sklearn.metrics import r2_score
+
+        model = LinearRegression()
+        score_fn = r2_score
+        metric = "r2"
+
+    preds = bench.get_ml_efficiency(model)
+    trtr = float(score_fn(preds["actual"], preds["original_predictions"]))
+    tstr = float(score_fn(preds["actual"], preds["synthetic_predictions"]))
+    gap = trtr - tstr
 
     print(
-        f"[{label}] utility: TRTR AUC={trtr_auc:.4f} TSTR AUC={tstr_auc:.4f} "
+        f"[{label}] utility ({metric}): TRTR={trtr:.4f} TSTR={tstr:.4f} "
         f"gap={gap:+.4f} (closer to 0 = synthetic data is as useful as real)",
         flush=True,
     )
 
-    result = dict(trtr_auc=trtr_auc, tstr_auc=tstr_auc, auc_gap=gap)
+    result = dict(metric=metric, trtr=trtr, tstr=tstr, gap=gap)
     existing = {}
     if summary_path.exists():
         existing = json.loads(summary_path.read_text())
@@ -260,12 +360,12 @@ def measure_utility(bench, label, summary_path):
     return result
 
 
-def run_cusum(args, run_id, full_df):
+def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
     bench = SyntheticDataBench(
         data=full_df,
-        target_col="income",
-        categorical=True,
-        target_pos_val=">50K",
+        target_col=target_col,
+        categorical=categorical,
+        target_pos_val=target_pos_val,
         test_size=0.2,
         random_state=RANDOM_SEED,
     )
@@ -356,16 +456,16 @@ def run_cusum(args, run_id, full_df):
         summary_path,
         gen_batch=args.gen_batch,
     )
-    measure_utility(bench, "cusum_stop_at_alarm", summary_path)
+    measure_utility(bench, "cusum_stop_at_alarm", summary_path, categorical=categorical)
     print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
 
 
-def run_full(args, run_id, full_df):
+def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
     bench = SyntheticDataBench(
         data=full_df,
-        target_col="income",
-        categorical=True,
-        target_pos_val=">50K",
+        target_col=target_col,
+        categorical=categorical,
+        target_pos_val=target_pos_val,
         test_size=0.2,
         random_state=RANDOM_SEED,
     )
@@ -420,11 +520,11 @@ def run_full(args, run_id, full_df):
         summary_path,
         gen_batch=args.gen_batch,
     )
-    measure_utility(bench, "full_schedule", summary_path)
+    measure_utility(bench, "full_schedule", summary_path, categorical=categorical)
     print(f"\nWrote {summary_path}", flush=True)
 
 
-def run_sensitivity(args, run_id, full_df):
+def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_val):
     """The EXISTING bootstrap-DCR overfitting_detection_method="sensitivity"
     (the default, pre-CUSUM mechanism) -- the actually meaningful
     baseline for this whole research thread, since CUSUM's point was to
@@ -438,9 +538,9 @@ def run_sensitivity(args, run_id, full_df):
     """
     bench = SyntheticDataBench(
         data=full_df,
-        target_col="income",
-        categorical=True,
-        target_pos_val=">50K",
+        target_col=target_col,
+        categorical=categorical,
+        target_pos_val=target_pos_val,
         test_size=0.2,
         random_state=RANDOM_SEED,
     )
@@ -470,7 +570,7 @@ def run_sensitivity(args, run_id, full_df):
     trainer = model.fit(
         train_df,
         device=args.device,
-        target_col="income",
+        target_col=target_col,
         n_critic=args.sensitivity_n_critic,
         n_critic_stop=args.sensitivity_n_critic_stop,
         num_bootstrap=args.sensitivity_num_bootstrap,
@@ -522,11 +622,11 @@ def run_sensitivity(args, run_id, full_df):
         summary_path,
         gen_batch=args.gen_batch,
     )
-    measure_utility(bench, "sensitivity_stop", summary_path)
+    measure_utility(bench, "sensitivity_stop", summary_path, categorical=categorical)
     print(f"\nWrote {summary_path}", flush=True)
 
 
-def run_from_checkpoint(args, run_id, full_df):
+def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_pos_val):
     """Re-measure DCR + utility for an ALREADY-TRAINED checkpoint --
     no retraining, just reload and score. Rebuilds the same
     SyntheticDataBench split (same RANDOM_SEED, same full_df) any of
@@ -538,9 +638,9 @@ def run_from_checkpoint(args, run_id, full_df):
     """
     bench = SyntheticDataBench(
         data=full_df,
-        target_col="income",
-        categorical=True,
-        target_pos_val=">50K",
+        target_col=target_col,
+        categorical=categorical,
+        target_pos_val=target_pos_val,
         test_size=0.2,
         random_state=RANDOM_SEED,
     )
@@ -564,12 +664,22 @@ def run_from_checkpoint(args, run_id, full_df):
         summary_path,
         gen_batch=args.gen_batch,
     )
-    measure_utility(bench, "checkpoint_recheck", summary_path)
+    measure_utility(bench, "checkpoint_recheck", summary_path, categorical=categorical)
     print(f"\nWrote {summary_path}", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset",
+        choices=list(DATASET_CONFIGS.keys()),
+        default="adult",
+        help="Which dataset to run against. Small: diabetes (768 rows, "
+        "classification), insurance (1338, regression), abalone (4177, "
+        "regression), wilt (4839, classification). Medium: churn2 (10000, "
+        "classification). Large: adult (45k, classification, the original "
+        "validation target and default).",
+    )
     parser.add_argument(
         "--mode",
         choices=["cusum", "full", "sensitivity", "both", "all", "checkpoint"],
@@ -643,23 +753,28 @@ def main():
         parser.error("--mode checkpoint requires --checkpoint-dir")
 
     if args.run_id is None:
-        args.run_id = f"{args.mode}_ep{args.epochs}_{int(time.time())}"
+        args.run_id = f"{args.dataset}_{args.mode}_ep{args.epochs}_{int(time.time())}"
 
-    print(f"Loading Adult data from {DATA_DIR} ...", flush=True)
-    full_df = load_adult()
+    loader, target_col, categorical, target_pos_val = DATASET_CONFIGS[args.dataset]
+    print(f"Loading {args.dataset} data from {DATA_DIR} ...", flush=True)
+    full_df = loader()
     print(f"full cleaned dataset: {len(full_df)} rows", flush=True)
 
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
     if args.mode in ("cusum", "both", "all"):
-        run_cusum(args, args.run_id, full_df)
+        run_cusum(args, args.run_id, full_df, target_col, categorical, target_pos_val)
     if args.mode in ("full", "both", "all"):
-        run_full(args, args.run_id, full_df)
+        run_full(args, args.run_id, full_df, target_col, categorical, target_pos_val)
     if args.mode in ("sensitivity", "all"):
-        run_sensitivity(args, args.run_id, full_df)
+        run_sensitivity(
+            args, args.run_id, full_df, target_col, categorical, target_pos_val
+        )
     if args.mode == "checkpoint":
-        run_from_checkpoint(args, args.run_id, full_df)
+        run_from_checkpoint(
+            args, args.run_id, full_df, target_col, categorical, target_pos_val
+        )
 
     print("\nDone. Commit the new files under results/ to share them.", flush=True)
 

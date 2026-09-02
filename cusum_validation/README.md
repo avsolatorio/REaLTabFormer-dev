@@ -1,4 +1,4 @@
-# CUSUM overfitting detection: long-horizon validation on full Adult
+# CUSUM overfitting detection: validation across dataset scales
 
 Continues an earlier research thread (not tracked in this repo -- a
 working research log kept locally during development) validating the
@@ -6,12 +6,13 @@ CUSUM overfitting detector added in this branch. On a 2,400-row
 subsample of the Adult dataset, the CUSUM detector fired
 at ~epoch 40 of 75, and stopping there instead of running the full
 schedule roughly halved the fraction of suspiciously-close synthetic
-samples. On the full 45k-row dataset, a 25-epoch run (the most
-practical on CPU) never fired, and the model already sat at the
-natural non-memorized baseline rate. This experiment runs a much
-longer horizon (default 1,000 epochs) on a GPU to see whether
-memorization ever emerges on the full dataset, and whether the
-detector still catches it with a useful lead time if it does.
+samples. On the full 45k-row dataset, long-horizon GPU runs confirmed
+the fixed detector matches the existing sensitivity mechanism's
+privacy and utility outcomes at a fraction of the wall-clock cost (see
+"Results so far" below). A CPU-only follow-up then tested five much
+smaller datasets to see whether that holds at other scales -- see
+"Multi-dataset validation" below for what that found (mostly yes, with
+one real exception worth digging into further on real hardware).
 
 ## Setup
 
@@ -20,13 +21,28 @@ From the repo root, in an environment with the package installed
 
 ```bash
 cd cusum_validation
-python run_experiment.py --mode cusum --epochs 1000 --device cuda
+python run_experiment.py --dataset adult --mode cusum --epochs 1000 --device cuda
 ```
 
-The Adult dataset (`adult.data`, `adult.test`, standard UCI Census
-Income files) is checked into `data/` alongside this script -- no
-download needed, and this guarantees the exact same data used
-throughout the rest of this research.
+`--dataset` selects which dataset to run against (`--help` lists all
+of them). Every dataset's raw data is checked into `data/` alongside
+this script -- no download needed, and this guarantees the exact same
+data used throughout this research.
+
+## Datasets
+
+| `--dataset` | rows | target | type |
+|---|---|---|---|
+| `diabetes` | 768 | `class` | classification |
+| `insurance` | 1,338 | `charges` | regression |
+| `abalone` | 4,177 | `Rings` | regression |
+| `wilt` | 4,839 | `Class` | classification |
+| `churn2` | 10,000 | `Exited` | classification |
+| `adult` (default) | 45,222 | `income` | classification |
+
+The first four are the "small" scale point, `churn2` is "medium",
+`adult` is "large" -- see `DATASET_CONFIGS` in `run_experiment.py` for
+the exact target/type wiring each one uses.
 
 ## Modes
 
@@ -183,20 +199,61 @@ memorize *or* learn anything useful yet" -- DCR/`frac_suspicious`
 can't tell those apart, since an undertrained model trivially looks
 "not memorized." That's what the utility check below is for.
 
+## Multi-dataset validation: small, medium, and the abalone exception
+
+A CPU-only follow-up ran `--mode cusum` (default single delta=0.5 at
+the time -- ensemble support came slightly later) then `--mode
+sensitivity` on all four small datasets plus `churn2` (medium), to
+check whether the Adult-scale result (CUSUM matching sensitivity on
+both privacy and utility, ~5x cheaper) holds at very different scales.
+Results (not committed -- these were local, disk-constrained runs, not
+meant as the final word):
+
+- `diabetes`, `insurance`, `wilt`: clean, matches the Adult pattern --
+  utility gap between real- and synthetic-trained models stayed small
+  (-0.014 to +0.041), tracking close to what sensitivity achieved.
+- `abalone`: the exception. CUSUM stopped at ~10.6 effective epochs
+  (via `delta=0.5`) with a real utility cost (R² gap 0.190) that
+  sensitivity, training ~4x longer, closed to 0.024 -- i.e. abalone's
+  gap was substantially a stopping-time artifact, not (only) the
+  `Rings` target being inherently hard to fit.
+- Two fixes were tried on abalone and **neither helped**: relaxing the
+  cooldown safety-cap (`steps_per_epoch - 1` instead of `steps_per_epoch
+  // 2`) fired *earlier*, not later (gap got marginally worse, 0.199);
+  explicitly using the delta ensemble instead of the accidental
+  single-tracker default changed which tracker fired (`delta=1.0`
+  instead of `0.5`, the first time anything but `0.5` won across every
+  test run so far) but only marginally closed the gap (0.184).
+- `churn2` (medium) was queued for the same cusum-vs-sensitivity
+  comparison but not completed locally before this script was built to
+  let the investigation continue on real GPU hardware instead.
+
+Since neither obvious fix panned out, this is a genuinely open
+question -- worth a real run here (`--dataset abalone --mode all`) to
+get a clean, fast comparison, and ideally a `churn2` run to see whether
+the abalone gap is really about small *datasets* generally or something
+more specific to `abalone`/its target.
+
 ## Utility check (TSTR vs. TRTR)
 
 `measure_utility` (called automatically after `measure_dcr` in every
 mode, including `--mode checkpoint`) answers a different question than
 DCR: not "is the synthetic data suspiciously close to training rows"
-but "did the model learn anything useful." It trains the same
-classifier (`LogisticRegression`, predicting `income`) once on the
-real training split (TRTR) and once on the registered synthetic data
-(TSTR), scores both against the same real held-out test set, and
-reports ROC-AUC for each plus `auc_gap = trtr_auc - tstr_auc`. A gap
-near 0 means the synthetic data is nearly as useful as the real thing
-for downstream modeling; a large gap means the generator hasn't
+but "did the model learn anything useful." It trains the same model
+once on the real training split (TRTR) and once on the registered
+synthetic data (TSTR), scores both against the same real held-out test
+set, and reports the gap. Classification targets (`categorical=True`
+in `DATASET_CONFIGS`) use `LogisticRegression` + ROC-AUC; regression
+targets use `LinearRegression` + R². Written to the summary as
+`{"metric": "auc"|"r2", "trtr": ..., "tstr": ..., "gap": trtr - tstr}`.
+A gap near 0 means the synthetic data is nearly as useful as the real
+thing for downstream modeling; a large gap means the generator hasn't
 learned the data's structure yet, regardless of what `frac_suspicious`
 says.
+
+(Earlier committed results, from before regression-target support was
+added, use the older `trtr_auc`/`tstr_auc`/`auc_gap` field names --
+same meaning, classification-only naming.)
 
 This fixed a real, previously-unexercised bug in
 `SyntheticDataBench.measure_ml_efficiency` along the way: any binary
