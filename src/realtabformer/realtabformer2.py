@@ -1204,6 +1204,17 @@ class REaLTabFormer2:
             (loaded_model_path / "trainer_state.json").read_text()
         )
 
+        # `trainer.save_model(...)` above only wrote raw HF weights, not
+        # a usable REaLTabFormer checkpoint -- load_from_dir needs the
+        # rtf_config.json/rtf_model.pt pair too (same gap fixed for the
+        # v1 sensitivity/cusum paths).
+        self.save(
+            path=self.checkpoints_dir,
+            experiment_id="sensitivity_best",
+            allow_overwrite=True,
+            verbose=False,
+        )
+
         return trainer
 
     def _train_with_objective(

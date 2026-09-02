@@ -4,9 +4,12 @@ realtabformer2.py has no prior test coverage in this repo -- these are new
 tests, not a regression net for existing behavior. See
 /Users/avsolatorio/.claude/plans/snappy-swimming-hickey.md for the design.
 """
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import pytest
+import torch
 from scipy import stats
 
 from realtabformer.realtabformer2 import REaLTabFormer2
@@ -505,6 +508,44 @@ def test_sensitivity_training_does_not_crash_with_default_gen_kwargs():
     )
     model.fit(df, device="cpu", n_critic=1, n_critic_stop=1, num_bootstrap=20)
     assert model.model is not None
+
+
+def test_sensitivity_training_saves_reloadable_checkpoint(tmp_path):
+    # v2 counterpart of the same regression test in test_realtabformer.py:
+    # _train_with_sensitivity picked the best-discriminator model via
+    # trainer.save_model()/from_pretrained() (raw HF weights only) and
+    # never wrote a REaLTabFormer-loadable checkpoint (rtf_config.json +
+    # rtf_model.pt) anywhere -- load_from_dir on that directory always
+    # failed. Independently present in realtabformer2.py's own copy of
+    # _train_with_sensitivity (confirmed by reading it directly, not
+    # assumed from the v1 fix).
+    df = _tiny_df(n_rows=40)
+    model = REaLTabFormer2(
+        model_type="tabular",
+        epochs=2,
+        batch_size=8,
+        tabular_backbone="distilgpt2",
+        random_state=1029,
+        checkpoints_dir=str(tmp_path / "checkpoints"),
+    )
+    model.fit(df, device="cpu", n_critic=1, n_critic_stop=1, num_bootstrap=20)
+
+    ckpt_path = Path(model.checkpoints_dir) / "sensitivity_best"
+    assert (ckpt_path / "rtf_config.json").exists()
+    assert (ckpt_path / "rtf_model.pt").exists()
+
+    reloaded = REaLTabFormer2.load_from_dir(ckpt_path)
+    assert reloaded.vocab.keys() == model.vocab.keys()
+    assert reloaded.processed_columns == model.processed_columns
+
+    current_state = model.model.state_dict()
+    reloaded_state = reloaded.model.state_dict()
+    assert reloaded_state.keys() == current_state.keys()
+    for key in current_state:
+        assert torch.equal(reloaded_state[key].cpu(), current_state[key].cpu())
+
+    samples = reloaded.sample(10, device="cpu")
+    assert len(samples) == 10
 
 
 def test_any_order_composes_with_digit_entropy_weighting():
