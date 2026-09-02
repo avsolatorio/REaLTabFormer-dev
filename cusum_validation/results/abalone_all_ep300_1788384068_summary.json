@@ -1,0 +1,90 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 620,
+    "alarm_delta": 1.0,
+    "global_step": 620,
+    "steps_per_epoch": 26,
+    "effective_epochs": 23.846153846153847,
+    "elapsed_s": 131.6249771118164,
+    "mu0": 1.2811881629982964,
+    "sigma0": 0.053126140334078115,
+    "cusum_h": 8.842940651369034,
+    "cusum_h_by_delta": {
+      "0.25": 8.842940651369034,
+      "0.5": 9.826371584485825,
+      "1.0": 10.683748595537399
+    },
+    "cooldown_steps_final": 13,
+    "alarm_checkpoint_dir": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/cusum_validation/results/abalone_all_ep300_1788384068_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 4477,
+    "dcr_synth_mean": 0.7787836410712082,
+    "dcr_synth_min": 0.044214403870123986,
+    "dcr_test_mean": 0.8281265351055374,
+    "frac_suspicious": 0.07904191616766468
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "r2",
+    "trtr": 0.5333320730259068,
+    "tstr": 0.5111953142698391,
+    "gap": 0.022136758756067687
+  },
+  "full_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "global_step": 4200,
+    "elapsed_s": 814.2100203037262
+  },
+  "full_schedule": {
+    "label": "full_schedule",
+    "n_samples_generated": 4477,
+    "dcr_synth_mean": 0.038173890376736345,
+    "dcr_synth_min": 0.0,
+    "dcr_test_mean": 0.8281265351055374,
+    "frac_suspicious": 0.9580838323353293
+  },
+  "full_schedule_utility": {
+    "metric": "r2",
+    "trtr": 0.5333320730259068,
+    "tstr": 0.532410340708243,
+    "gap": 0.0009217323176637926
+  },
+  "sensitivity_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "n_critic": 5,
+    "n_critic_stop": 2,
+    "num_bootstrap": 500,
+    "elapsed_s": 241.30165600776672,
+    "global_step": 840,
+    "steps_per_epoch": 26,
+    "stopped_epoch": 32.30769230769231
+  },
+  "sensitivity_stop": {
+    "label": "sensitivity_stop",
+    "n_samples_generated": 4477,
+    "dcr_synth_mean": 0.6967846197006443,
+    "dcr_synth_min": 0.021094810173245993,
+    "dcr_test_mean": 0.8281265351055374,
+    "frac_suspicious": 0.09700598802395209
+  },
+  "sensitivity_stop_utility": {
+    "metric": "r2",
+    "trtr": 0.5333320730259068,
+    "tstr": 0.517563941873783,
+    "gap": 0.015768131152123832
+  }
+}
