@@ -13,7 +13,7 @@ import time
 import warnings
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union
 
 import numpy as np
 import pandas as pd
@@ -501,7 +501,7 @@ class REaLTabFormer:
         cusum_cooldown_steps: int = 40,
         cusum_warmup_checks: int = 10,
         cusum_warmup_settle_checks: Optional[int] = None,
-        cusum_delta: float = 0.5,
+        cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
@@ -576,7 +576,11 @@ class REaLTabFormer:
               reference pool first becomes eligible (dominated by rows whose baseline
               was captured at/near model init). Defaults to `cusum_warmup_checks` itself.
             cusum_delta: Only used when `overfitting_detection_method="cusum"`. Target
-              effect size (in standard-error units) the detector is tuned to catch.
+              effect size (in standard-error units) the detector is tuned to catch. Pass
+              a sequence (e.g. `[0.25, 0.5, 1.0]`) to run an ensemble of trackers in
+              parallel instead of one -- no single delta is well-matched to both a
+              slow, gradual drift and a sharp, sudden one; the alarm fires the moment
+              any tracker crosses its own (Bonferroni-corrected) threshold.
             cusum_target_far: Only used when `overfitting_detection_method="cusum"`. Target
               false-alarm rate for the detector's decision threshold.
 
@@ -1676,7 +1680,7 @@ class REaLTabFormer:
         cusum_cooldown_steps: int = 40,
         cusum_warmup_checks: int = 10,
         cusum_warmup_settle_checks: Optional[int] = None,
-        cusum_delta: float = 0.5,
+        cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
         cusum_seen_pool_size: int = 256,
         cusum_min_seen_pool: int = 32,
@@ -1708,7 +1712,10 @@ class REaLTabFormer:
               window to calibrate "normal" noise from. Defaults to
               `cusum_warmup_checks` itself.
             cusum_delta: Target effect size (in standard-error units)
-              the CUSUM is tuned to detect.
+              the CUSUM is tuned to detect. A sequence runs an ensemble
+              of trackers in parallel (alarm fires on the first one to
+              cross its own Bonferroni-corrected threshold) instead of
+              a single one.
             cusum_target_far: Target false-alarm rate for the CUSUM
               threshold, calibrated via Monte Carlo simulation against
               the actual training length.

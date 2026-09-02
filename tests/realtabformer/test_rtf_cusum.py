@@ -151,6 +151,146 @@ def test_monitor_rejects_bad_config():
         _make_monitor(warmup_checks=1)
     with pytest.raises(ValueError):
         _make_monitor(warmup_settle_checks=-1)
+    with pytest.raises(ValueError):
+        _make_monitor(delta=[])
+    with pytest.raises(ValueError):
+        _make_monitor(delta=[0.5, -0.1])
+    with pytest.raises(ValueError):
+        _make_monitor(delta=[0.5, 0.5])  # duplicates not allowed
+
+
+# ---------------------------------------------------------------------
+# delta ensemble
+# ---------------------------------------------------------------------
+def test_monitor_single_delta_is_backward_compatible():
+    # A plain float (the original API) must produce EXACTLY the same
+    # cusum_h as before the ensemble feature existed -- Bonferroni
+    # correction with a single tracker is a no-op (far / 1 == far).
+    horizon = 50
+    mon = _make_monitor(delta=0.5, total_checks_horizon=horizon)
+    expected_h = calibrate_gaussian_cusum_threshold(
+        delta=0.5, n_checks_horizon=horizon, target_quantile=0.99, seed=RANDOM_SEED
+    )
+    assert mon.deltas == [0.5]
+    assert mon.delta == 0.5
+    assert mon.cusum_h == pytest.approx(expected_h)
+    assert mon.cusum_S == 0.0
+
+
+def test_monitor_ensemble_thresholds_are_bonferroni_corrected():
+    horizon = 50
+    deltas = [0.25, 0.5, 1.0]
+    mon = _make_monitor(delta=deltas, total_checks_horizon=horizon)
+
+    assert mon.deltas == deltas
+    assert set(mon.cusum_h_by_delta.keys()) == set(deltas)
+
+    # far=0.01 split three ways -> each tracker individually calibrated
+    # at target_quantile = 1 - 0.01/3, not the naive 0.99.
+    adjusted_quantile = 1.0 - (0.01 / 3)
+    for d in deltas:
+        expected_h = calibrate_gaussian_cusum_threshold(
+            delta=d, n_checks_horizon=horizon, target_quantile=adjusted_quantile, seed=RANDOM_SEED
+        )
+        assert mon.cusum_h_by_delta[d] == pytest.approx(expected_h)
+
+    # A stricter per-tracker quantile means a HIGHER threshold than the
+    # single-tracker (non-Bonferroni-corrected) calibration would give.
+    single_h = calibrate_gaussian_cusum_threshold(
+        delta=deltas[0], n_checks_horizon=horizon, target_quantile=0.99, seed=RANDOM_SEED
+    )
+    assert mon.cusum_h_by_delta[deltas[0]] > single_h
+
+    # Backward-compat aliases point at the first (primary) tracker.
+    assert mon.delta == deltas[0]
+    assert mon.cusum_h == mon.cusum_h_by_delta[deltas[0]]
+    assert mon.cusum_S == mon.cusum_S_by_delta[deltas[0]]
+
+
+def test_monitor_ensemble_fires_on_first_tracker_to_cross():
+    # A small delta accumulates evidence readily from a small, steady
+    # shift -- confirm the ensemble fires via that tracker (not
+    # necessarily the "primary"/first-listed one) and records which.
+    torch.manual_seed(RANDOM_SEED)
+    V = 30
+    mon = _make_monitor(
+        delta=[0.15, 0.5, 1.5],
+        cooldown_steps=1,
+        min_seen_pool=8,
+        warmup_checks=3,
+        check_every=1,
+        total_checks_horizon=200,
+    )
+
+    class ConstShiftLM(torch.nn.Module):
+        def __init__(self, vocab_size, bias_scale=0.0):
+            super().__init__()
+            self.vocab_size = vocab_size
+            self.bias_scale = bias_scale
+            self.training = True
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = mode
+            return self
+
+        def forward(self, input_ids, labels):
+            B, T = labels.shape
+            logits = torch.randn(B, T, self.vocab_size) * 0.1
+            for b in range(B):
+                for t in range(T):
+                    tok = int(labels[b, t].item())
+                    if tok >= 0:
+                        logits[b, t, tok] += self.bias_scale
+
+            class Out:
+                pass
+
+            out = Out()
+            out.logits = logits
+            return out
+
+        def parameters(self):
+            return iter([torch.nn.Parameter(torch.zeros(1))])
+
+    model = ConstShiftLM(V, bias_scale=0.0)
+    row_ids = list(range(20))
+    T = 3
+    row_labels = torch.randint(1, V, (len(row_ids), T + 1))
+    row_labels[:, 0] = -1
+    labels_by_id = {idx: row_labels[i : i + 1] for i, idx in enumerate(row_ids)}
+
+    def get_rows(indices):
+        return None, torch.cat([labels_by_id[i] for i in indices], dim=0)
+
+    logits = model(None, row_labels).logits
+    mon.record_batch(row_ids, logits, row_labels, step=1)
+
+    step = 2
+    for _ in range(5):
+        assert mon.maybe_check(step, model, get_rows) is False
+        step += 1
+    assert mon.mu0 is not None
+
+    # A small, persistent shift -- exactly what a small delta should
+    # catch faster than a large one.
+    model.bias_scale = 1.5
+    fired_at = None
+    for _ in range(100):
+        if mon.maybe_check(step, model, get_rows):
+            fired_at = step
+            break
+        step += 1
+
+    assert fired_at is not None, "expected the ensemble to fire on a persistent shift"
+    assert mon.alarm_step == fired_at
+    assert mon.alarm_delta in mon.deltas
+    # The firing tracker's own accumulator must have actually crossed
+    # its own (Bonferroni-corrected) threshold.
+    assert mon.cusum_S_by_delta[mon.alarm_delta] >= mon.cusum_h_by_delta[mon.alarm_delta]
 
 
 def test_monitor_warmup_settle_checks_defaults_to_warmup_checks():

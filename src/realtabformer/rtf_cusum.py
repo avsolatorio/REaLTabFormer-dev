@@ -63,7 +63,17 @@ feature was built from):
   improvement. Lorden's theorem (1971) is the reason this is a
   principled choice, not just a heuristic: CUSUM minimizes the
   worst-case expected detection delay among all stopping rules for a
-  given false-alarm-rate constraint.
+  given false-alarm-rate constraint. ``delta`` (the effect size CUSUM
+  is tuned to detect) may be a single float (one tracker, the original
+  behavior) or a sequence of floats (an ensemble: several trackers run
+  in parallel on the same per-check z, alarm fires the moment any one
+  crosses its own threshold) -- no single delta is well-matched to
+  both a slow, gradual drift and a sharp, sudden one, and there's no
+  way to know in advance which shape a given run's signal will take.
+  Each tracker's threshold is Bonferroni-corrected (calibrated at a
+  stricter quantile, the false-alarm budget split across trackers) so
+  the ensemble's combined false-alarm rate stays at or below the
+  single-tracker target (see ``_calibrate_thresholds``).
 
 Known limitation, stated plainly: like any reactive/sequential
 detector, this needs at least a little data past the true change point
@@ -79,7 +89,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -205,7 +215,7 @@ class CUSUMOverfittingMonitor:
         warmup_settle_checks: Optional[int] = None,
         seen_pool_size: int = 256,
         min_seen_pool: int = 32,
-        delta: float = 0.5,
+        delta: Union[float, Sequence[float]] = 0.5,
         target_quantile: float = 0.99,
         total_checks_horizon: Optional[int] = None,
         random_state: Optional[int] = None,
@@ -218,6 +228,30 @@ class CUSUMOverfittingMonitor:
             raise ValueError("warmup_checks must be at least 2 to estimate a variance.")
         if warmup_settle_checks is not None and warmup_settle_checks < 0:
             raise ValueError("warmup_settle_checks must be non-negative.")
+
+        # `delta` may be a single float (the original, still-default
+        # behavior -- exactly one tracker) or a sequence of floats (an
+        # ensemble: several CUSUM accumulators run in parallel, one per
+        # assumed effect size, fed the SAME z-score each check -- see
+        # the module docstring's "Stopping rule" bullet for why: no
+        # single delta is well-matched to both a slow, gradual drift
+        # and a sharp, sudden one, and there's no way to know in
+        # advance which shape a given run's memorization signal will
+        # take). Alarm fires the moment ANY tracker crosses ITS OWN
+        # threshold.
+        self.deltas: List[float] = (
+            [float(delta)]
+            if isinstance(delta, (int, float))
+            else [float(d) for d in delta]
+        )
+        if not self.deltas:
+            raise ValueError(
+                "delta must be a positive float or a non-empty sequence of them."
+            )
+        if any(d <= 0 for d in self.deltas):
+            raise ValueError("All delta values must be positive.")
+        if len(set(self.deltas)) != len(self.deltas):
+            raise ValueError("delta values in an ensemble must be distinct.")
 
         self.floor_log_prob = float(math.log(1.0 / vocab_size))
         self.check_every = check_every
@@ -235,7 +269,6 @@ class CUSUMOverfittingMonitor:
         self._settle_checks_remaining = self.warmup_settle_checks
         self.seen_pool_size = seen_pool_size
         self.min_seen_pool = min_seen_pool
-        self.delta = delta
         self.target_quantile = target_quantile
         self.random_state = random_state
         self._rng = np.random.default_rng(random_state)
@@ -246,12 +279,7 @@ class CUSUMOverfittingMonitor:
         # training length isn't fixed ahead of time), a generous default
         # horizon is used and can be widened later via `extend_horizon`.
         self._horizon = total_checks_horizon or 1000
-        self.cusum_h = calibrate_gaussian_cusum_threshold(
-            delta=self.delta,
-            n_checks_horizon=self._horizon,
-            target_quantile=self.target_quantile,
-            seed=self.random_state,
-        )
+        self.cusum_h_by_delta: Dict[float, float] = self._calibrate_thresholds()
 
         self.baseline_score: Dict[int, float] = {}
         self.last_seen_step: Dict[int, int] = {}
@@ -261,22 +289,62 @@ class CUSUMOverfittingMonitor:
         self.sigma0: Optional[float] = None
         self._warmup_deltas: List[float] = []
 
-        self.cusum_S: float = 0.0
+        self.cusum_S_by_delta: Dict[float, float] = {d: 0.0 for d in self.deltas}
         self.alarm_step: Optional[int] = None
+        self.alarm_delta: Optional[float] = None
         self.alarm_checkpoint_dir: Optional[str] = None
-        self.history: List[Tuple[int, float, float, float]] = []  # (step, Delta, Z, S)
+        # (step, Delta, Z, S_by_delta) -- S_by_delta is a dict even in
+        # the single-tracker (default) case, for one uniform shape.
+        self.history: List[Tuple[int, float, float, Dict[float, float]]] = []
+
+    @property
+    def delta(self) -> float:
+        """Backward-compat alias for the primary (first) tracked delta."""
+        return self.deltas[0]
+
+    @property
+    def cusum_S(self) -> float:
+        """Backward-compat alias for the primary tracker's accumulator."""
+        return self.cusum_S_by_delta[self.deltas[0]]
+
+    @property
+    def cusum_h(self) -> float:
+        """Backward-compat alias for the primary tracker's threshold."""
+        return self.cusum_h_by_delta[self.deltas[0]]
+
+    def _calibrate_thresholds(self) -> Dict[float, float]:
+        """Monte-Carlo-calibrates a threshold for every tracked delta.
+
+        With more than one delta (an ensemble), calibrating each
+        independently at ``target_quantile`` and firing on "any tracker
+        crosses" would inflate the true combined false-alarm rate above
+        the target -- multiple looks at the same data. Bonferroni-
+        corrects for this: each tracker is calibrated at a stricter
+        quantile (the false-alarm budget split across trackers), so the
+        ensemble's overall false-alarm rate stays at or below the
+        nominal target (real trackers are positively correlated --
+        sharing the same z each check -- so this errs conservatively,
+        firing falsely less often than the budget, never more).
+        """
+        n = len(self.deltas)
+        far = 1.0 - self.target_quantile
+        adjusted_quantile = 1.0 - (far / n)
+        return {
+            d: calibrate_gaussian_cusum_threshold(
+                delta=d,
+                n_checks_horizon=self._horizon,
+                target_quantile=adjusted_quantile,
+                seed=self.random_state,
+            )
+            for d in self.deltas
+        }
 
     def extend_horizon(self, total_checks_horizon: int) -> None:
-        """Recalibrate ``cusum_h`` once the true check horizon is known."""
+        """Recalibrate every tracker's threshold once the true check horizon is known."""
         if total_checks_horizon <= self._horizon:
             return
         self._horizon = total_checks_horizon
-        self.cusum_h = calibrate_gaussian_cusum_threshold(
-            delta=self.delta,
-            n_checks_horizon=self._horizon,
-            target_quantile=self.target_quantile,
-            seed=self.random_state,
-        )
+        self.cusum_h_by_delta = self._calibrate_thresholds()
 
     def adjust_cooldown_for_steps_per_epoch(self, steps_per_epoch: int) -> None:
         """Caps ``cooldown_steps`` against the ACTUAL observed steps-per-
@@ -393,12 +461,21 @@ class CUSUMOverfittingMonitor:
             return False
 
         z = (Delta - self.mu0) / se
-        llr = self.delta * z - self.delta**2 / 2
-        self.cusum_S = max(0.0, self.cusum_S + llr)
-        self.history.append((step, Delta, z, self.cusum_S))
+        # z doesn't depend on delta -- computed once, shared by every
+        # tracker in the ensemble. Only the LLR increment (and each
+        # tracker's own threshold) does.
+        fired_delta = None
+        for d in self.deltas:
+            llr = d * z - d**2 / 2
+            s = max(0.0, self.cusum_S_by_delta[d] + llr)
+            self.cusum_S_by_delta[d] = s
+            if fired_delta is None and s >= self.cusum_h_by_delta[d]:
+                fired_delta = d
+        self.history.append((step, Delta, z, dict(self.cusum_S_by_delta)))
 
-        if self.cusum_S >= self.cusum_h and self.alarm_step is None:
+        if fired_delta is not None and self.alarm_step is None:
             self.alarm_step = step
+            self.alarm_delta = fired_delta
             return True
         return False
 

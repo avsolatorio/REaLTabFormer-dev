@@ -34,7 +34,17 @@ throughout the rest of this research.
   `overfitting_detection_method="cusum"`, stopping early if/when the
   detector fires, up to `--epochs`. This is the main question --
   "does it trigger, and when." Also measures DCR (distance to closest
-  record) ground truth on whatever model results.
+  record) ground truth on whatever model results. Runs a **delta
+  ensemble** by default (`--cusum-delta 0.25 0.5 1.0`) -- several
+  CUSUM trackers in parallel, one per assumed effect size, alarm fires
+  on the first to cross its own (Bonferroni-corrected) threshold. No
+  single delta is well-matched to both a slow, gradual drift and a
+  sharp, sudden one, and there's no way to know in advance which shape
+  a given run's signal will take; the ensemble hedges against that
+  without added training-time cost (`z` is computed once per check,
+  shared by every tracker -- only a few extra scalar ops each). Pass a
+  single value (`--cusum-delta 0.5`) for the original single-tracker
+  behavior.
 - `--mode full`: trains the full `--epochs` schedule with no early
   stopping (`overfitting_detection_method="none"`), for a direct
   before/after DCR comparison against the cusum run. Roughly the same

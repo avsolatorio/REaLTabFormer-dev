@@ -32,9 +32,12 @@ still leaves usable, committable data:
     `phase` is one of `"settle"` (discarded, pre-calibration -- just
     `step`), `"warmup"` (a raw calibration-window sample -- `step`,
     `delta`), or `"post_calibration"` (a real detection check -- step,
-    Delta, Z, cusum_S, mu0, sigma0, cusum_h). This is the file to look
-    at if the run gets cut off before finishing; the CUSUM trend up to
-    that point is fully visible even without a final summary.
+    Delta, Z, cusum_S/cusum_h (primary tracker, back-compat) plus
+    cusum_S_by_delta/cusum_h_by_delta (every tracker in the ensemble),
+    mu0, sigma0, alarm_step, alarm_delta -- which tracker actually
+    fired, if any). This is the file to look at if the run gets cut
+    off before finishing; the CUSUM trend up to that point is fully
+    visible even without a final summary.
   - `<run_id>_summary.json`: written once, at the end of the run --
     full config, alarm_step (if any), timing, and the DCR ground-truth
     comparison (frac_suspicious, dcr_synth mean, etc.).
@@ -123,17 +126,24 @@ def attach_trajectory_logger(trajectory_path: Path):
         warmup_before = len(self._warmup_deltas)
         fired = orig_maybe_check(self, step, model, get_rows)
         if self.history and self.history[-1][0] == step:
-            _, delta, z, cusum_s = self.history[-1]
+            # `stat_delta` is the paired-improvement statistic (called
+            # `Delta` in the module docstring/code) -- unrelated to the
+            # `delta` hyperparameter(s) tracked in `s_by_delta` below,
+            # confusing as the shared name is.
+            _, stat_delta, z, s_by_delta = self.history[-1]
             record = dict(
                 phase="post_calibration",
                 step=step,
-                delta=delta,
+                delta=stat_delta,
                 z=z,
-                cusum_S=cusum_s,
+                cusum_S=s_by_delta.get(self.delta),  # primary tracker, back-compat
+                cusum_S_by_delta=s_by_delta,
                 mu0=self.mu0,
                 sigma0=self.sigma0,
-                cusum_h=self.cusum_h,
+                cusum_h=self.cusum_h,  # primary tracker, back-compat
+                cusum_h_by_delta=dict(self.cusum_h_by_delta),
                 alarm_step=self.alarm_step,
+                alarm_delta=self.alarm_delta,
             )
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
@@ -288,6 +298,7 @@ def run_cusum(args, run_id, full_df):
         device=args.device,
         overfitting_detection_method="cusum",
         cusum_check_every=args.cusum_check_every,
+        cusum_delta=args.cusum_delta,
     )
     elapsed = time.time() - t0
     mon = model.cusum_monitor
@@ -319,14 +330,17 @@ def run_cusum(args, run_id, full_df):
         batch_size=args.batch_size,
         device=args.device,
         cusum_check_every=args.cusum_check_every,
+        cusum_deltas=mon.deltas,
         alarm_step=mon.alarm_step,
+        alarm_delta=mon.alarm_delta,
         global_step=trainer.state.global_step,
         steps_per_epoch=steps_per_epoch,
         effective_epochs=trainer.state.global_step / steps_per_epoch,
         elapsed_s=elapsed,
         mu0=mon.mu0,
         sigma0=mon.sigma0,
-        cusum_h=mon.cusum_h,
+        cusum_h=mon.cusum_h,  # primary tracker, back-compat
+        cusum_h_by_delta=mon.cusum_h_by_delta,
         cooldown_steps_final=mon.cooldown_steps,
         alarm_checkpoint_dir=mon.alarm_checkpoint_dir,
     )
@@ -594,6 +608,19 @@ def main():
         "default (128) if unset; raise it if the GPU still has headroom.",
     )
     parser.add_argument("--cusum-check-every", type=int, default=20)
+    parser.add_argument(
+        "--cusum-delta",
+        type=float,
+        nargs="+",
+        default=[0.25, 0.5, 1.0],
+        help="Target effect size(s) CUSUM is tuned to detect, in standard-error "
+        "units. Pass one or more values -- more than one runs an ensemble of "
+        "trackers in parallel (alarm fires on the first to cross its own "
+        "Bonferroni-corrected threshold), hedging against not knowing in advance "
+        "whether the drift will be slow/gradual or sharp/sudden. Defaults to a "
+        "small ensemble; pass a single value (e.g. --cusum-delta 0.5) for the "
+        "original single-tracker behavior.",
+    )
     parser.add_argument(
         "--sensitivity-n-critic",
         type=int,
