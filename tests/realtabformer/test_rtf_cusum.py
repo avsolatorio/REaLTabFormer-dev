@@ -157,6 +157,10 @@ def test_monitor_rejects_bad_config():
         _make_monitor(delta=[0.5, -0.1])
     with pytest.raises(ValueError):
         _make_monitor(delta=[0.5, 0.5])  # duplicates not allowed
+    with pytest.raises(ValueError):
+        _make_monitor(max_calibration_epochs=0)
+    with pytest.raises(ValueError):
+        _make_monitor(max_calibration_epochs=-1.0)
 
 
 # ---------------------------------------------------------------------
@@ -361,6 +365,41 @@ def test_monitor_adjust_cooldown_is_noop_when_already_safe():
     mon = _make_monitor(cooldown_steps=10)
     mon.adjust_cooldown_for_steps_per_epoch(steps_per_epoch=1000)
     assert mon.cooldown_steps == 10  # unchanged -- comfortably fits already
+
+
+def test_monitor_adjust_calibration_pace_caps_on_small_dataset():
+    # Regression test for the real diagnosed bug: a 768-row dataset with
+    # steps_per_epoch=4, warmup_settle_checks=10, warmup_checks=10 (the
+    # library defaults) and check_every=20 would otherwise take 400
+    # steps == 100 epochs to finish calibration -- by which point
+    # memorization is already baked into the calibrated baseline.
+    mon = _make_monitor(
+        check_every=20,
+        warmup_checks=10,
+        warmup_settle_checks=10,
+        max_calibration_epochs=10.0,
+    )
+    mon.adjust_calibration_pace_for_steps_per_epoch(steps_per_epoch=4)
+    # budget = max(20, round(10 * 4)) = 40 steps; 40 // 20 checks = 2.
+    assert mon._calibration_check_every == 2
+    assert mon.current_check_every == 2  # mu0 unset -- calibration pace applies
+    # Post-calibration pace is untouched.
+    assert mon.check_every == 20
+
+
+def test_monitor_adjust_calibration_pace_is_noop_when_already_safe():
+    mon = _make_monitor(check_every=5, warmup_checks=3, warmup_settle_checks=0)
+    mon.adjust_calibration_pace_for_steps_per_epoch(steps_per_epoch=1000)
+    assert mon._calibration_check_every == mon.check_every == 5
+
+
+def test_monitor_current_check_every_switches_after_calibration():
+    mon = _make_monitor(check_every=20, warmup_checks=10, warmup_settle_checks=10)
+    mon.adjust_calibration_pace_for_steps_per_epoch(steps_per_epoch=4)
+    assert mon.mu0 is None
+    assert mon.current_check_every == mon._calibration_check_every == 2
+    mon.mu0 = 0.0  # simulate calibration having completed
+    assert mon.current_check_every == mon.check_every == 20
 
 
 def test_monitor_record_batch_tracks_baseline_once():

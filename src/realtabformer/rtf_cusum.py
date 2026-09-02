@@ -57,7 +57,17 @@ feature was built from):
   ``sigma0`` is estimated via first-differencing the calibration window
   rather than its raw standard deviation, since raw std conflates that
   drift with actual check-to-check noise and further inflates the
-  scale (`_robust_noise_std`).
+  scale (`_robust_noise_std`). (3) settle+warmup together are a *fixed
+  step count* (``check_every``-spaced), which is fine on a large
+  dataset but -- confirmed on a real 768-row run -- can silently
+  consume 100+ epochs on a small one, by which point the calibrated
+  "normal" baseline has already absorbed real memorization as normal
+  and the detector gives essentially no protection.
+  ``max_calibration_epochs`` bounds this by checking *more often*
+  during calibration only (`adjust_calibration_pace_for_steps_per_epoch`)
+  -- the full ``warmup_checks`` sample count is preserved, just
+  gathered in fewer real steps, so ``sigma0`` doesn't get noisier the
+  way shrinking the sample count would.
 - Stopping rule: the classical Gaussian mean-shift CUSUM (Page, 1954)
   on the calibration-normalized z-score of each check's paired
   improvement. Lorden's theorem (1971) is the reason this is a
@@ -213,6 +223,7 @@ class CUSUMOverfittingMonitor:
         cooldown_steps: int = 40,
         warmup_checks: int = 10,
         warmup_settle_checks: Optional[int] = None,
+        max_calibration_epochs: float = 10.0,
         seen_pool_size: int = 256,
         min_seen_pool: int = 32,
         delta: Union[float, Sequence[float]] = 0.5,
@@ -228,6 +239,8 @@ class CUSUMOverfittingMonitor:
             raise ValueError("warmup_checks must be at least 2 to estimate a variance.")
         if warmup_settle_checks is not None and warmup_settle_checks < 0:
             raise ValueError("warmup_settle_checks must be non-negative.")
+        if max_calibration_epochs <= 0:
+            raise ValueError("max_calibration_epochs must be positive.")
 
         # `delta` may be a single float (the original, still-default
         # behavior -- exactly one tracker) or a sequence of floats (an
@@ -267,6 +280,21 @@ class CUSUMOverfittingMonitor:
             warmup_checks if warmup_settle_checks is None else warmup_settle_checks
         )
         self._settle_checks_remaining = self.warmup_settle_checks
+        # `check_every` paces monitoring throughout the whole run, but a
+        # fixed step count for settle+warmup (below) means calibration
+        # itself can silently consume far more epochs on a small dataset
+        # than on a large one -- found the hard way: on a real 768-row
+        # dataset, calibration alone took 100 epochs before CUSUM ever
+        # started watching, by which point the model had already
+        # memorized enough that the "normal" baseline it calibrated
+        # treated that memorization as normal, and the detector never
+        # meaningfully protected against it. `max_calibration_epochs`
+        # bounds that -- see `adjust_calibration_pace_for_steps_per_epoch`
+        # -- by checking *more often* during calibration only, not by
+        # collecting fewer calibration samples (which would just make
+        # sigma0 noisier instead).
+        self.max_calibration_epochs = max_calibration_epochs
+        self._calibration_check_every = check_every
         self.seen_pool_size = seen_pool_size
         self.min_seen_pool = min_seen_pool
         self.target_quantile = target_quantile
@@ -370,6 +398,50 @@ class CUSUMOverfittingMonitor:
         safe_cap = max(1, steps_per_epoch // 2)
         if self.cooldown_steps > safe_cap:
             self.cooldown_steps = safe_cap
+
+    def adjust_calibration_pace_for_steps_per_epoch(self, steps_per_epoch: int) -> None:
+        """Paces settle+warmup checks faster on small datasets, so
+        calibration -- a fixed ``warmup_settle_checks + warmup_checks``
+        checks -- can't silently consume more than
+        ``max_calibration_epochs`` epochs before CUSUM starts actually
+        monitoring. Confirmed on real data: on a 768-row dataset, the
+        default ``check_every=20`` meant calibration alone took ~100
+        epochs (400 steps at 4 steps/epoch), and by then the model had
+        already memorized enough that the calibrated "normal" baseline
+        (``mu0``) treated that memorization as normal -- the detector's
+        eventual alarm gave essentially no protection (its
+        ``frac_suspicious`` matched an unrestricted full-schedule run).
+
+        Deliberately checks *more often* during calibration rather than
+        collecting *fewer* calibration samples (the more obvious lever)
+        -- that would keep calibration fast but make the ``sigma0``
+        estimate noisier from having fewer data points. This keeps the
+        full ``warmup_checks`` sample count, just gathers it in fewer
+        real steps; ``check_every`` itself (the post-calibration
+        monitoring pace) is untouched. A no-op whenever calibration
+        already comfortably fits the budget (the common case on any
+        reasonably large dataset, e.g. Adult).
+        """
+        if steps_per_epoch <= 0:
+            return
+        total_checks = self.warmup_settle_checks + self.warmup_checks
+        if total_checks <= 0:
+            return
+        budget_steps = max(
+            total_checks, round(self.max_calibration_epochs * steps_per_epoch)
+        )
+        self._calibration_check_every = max(
+            1, min(self.check_every, budget_steps // total_checks)
+        )
+
+    @property
+    def current_check_every(self) -> int:
+        """The check interval to use right now: the (possibly tighter)
+        calibration pace while ``mu0`` is still unset, ``check_every``
+        itself once calibrated."""
+        if self.mu0 is None:
+            return self._calibration_check_every
+        return self.check_every
 
     def record_batch(
         self,
@@ -582,6 +654,7 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
                 f"would never activate. Capped to "
                 f"{self.monitor.cooldown_steps} steps instead."
             )
+        self.monitor.adjust_calibration_pace_for_steps_per_epoch(steps_per_epoch)
 
         total_steps = (
             state.max_steps if state.max_steps and state.max_steps > 0 else None
@@ -599,7 +672,7 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         **kwargs,
     ):
         step = state.global_step
-        if step == 0 or step % self.monitor.check_every != 0:
+        if step == 0 or step % self.monitor.current_check_every != 0:
             return control
 
         model = kwargs.get("model")

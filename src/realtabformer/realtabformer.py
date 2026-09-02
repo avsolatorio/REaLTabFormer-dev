@@ -501,6 +501,7 @@ class REaLTabFormer:
         cusum_cooldown_steps: int = 40,
         cusum_warmup_checks: int = 10,
         cusum_warmup_settle_checks: Optional[int] = None,
+        cusum_max_calibration_epochs: float = 10.0,
         cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
     ) -> Trainer:
@@ -575,6 +576,16 @@ class REaLTabFormer:
               calibration doesn't land on the highly volatile window right as the
               reference pool first becomes eligible (dominated by rows whose baseline
               was captured at/near model init). Defaults to `cusum_warmup_checks` itself.
+            cusum_max_calibration_epochs: Only used when `overfitting_detection_method=
+              "cusum"`. Upper bound, in epochs, on how long calibration (settle +
+              warmup checks) is allowed to take. `cusum_check_every` is a step count,
+              which on a small dataset (few steps per epoch) can silently stretch
+              calibration across many epochs -- by the time it finishes, the
+              "normal" baseline may have already absorbed real memorization as
+              normal. When the default `cusum_check_every` would exceed this many
+              epochs, checks are run more often (not fewer) during calibration only,
+              so the full `cusum_warmup_checks` sample count -- and thus `sigma0`'s
+              precision -- is preserved.
             cusum_delta: Only used when `overfitting_detection_method="cusum"`. Target
               effect size (in standard-error units) the detector is tuned to catch. Pass
               a sequence (e.g. `[0.25, 0.5, 1.0]`) to run an ensemble of trackers in
@@ -625,6 +636,7 @@ class REaLTabFormer:
                     cusum_cooldown_steps=cusum_cooldown_steps,
                     cusum_warmup_checks=cusum_warmup_checks,
                     cusum_warmup_settle_checks=cusum_warmup_settle_checks,
+                    cusum_max_calibration_epochs=cusum_max_calibration_epochs,
                     cusum_delta=cusum_delta,
                     cusum_target_far=cusum_target_far,
                 )
@@ -1680,6 +1692,7 @@ class REaLTabFormer:
         cusum_cooldown_steps: int = 40,
         cusum_warmup_checks: int = 10,
         cusum_warmup_settle_checks: Optional[int] = None,
+        cusum_max_calibration_epochs: float = 10.0,
         cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
         cusum_seen_pool_size: int = 256,
@@ -1711,6 +1724,17 @@ class REaLTabFormer:
               baseline was captured at/near model init, making it a bad
               window to calibrate "normal" noise from. Defaults to
               `cusum_warmup_checks` itself.
+            cusum_max_calibration_epochs: Upper bound, in epochs, on how
+              long calibration (settle + warmup checks) is allowed to
+              take. On a small dataset (few steps per epoch),
+              `cusum_check_every`'s fixed step spacing can otherwise
+              silently stretch calibration across many epochs, so the
+              "normal" baseline it produces has already absorbed real
+              memorization by the time it's used. When the default
+              spacing would exceed this many epochs, checks run more
+              often (not fewer) during calibration only -- the full
+              `cusum_warmup_checks` sample count is preserved, so
+              `sigma0`'s precision doesn't suffer.
             cusum_delta: Target effect size (in standard-error units)
               the CUSUM is tuned to detect. A sequence runs an ensemble
               of trackers in parallel (alarm fires on the first one to
@@ -1762,6 +1786,7 @@ class REaLTabFormer:
             cooldown_steps=cusum_cooldown_steps,
             warmup_checks=cusum_warmup_checks,
             warmup_settle_checks=cusum_warmup_settle_checks,
+            max_calibration_epochs=cusum_max_calibration_epochs,
             seen_pool_size=cusum_seen_pool_size,
             min_seen_pool=cusum_min_seen_pool,
             delta=cusum_delta,
