@@ -87,6 +87,7 @@ RandomForest fits, per label).
 
 import argparse
 import json
+import shutil
 import sys
 import time
 import warnings
@@ -366,6 +367,51 @@ def attach_trajectory_logger(trajectory_path: Path):
         return fired
 
     rtf_cusum.CUSUMOverfittingMonitor.maybe_check = logged_maybe_check
+
+
+def sync_results_to_repo(output_dir: Path, run_id: str) -> None:
+    """Copies this run's small, git-tracked result files (the
+    `{run_id}_summary.json` and `{run_id}_cusum_trajectory.jsonl`, if
+    present) from `output_dir` back into the script's own `results/`
+    directory -- lets `--output-dir` point somewhere else entirely
+    (e.g. a larger mount, to keep the big gitignored checkpoint
+    directories off a small/disk-constrained git working copy) without
+    losing the "just commit results/" workflow: no separate manual
+    rsync step needed afterward. A no-op when `output_dir` already IS
+    the repo's own `results/` directory (the common case, nothing to
+    sync).
+
+    Deliberately filters to *files* with a `.json`/`.jsonl` suffix,
+    not a bare `{run_id}*` glob -- the checkpoint directories
+    (`{run_id}_ckpt_cusum/` etc.) share that exact prefix and must
+    never get pulled in here; they're gitignored on purpose (large,
+    not meant to be committed). Called once per mode (at the end of
+    each `run_*` function, same place each mode already prints "Wrote
+    ..."), not just once at the very end of `main()` -- matching this
+    script's existing incremental-write philosophy so a run killed
+    partway through `--mode all` still leaves whatever finished so far
+    synced back, not just whatever was still running when it died.
+    """
+    output_dir = Path(output_dir).resolve()
+    repo_results_dir = (SCRIPT_DIR / "results").resolve()
+    if output_dir == repo_results_dir:
+        return
+
+    repo_results_dir.mkdir(parents=True, exist_ok=True)
+    copied = [
+        p.name
+        for p in output_dir.glob(f"{run_id}*")
+        if p.is_file() and p.suffix in (".json", ".jsonl")
+    ]
+    for name in copied:
+        shutil.copy2(output_dir / name, repo_results_dir / name)
+
+    if copied:
+        print(
+            f"Synced {len(copied)} result file(s) from {output_dir} to "
+            f"{repo_results_dir}: {', '.join(copied)}",
+            flush=True,
+        )
 
 
 def measure_dcr(
@@ -852,6 +898,8 @@ def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
             n_jobs=args.eval_n_jobs,
         )
     print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
+    if not args.no_sync_results:
+        sync_results_to_repo(Path(args.output_dir), run_id)
 
 
 def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
@@ -934,6 +982,8 @@ def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
             n_jobs=args.eval_n_jobs,
         )
     print(f"\nWrote {summary_path}", flush=True)
+    if not args.no_sync_results:
+        sync_results_to_repo(Path(args.output_dir), run_id)
 
 
 def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_val):
@@ -1054,6 +1104,8 @@ def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_v
             n_jobs=args.eval_n_jobs,
         )
     print(f"\nWrote {summary_path}", flush=True)
+    if not args.no_sync_results:
+        sync_results_to_repo(Path(args.output_dir), run_id)
 
 
 def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_pos_val):
@@ -1114,6 +1166,8 @@ def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_p
             n_jobs=args.eval_n_jobs,
         )
     print(f"\nWrote {summary_path}", flush=True)
+    if not args.no_sync_results:
+        sync_results_to_repo(Path(args.output_dir), run_id)
 
 
 def main():
@@ -1237,7 +1291,26 @@ def main():
         "sequential (e.g. for predictable wall-clock on a shared box), or a "
         "smaller positive number to cap how many cores this step claims.",
     )
-    parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
+    parser.add_argument(
+        "--output-dir",
+        default=str(SCRIPT_DIR / "results"),
+        help="Where results (and, for --mode cusum/all, the gigabytes-heavy "
+        "checkpoint directories) are written. Point this at a larger mount "
+        "if the repo's own disk is tight -- the small, git-tracked summary/ "
+        "trajectory files still get copied back into cusum_validation/"
+        "results/ automatically afterward (see --no-sync-results), so the "
+        "usual 'commit results/' workflow still works without a separate "
+        "manual rsync step.",
+    )
+    parser.add_argument(
+        "--no-sync-results",
+        action="store_true",
+        default=False,
+        help="Skip copying this run's summary/trajectory files back into "
+        "cusum_validation/results/ when --output-dir points elsewhere. On "
+        "by default; pass this if you'd rather sync manually (e.g. you only "
+        "want to commit a subset of what a big batch produced).",
+    )
     parser.add_argument(
         "--run-id",
         default=None,
