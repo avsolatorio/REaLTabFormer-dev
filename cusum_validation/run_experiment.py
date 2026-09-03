@@ -64,9 +64,16 @@ mean+/-std over many seeds, the same methodology as the tab-ddpm
 benchmark framework (github.com/rotot0/tab-ddpm,
 scripts/eval_catboost.py) that avsolatorio/REaLTabFormer-Experiments
 reuses -- confirmed by reading that framework's actual eval code, not
-guessed from file naming. DM (discriminator measure -- a classifier's
-accuracy at telling real from synthetic rows apart, 50% = best/
-indistinguishable) reuses this library's own
+guessed from file naming. CatBoost is fit with tab-ddpm's own
+PER-DATASET-TUNED hyperparameters (see CATBOOST_TUNED_CONFIGS, copied
+verbatim from rotot0/tab-ddpm/tuned_models/catboost/*.json) whenever
+one exists for `--dataset`, not CatBoost's defaults -- confirmed via
+`measure_mle`'s own real-vs-tuned comparison to be the actual source of
+an earlier gap between this script's real-data (TRTR) F1 on diabetes
+(0.716, CatBoost defaults) and the paper's published "Original" column
+for the same dataset (0.776). DM (discriminator measure -- a
+classifier's accuracy at telling real from synthetic rows apart, 50% =
+best/indistinguishable) reuses this library's own
 `SyntheticDataBench.get_discriminator_performance`, with
 RandomForestClassifier(oob_score=True) as the default model -- the
 only model type that method's own oob_score_ check would report
@@ -212,6 +219,92 @@ DATASET_CONFIGS = {
     "wilt": (load_wilt, "Class", True, "2"),
     "churn2": (load_churn2, "Exited", True, 1),
     "adult": (load_adult, "income", True, ">50K"),
+}
+
+# Per-dataset CatBoost hyperparameters, copied verbatim from
+# rotot0/tab-ddpm's tuned_models/catboost/<dataset>_cv.json -- these are
+# the ACTUAL hyperparameters the tab-ddpm benchmark framework (and, via
+# it, the REaLTabFormer paper's own Table 1) tunes and uses for MLE, not
+# guessed or re-tuned here. `cat_features` from those files is NOT
+# reused -- it's a column-index list specific to tab-ddpm's own internal
+# feature ordering, meaningless against our own dataframe's column
+# order, so `measure_mle` computes its own indices dynamically instead
+# (unchanged from before). Only present for datasets tab-ddpm actually
+# tuned a config for; `measure_mle` falls back to CatBoost defaults (no
+# eval_set/early stopping) for any dataset missing here.
+CATBOOST_TUNED_CONFIGS = {
+    "diabetes": dict(
+        learning_rate=0.026561564197335047,
+        depth=3,
+        l2_leaf_reg=0.8066571920706246,
+        bagging_temperature=0.6363246451815178,
+        leaf_estimation_iterations=9,
+        iterations=2000,
+        early_stopping_rounds=50,
+        od_pval=0.001,
+        task_type="CPU",
+        thread_count=4,
+    ),
+    "insurance": dict(
+        learning_rate=0.08663279761354557,
+        depth=6,
+        l2_leaf_reg=8.92855270774259,
+        bagging_temperature=0.9636627605010293,
+        leaf_estimation_iterations=4,
+        iterations=2000,
+        early_stopping_rounds=50,
+        od_pval=0.001,
+        task_type="CPU",
+        thread_count=4,
+    ),
+    "abalone": dict(
+        learning_rate=0.028050502468157906,
+        depth=5,
+        l2_leaf_reg=7.780211394737271,
+        bagging_temperature=0.026696235942186064,
+        leaf_estimation_iterations=9,
+        iterations=2000,
+        early_stopping_rounds=50,
+        od_pval=0.001,
+        task_type="CPU",
+        thread_count=4,
+    ),
+    "wilt": dict(
+        learning_rate=0.13877980376409904,
+        depth=6,
+        l2_leaf_reg=1.1040918394803323,
+        bagging_temperature=0.9966446926502672,
+        leaf_estimation_iterations=4,
+        iterations=2000,
+        early_stopping_rounds=50,
+        od_pval=0.001,
+        task_type="CPU",
+        thread_count=4,
+    ),
+    "churn2": dict(
+        learning_rate=0.4667069360390258,
+        depth=3,
+        l2_leaf_reg=8.856733942123162,
+        bagging_temperature=0.2955334069354449,
+        leaf_estimation_iterations=1,
+        iterations=2000,
+        early_stopping_rounds=50,
+        od_pval=0.001,
+        task_type="CPU",
+        thread_count=4,
+    ),
+    "adult": dict(
+        learning_rate=0.16886992997713726,
+        depth=3,
+        l2_leaf_reg=0.19334681185025449,
+        bagging_temperature=0.11959130879575816,
+        leaf_estimation_iterations=8,
+        iterations=2000,
+        early_stopping_rounds=50,
+        od_pval=0.001,
+        task_type="CPU",
+        thread_count=4,
+    ),
 }
 
 
@@ -388,6 +481,7 @@ def measure_mle(
     categorical: bool,
     n_seeds_synthetic: int = 50,
     n_seeds_real: int = 10,
+    dataset_name: str = None,
 ):
     """Machine-learning efficacy (MLE) matching the metric definition
     used in the REaLTabFormer paper's benchmark table and the
@@ -408,6 +502,29 @@ def measure_mle(
     Defaults (50 synthetic-seed fits, 10 real-seed fits) mirror
     tab-ddpm's own eval_seeds.py defaults, for direct comparability
     with the numbers already published for these same datasets.
+
+    When `dataset_name` has a matching entry in CATBOOST_TUNED_CONFIGS,
+    uses those exact per-dataset-tuned hyperparameters (not CatBoost's
+    defaults) -- this is the actual gap that made an earlier run's real
+    (TRTR) MLE on diabetes (F1=0.716) come out well below the paper's
+    published "Original" column (F1=0.776) for what's very likely the
+    same underlying dataset: CatBoost defaults vs. tab-ddpm's tuned
+    config, not a difference in methodology. Matching that also means
+    matching its early-stopping setup (iterations=2000 capped by
+    early_stopping_rounds=50 against a held-out eval_set) -- since our
+    SyntheticDataBench only keeps a train/test split (no third val
+    split like tab-ddpm's datasets ship with), a validation slice is
+    carved out of `bench.train_df` here (20% held out, stratified for
+    classification, random_state=777 -- tab-ddpm's own
+    lib.data.read_changed_val defaults, reused for consistency) and
+    used as the eval_set for EVERY fit, TSTR and TRTR alike, exactly
+    mirroring how tab-ddpm always evaluates against the real val split
+    regardless of which data trained the model. The TRTR fit excludes
+    those held-out rows from its own training data (no leakage into its
+    early-stopping signal); the TSTR fit's synthetic training rows are
+    already disjoint from real data, so nothing needs excluding there.
+    Falls back to CatBoost defaults (no eval_set/early stopping) when
+    `dataset_name` is unset or has no tuned config on file.
     """
     if bench.synth_train_df is None:
         print(f"[{label}] skipping MLE -- no synthetic data registered", flush=True)
@@ -424,47 +541,82 @@ def measure_mle(
         return None
 
     from sklearn.metrics import f1_score, r2_score
+    from sklearn.model_selection import train_test_split
+
+    tuned_config = CATBOOST_TUNED_CONFIGS.get(dataset_name)
+    if tuned_config is not None:
+        print(
+            f"[{label}] MLE using tab-ddpm's tuned CatBoost config for "
+            f"'{dataset_name}'",
+            flush=True,
+        )
+    else:
+        print(
+            f"[{label}] MLE: no tuned CatBoost config for "
+            f"'{dataset_name}' -- using CatBoost defaults (not directly "
+            "comparable to the paper's published magnitudes)",
+            flush=True,
+        )
 
     feature_cols = [c for c in bench.train_df.columns if c != bench.target_col]
     cat_feature_idx = [
         i for i, c in enumerate(feature_cols) if bench.train_df[c].dtype == object
     ]
 
+    real_fit_df, val_df = bench.train_df, None
+    if tuned_config is not None:
+        strat = bench.train_df[bench.target_col] if categorical else None
+        real_fit_df, val_df = train_test_split(
+            bench.train_df, test_size=0.2, random_state=777, stratify=strat
+        )
+
     def _fit_score(train_df, seed):
         X_train = train_df[feature_cols]
         X_test = bench.test_df[feature_cols]
+        fit_kwargs = {}
+
         if categorical:
             y_train = (train_df[bench.target_col] == bench.target_pos_val).astype(int)
             y_test = (bench.test_df[bench.target_col] == bench.target_pos_val).astype(
                 int
             )
             model = CatBoostClassifier(
+                **(tuned_config or {}),
                 loss_function="Logloss",
                 eval_metric="TotalF1",
                 random_seed=seed,
                 verbose=False,
                 cat_features=cat_feature_idx,
             )
-            model.fit(X_train, y_train)
+            if val_df is not None:
+                y_val = (val_df[bench.target_col] == bench.target_pos_val).astype(int)
+                fit_kwargs["eval_set"] = (val_df[feature_cols], y_val)
+            model.fit(X_train, y_train, **fit_kwargs)
             pred = (model.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
             return f1_score(y_test, pred, average="macro")
         else:
             y_train = train_df[bench.target_col]
             y_test = bench.test_df[bench.target_col]
             model = CatBoostRegressor(
+                **(tuned_config or {}),
                 eval_metric="RMSE",
                 random_seed=seed,
                 verbose=False,
                 cat_features=cat_feature_idx,
             )
-            model.fit(X_train, y_train)
+            if val_df is not None:
+                fit_kwargs["eval_set"] = (
+                    val_df[feature_cols],
+                    val_df[bench.target_col],
+                )
+            model.fit(X_train, y_train, **fit_kwargs)
             pred = model.predict(X_test)
             return r2_score(y_test, pred)
 
     synth_scores = [
         _fit_score(bench.synth_train_df, s) for s in range(n_seeds_synthetic)
     ]
-    real_scores = [_fit_score(bench.train_df, s) for s in range(n_seeds_real)]
+    real_scores = [_fit_score(real_fit_df, s) for s in range(n_seeds_real)]
 
     metric = "f1_macro" if categorical else "r2"
     result = dict(
@@ -475,6 +627,7 @@ def measure_mle(
         real_std=float(np.std(real_scores)),
         n_seeds_synthetic=n_seeds_synthetic,
         n_seeds_real=n_seeds_real,
+        used_tuned_config=tuned_config is not None,
     )
     print(
         f"[{label}] MLE ({metric}): synthetic={result['synthetic_mean']:.4f}"
@@ -646,6 +799,7 @@ def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
             categorical=categorical,
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
+            dataset_name=args.dataset,
         )
         measure_dm(bench, "cusum_stop_at_alarm", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
@@ -720,6 +874,7 @@ def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
             categorical=categorical,
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
+            dataset_name=args.dataset,
         )
         measure_dm(bench, "full_schedule", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {summary_path}", flush=True)
@@ -832,6 +987,7 @@ def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_v
             categorical=categorical,
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
+            dataset_name=args.dataset,
         )
         measure_dm(bench, "sensitivity_stop", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {summary_path}", flush=True)
@@ -884,6 +1040,7 @@ def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_p
             categorical=categorical,
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
+            dataset_name=args.dataset,
         )
         measure_dm(bench, "checkpoint_recheck", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {summary_path}", flush=True)
