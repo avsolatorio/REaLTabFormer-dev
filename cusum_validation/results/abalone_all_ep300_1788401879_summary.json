@@ -1,0 +1,78 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 580,
+    "alarm_delta": 1.0,
+    "global_step": 580,
+    "steps_per_epoch": 26,
+    "effective_epochs": 22.307692307692307,
+    "elapsed_s": 138.3075053691864,
+    "mu0": 1.1978378313593567,
+    "sigma0": 0.09714466366352188,
+    "cusum_h": 8.842940651369034,
+    "cusum_h_by_delta": {
+      "0.25": 8.842940651369034,
+      "0.5": 9.826371584485825,
+      "1.0": 10.683748595537399
+    },
+    "cooldown_steps_final": 13,
+    "alarm_checkpoint_dir": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/cusum_validation/results/abalone_all_ep300_1788401879_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 4477,
+    "dcr_synth_mean": 0.80456375587064,
+    "dcr_synth_min": 0.047107045629271926,
+    "dcr_test_mean": 0.8281265351055374,
+    "frac_suspicious": 0.07784431137724551
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "r2",
+    "trtr": 0.5333320730259068,
+    "tstr": 0.5109756814920412,
+    "gap": 0.022356391533865594
+  },
+  "cusum_stop_at_alarm_mle": {
+    "metric": "r2",
+    "synthetic_mean": 0.4839207806311936,
+    "synthetic_std": 0.004502508418663296,
+    "real_mean": 0.5575312475818788,
+    "real_std": 0.004237699702732103,
+    "n_seeds_synthetic": 50,
+    "n_seeds_real": 10
+  },
+  "cusum_stop_at_alarm_dm": {
+    "dm_mean": 63.02395209580838,
+    "dm_std": 0.5430645852460174,
+    "n_seeds": 10
+  },
+  "full_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "global_step": 4200,
+    "elapsed_s": 859.5089609622955
+  },
+  "full_schedule": {
+    "label": "full_schedule",
+    "n_samples_generated": 4477,
+    "dcr_synth_mean": 0.038173890376736345,
+    "dcr_synth_min": 0.0,
+    "dcr_test_mean": 0.8281265351055374,
+    "frac_suspicious": 0.9580838323353293
+  },
+  "full_schedule_utility": {
+    "metric": "r2",
+    "trtr": 0.5333320730259068,
+    "tstr": 0.532410340708243,
+    "gap": 0.0009217323176637926
+  }
+}
