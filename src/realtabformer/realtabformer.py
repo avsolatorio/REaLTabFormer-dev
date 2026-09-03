@@ -487,6 +487,8 @@ class REaLTabFormer:
         full_sensitivity: bool = False,
         sensitivity_orig_frac_multiple: int = 4,
         orig_samples_rounds: int = 5,
+        sensitivity_cache_dir: Optional[Union[str, Path]] = None,
+        sensitivity_bootstrap_n_jobs: Optional[int] = None,
         load_from_best_mean_sensitivity: bool = False,
         target_col: str = None,
         save_full_every_epoch: int = 0,
@@ -552,6 +554,25 @@ class REaLTabFormer:
               `(sensitivity_orig_frac_multiple + 2)` multiplied by `frac` must be less than 1.
             orig_samples_rounds: This is the number of train/hold-out samples that will be used to
               compute the epoch sensitivity value.
+            sensitivity_cache_dir: Only used when `overfitting_detection_method=
+              "sensitivity"`. Caches the pre-training `num_bootstrap`-round
+              bootstrap threshold computation to disk, keyed on the training
+              data's own content plus every parameter that affects it -- this
+              step is entirely independent of any trained model (it only ever
+              resamples the training data against itself), so a repeat run
+              against the same data/settings can skip it entirely on a cache
+              hit. `None` (default): no caching, unchanged behavior. Note the
+              bootstrap itself isn't seeded, so a cache hit reuses one
+              particular prior random realization rather than drawing a fresh
+              one -- equally valid statistically, just not fresh noise on
+              every call.
+            sensitivity_bootstrap_n_jobs: Only used when
+              `overfitting_detection_method="sensitivity"`. Explicit worker
+              count (joblib's own convention, e.g. `-1` for every core) for
+              that same bootstrap computation. `None` (default): the
+              library's original heuristic (`min(max(2, cpu_count // 4), 16)`)
+              -- deliberately conservative, likely leaving real speed on the
+              table on a many-core machine.
             load_from_best_mean_sensitivity: Whether to load from best mean sensitivity or not.
             target_col: The target column name.
             save_full_every_epoch: The number of epochs to save the full model. Only used for tabular data with sensitivity training.
@@ -692,6 +713,8 @@ class REaLTabFormer:
                     full_sensitivity=full_sensitivity,
                     sensitivity_orig_frac_multiple=sensitivity_orig_frac_multiple,
                     orig_samples_rounds=orig_samples_rounds,
+                    sensitivity_cache_dir=sensitivity_cache_dir,
+                    sensitivity_bootstrap_n_jobs=sensitivity_bootstrap_n_jobs,
                     load_from_best_mean_sensitivity=load_from_best_mean_sensitivity,
                     save_full_every_epoch=save_full_every_epoch,
                     gen_kwargs=gen_kwargs,
@@ -745,6 +768,8 @@ class REaLTabFormer:
         full_sensitivity: bool = False,
         sensitivity_orig_frac_multiple: int = 4,
         orig_samples_rounds: int = 5,
+        sensitivity_cache_dir: Optional[Union[str, Path]] = None,
+        sensitivity_bootstrap_n_jobs: Optional[int] = None,
         load_from_best_mean_sensitivity: bool = False,
         save_full_every_epoch: int = 0,
         gen_kwargs: Optional[Dict[str, Any]] = None,
@@ -849,6 +874,8 @@ class REaLTabFormer:
             use_ks=use_ks,
             full_sensitivity=full_sensitivity,
             sensitivity_orig_frac_multiple=sensitivity_orig_frac_multiple,
+            cache_dir=sensitivity_cache_dir,
+            n_jobs=sensitivity_bootstrap_n_jobs,
         )
         sensitivity_threshold = np.quantile(sensitivity_values, quantile)
         mean_sensitivity_value = np.mean(sensitivity_values)

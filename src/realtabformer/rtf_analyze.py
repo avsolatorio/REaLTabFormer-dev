@@ -1,6 +1,9 @@
+import hashlib
+import json
 import math
 import os
 import random
+from pathlib import Path
 from typing import Any, List, Optional, Union
 
 import joblib
@@ -615,6 +618,51 @@ class SyntheticDataBench:
         return statistic
 
     @staticmethod
+    def _sensitivity_threshold_cache_key(
+        train_data: pd.DataFrame,
+        num_bootstrap: int,
+        frac: float,
+        qt_max: float,
+        qt_interval: int,
+        distance,
+        tsvd,
+        max_col_nums: int,
+        use_ks: bool,
+        full_sensitivity: bool,
+        sensitivity_orig_frac_multiple: int,
+    ) -> str:
+        """Content-based cache key for `compute_sensitivity_threshold`'s
+        bootstrap loop: hashes `train_data`'s actual values (not just
+        its shape) via pandas' own per-row hashing, combined with
+        every parameter that affects the bootstrap computation, so a
+        different dataset or a different setting never collides with
+        an unrelated cache entry. `frac` here is the FINAL, already-
+        resolved value (post `test_size`/`full_sensitivity` adjustment
+        in the caller), matching exactly what `bootstrap_inner_loop`
+        actually uses -- not the raw, possibly-`None` constructor
+        argument.
+        """
+        row_hashes = pd.util.hash_pandas_object(train_data, index=True).values
+        data_digest = hashlib.sha256(row_hashes.tobytes()).hexdigest()[:16]
+        key_str = "|".join(
+            str(part)
+            for part in [
+                data_digest,
+                num_bootstrap,
+                frac,
+                qt_max,
+                qt_interval,
+                getattr(distance, "__name__", repr(distance)),
+                repr(tsvd) if tsvd is not None else "None",
+                max_col_nums,
+                use_ks,
+                full_sensitivity,
+                sensitivity_orig_frac_multiple,
+            ]
+        )
+        return hashlib.sha256(key_str.encode()).hexdigest()[:24]
+
+    @staticmethod
     def compute_sensitivity_threshold(
         train_data: pd.DataFrame,
         num_bootstrap: int = 100,
@@ -630,6 +678,8 @@ class SyntheticDataBench:
         use_ks: bool = False,
         full_sensitivity: bool = True,
         sensitivity_orig_frac_multiple: int = 3,
+        cache_dir: Optional[Union[str, Path]] = None,
+        n_jobs: Optional[int] = None,
     ) -> Union[float, List]:
         """This method implements a bootstrapped estimation of the
         sensitivity values derived from the training data.
@@ -649,6 +699,30 @@ class SyntheticDataBench:
             sensitivity_orig_frac_multiple: The size of the training data relative to the chosen `frac` that will be
              used in computing the sensitivity. The larger this value is, the more robust the sensitivity threshold
              will be. However, `(sensitivity_orig_frac_multiple + 2)` multiplied by `frac` must be less than 1.
+            cache_dir: When set, this method's whole `num_bootstrap`-round
+             loop -- expensive, and entirely independent of any trained
+             model since it only ever resamples `train_data` against
+             itself -- is cached to disk, keyed on `train_data`'s own
+             content plus every parameter that affects the result (see
+             `_sensitivity_threshold_cache_key`). A cache hit skips the
+             loop entirely. IMPORTANT: `bootstrap_inner_loop`'s
+             `train_test_split` calls are NOT seeded, so this method's
+             output is already one particular random realization of the
+             bootstrap on every call, not a deterministic function of
+             its inputs -- caching means REUSING that one realization on
+             a hit rather than drawing a fresh one, which is just as
+             statistically valid (same null distribution, same
+             `num_bootstrap` draw count) but means repeated cache-hit
+             calls stop seeing fresh sampling noise between them.
+             `None` (default): no caching, identical behavior to before
+             this parameter existed.
+            n_jobs: Explicit joblib worker count for the bootstrap loop
+             (joblib's own convention -- `-1` means every core). `None`
+             (default): falls back to the original heuristic
+             (`min(max(2, cpu_count // 4), 16)`), unchanged from before
+             this parameter existed -- deliberately conservative and,
+             on a many-core box, likely leaving real speed on the
+             table; pass `-1` explicitly to use every core instead.
         """
         if test_size is not None:
             assert (
@@ -674,6 +748,32 @@ class SyntheticDataBench:
             # replacement. We should make sure that we don't exceed this
             # threshold.
             assert (sensitivity_orig_frac_multiple + 2) * frac <= 1
+
+        cache_path = None
+        if cache_dir is not None:
+            cache_dir = Path(cache_dir)
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            cache_key = SyntheticDataBench._sensitivity_threshold_cache_key(
+                train_data,
+                num_bootstrap,
+                frac,
+                qt_max,
+                qt_interval,
+                distance,
+                tsvd,
+                max_col_nums,
+                use_ks,
+                full_sensitivity,
+                sensitivity_orig_frac_multiple,
+            )
+            cache_path = cache_dir / f"sensitivity_threshold_{cache_key}.json"
+            if cache_path.exists():
+                values = json.loads(cache_path.read_text())
+                print(
+                    f"Loaded cached sensitivity threshold bootstrap "
+                    f"({len(values)} values) from {cache_path}"
+                )
+                return values if return_values else np.quantile(values, quantile)
 
         def bootstrap_inner_loop():
             original: pd.DataFrame = None
@@ -708,11 +808,15 @@ class SyntheticDataBench:
                 use_ks=use_ks,
             )
 
-        n_jobs = 1
-        cpu_count = os.cpu_count()
-
-        if cpu_count and cpu_count >= 4:
-            n_jobs = min(max(2, cpu_count // 4), 16)
+        if n_jobs is None:
+            # Original heuristic, unchanged -- deliberately conservative
+            # (divides by 4, caps at 16) and, on a many-core box, likely
+            # leaving real speed on the table. Pass `n_jobs` explicitly
+            # (e.g. -1 for every core) to override it.
+            n_jobs = 1
+            cpu_count = os.cpu_count()
+            if cpu_count and cpu_count >= 4:
+                n_jobs = min(max(2, cpu_count // 4), 16)
 
         if n_jobs == 1:
             for _ in tqdm(range(num_bootstrap), desc="Bootstrap round"):
@@ -727,6 +831,15 @@ class SyntheticDataBench:
 
         print("Sensitivity threshold summary:")
         print(pd.Series(values).describe())
+
+        if cache_path is not None:
+            # `values` entries are numpy scalars (from `.mean()` etc in
+            # compute_sensitivity_metric), not JSON-serializable as-is.
+            cache_path.write_text(json.dumps([float(v) for v in values]))
+            print(
+                f"Cached sensitivity threshold bootstrap ({len(values)} "
+                f"values) to {cache_path}"
+            )
 
         return values if return_values else np.quantile(values, quantile)
 
