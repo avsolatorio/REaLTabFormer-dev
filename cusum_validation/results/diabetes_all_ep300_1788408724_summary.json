@@ -1,0 +1,135 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 80,
+    "alarm_delta": 1.0,
+    "global_step": 80,
+    "steps_per_epoch": 4,
+    "effective_epochs": 20.0,
+    "elapsed_s": 32.58471965789795,
+    "mu0": 2.0898381491657347,
+    "sigma0": 0.018495067766514273,
+    "cusum_h": 8.842940651369034,
+    "cusum_h_by_delta": {
+      "0.25": 8.842940651369034,
+      "0.5": 9.826371584485825,
+      "1.0": 10.683748595537399
+    },
+    "cooldown_steps_final": 2,
+    "alarm_checkpoint_dir": "/data/wb536061/REaLTabFormer-dev/cusum_validation/results/diabetes_all_ep300_1788408724_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 1068,
+    "dcr_synth_mean": 2.330281700284429,
+    "dcr_synth_min": 0.6097048603266002,
+    "dcr_test_mean": 2.513550583328174,
+    "frac_suspicious": 0.12987012987012986
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "auc",
+    "trtr": 0.822038567493113,
+    "tstr": 0.785307621671258,
+    "gap": 0.03673094582185499
+  },
+  "cusum_stop_at_alarm_mle": {
+    "metric": "f1_macro",
+    "synthetic_mean": 0.7168239670024101,
+    "synthetic_std": 0.010945979733460894,
+    "real_mean": 0.705147128498556,
+    "real_std": 0.01738795223483161,
+    "n_seeds_synthetic": 50,
+    "n_seeds_real": 10,
+    "used_tuned_config": true
+  },
+  "cusum_stop_at_alarm_dm": {
+    "dm_mean": 58.993506493506494,
+    "dm_std": 0.7825955060515541,
+    "n_seeds": 10
+  },
+  "full_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "global_step": 900,
+    "elapsed_s": 327.65563797950745
+  },
+  "full_schedule": {
+    "label": "full_schedule",
+    "n_samples_generated": 1068,
+    "dcr_synth_mean": 0.09993611829365719,
+    "dcr_synth_min": 0.0,
+    "dcr_test_mean": 2.513550583328174,
+    "frac_suspicious": 0.961038961038961
+  },
+  "full_schedule_utility": {
+    "metric": "auc",
+    "trtr": 0.822038567493113,
+    "tstr": 0.8196510560146923,
+    "gap": 0.0023875114784206453
+  },
+  "full_schedule_mle": {
+    "metric": "f1_macro",
+    "synthetic_mean": 0.6615563751716813,
+    "synthetic_std": 0.012999564894641654,
+    "real_mean": 0.705147128498556,
+    "real_std": 0.01738795223483161,
+    "n_seeds_synthetic": 50,
+    "n_seeds_real": 10,
+    "used_tuned_config": true
+  },
+  "full_schedule_dm": {
+    "dm_mean": 58.57142857142857,
+    "dm_std": 1.5242460512085048,
+    "n_seeds": 10
+  },
+  "sensitivity_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "n_critic": 5,
+    "n_critic_stop": 2,
+    "num_bootstrap": 500,
+    "elapsed_s": 173.12816429138184,
+    "global_step": 210,
+    "steps_per_epoch": 4,
+    "stopped_epoch": 52.5
+  },
+  "sensitivity_stop": {
+    "label": "sensitivity_stop",
+    "n_samples_generated": 1068,
+    "dcr_synth_mean": 1.952311749505914,
+    "dcr_synth_min": 0.16988210408296323,
+    "dcr_test_mean": 2.513550583328174,
+    "frac_suspicious": 0.19480519480519481
+  },
+  "sensitivity_stop_utility": {
+    "metric": "auc",
+    "trtr": 0.822038567493113,
+    "tstr": 0.8352617079889806,
+    "gap": -0.013223140495867591
+  },
+  "sensitivity_stop_mle": {
+    "metric": "f1_macro",
+    "synthetic_mean": 0.7103748006091756,
+    "synthetic_std": 0.008961453367106551,
+    "real_mean": 0.705147128498556,
+    "real_std": 0.01738795223483161,
+    "n_seeds_synthetic": 50,
+    "n_seeds_real": 10,
+    "used_tuned_config": true
+  },
+  "sensitivity_stop_dm": {
+    "dm_mean": 56.72077922077923,
+    "dm_std": 1.33116883116883,
+    "n_seeds": 10
+  }
+}

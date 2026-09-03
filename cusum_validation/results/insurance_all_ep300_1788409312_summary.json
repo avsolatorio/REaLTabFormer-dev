@@ -1,0 +1,135 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 140,
+    "alarm_delta": 1.0,
+    "global_step": 140,
+    "steps_per_epoch": 8,
+    "effective_epochs": 17.5,
+    "elapsed_s": 44.1687331199646,
+    "mu0": 1.583988989284262,
+    "sigma0": 0.03689587671791712,
+    "cusum_h": 8.842940651369034,
+    "cusum_h_by_delta": {
+      "0.25": 8.842940651369034,
+      "0.5": 9.826371584485825,
+      "1.0": 10.683748595537399
+    },
+    "cooldown_steps_final": 4,
+    "alarm_checkpoint_dir": "/data/wb536061/REaLTabFormer-dev/cusum_validation/results/insurance_all_ep300_1788409312_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 1638,
+    "dcr_synth_mean": 0.6572550308164308,
+    "dcr_synth_min": 0.005741226419027079,
+    "dcr_test_mean": 0.7597987131308244,
+    "frac_suspicious": 0.06343283582089553
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "r2",
+    "trtr": 0.6868136154885598,
+    "tstr": 0.6824395271828856,
+    "gap": 0.004374088305674206
+  },
+  "cusum_stop_at_alarm_mle": {
+    "metric": "r2",
+    "synthetic_mean": 0.7957497058181393,
+    "synthetic_std": 0.0022078535534199428,
+    "real_mean": 0.7975907783771524,
+    "real_std": 0.003994693322030268,
+    "n_seeds_synthetic": 50,
+    "n_seeds_real": 10,
+    "used_tuned_config": true
+  },
+  "cusum_stop_at_alarm_dm": {
+    "dm_mean": 58.76865671641791,
+    "dm_std": 0.6299232468706767,
+    "n_seeds": 10
+  },
+  "full_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "global_step": 1500,
+    "elapsed_s": 442.2623040676117
+  },
+  "full_schedule": {
+    "label": "full_schedule",
+    "n_samples_generated": 1638,
+    "dcr_synth_mean": 0.0213257372861937,
+    "dcr_synth_min": 0.0,
+    "dcr_test_mean": 0.7597987131308244,
+    "frac_suspicious": 0.9701492537313433
+  },
+  "full_schedule_utility": {
+    "metric": "r2",
+    "trtr": 0.6868136154885598,
+    "tstr": 0.6794285313238346,
+    "gap": 0.007385084164725164
+  },
+  "full_schedule_mle": {
+    "metric": "r2",
+    "synthetic_mean": 0.7839231067528272,
+    "synthetic_std": 0.0065423396914336,
+    "real_mean": 0.7975907783771524,
+    "real_std": 0.003994693322030268,
+    "n_seeds_synthetic": 50,
+    "n_seeds_real": 10,
+    "used_tuned_config": true
+  },
+  "full_schedule_dm": {
+    "dm_mean": 60.186567164179095,
+    "dm_std": 0.9629468582510403,
+    "n_seeds": 10
+  },
+  "sensitivity_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "n_critic": 5,
+    "n_critic_stop": 2,
+    "num_bootstrap": 500,
+    "elapsed_s": 162.49270009994507,
+    "global_step": 375,
+    "steps_per_epoch": 8,
+    "stopped_epoch": 46.875
+  },
+  "sensitivity_stop": {
+    "label": "sensitivity_stop",
+    "n_samples_generated": 1638,
+    "dcr_synth_mean": 0.6284404341037139,
+    "dcr_synth_min": 0.0,
+    "dcr_test_mean": 0.7597987131308244,
+    "frac_suspicious": 0.11567164179104478
+  },
+  "sensitivity_stop_utility": {
+    "metric": "r2",
+    "trtr": 0.6868136154885598,
+    "tstr": 0.679413835338933,
+    "gap": 0.007399780149626833
+  },
+  "sensitivity_stop_mle": {
+    "metric": "r2",
+    "synthetic_mean": 0.7877996458670421,
+    "synthetic_std": 0.0026569035842912377,
+    "real_mean": 0.7975907783771524,
+    "real_std": 0.003994693322030268,
+    "n_seeds_synthetic": 50,
+    "n_seeds_real": 10,
+    "used_tuned_config": true
+  },
+  "sensitivity_stop_dm": {
+    "dm_mean": 57.649253731343286,
+    "dm_std": 0.7030389433364463,
+    "n_seeds": 10
+  }
+}
