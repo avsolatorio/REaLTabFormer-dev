@@ -72,6 +72,13 @@ def run_one(dataset, args, log_dir: Path) -> dict:
         cmd += ["--sensitivity-cache-dir", args.sensitivity_cache_dir]
     if args.no_sensitivity_cache:
         cmd += ["--no-sensitivity-cache"]
+    if args.cusum_confirm_with_sensitivity:
+        cmd += ["--cusum-confirm-with-sensitivity"]
+        if args.cusum_confirm_num_bootstrap is not None:
+            cmd += [
+                "--cusum-confirm-num-bootstrap",
+                str(args.cusum_confirm_num_bootstrap),
+            ]
 
     print(
         f"\n{'=' * 70}\nSTARTING {dataset} (run_id={run_id})\n"
@@ -169,6 +176,23 @@ def main():
         action="store_true",
         default=False,
         help="Passed through to run_experiment.py's own --no-sensitivity-cache.",
+    )
+    parser.add_argument(
+        "--cusum-confirm-with-sensitivity",
+        action="store_true",
+        default=False,
+        help="Passed through to run_experiment.py's own "
+        "--cusum-confirm-with-sensitivity -- for every dataset in this batch, "
+        "a fired CUSUM alarm gets a one-off sensitivity-style confirmation "
+        "before actually stopping. Off by default.",
+    )
+    parser.add_argument(
+        "--cusum-confirm-num-bootstrap",
+        type=int,
+        default=None,
+        help="Passed through to run_experiment.py's own "
+        "--cusum-confirm-num-bootstrap. Leave unset to reuse each dataset's "
+        "own --sensitivity-num-bootstrap value.",
     )
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(

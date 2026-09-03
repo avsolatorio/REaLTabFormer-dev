@@ -837,6 +837,19 @@ def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
         overfitting_detection_method="cusum",
         cusum_check_every=args.cusum_check_every,
         cusum_delta=args.cusum_delta,
+        cusum_confirm_with_sensitivity=args.cusum_confirm_with_sensitivity,
+        cusum_confirm_num_bootstrap=(
+            args.cusum_confirm_num_bootstrap
+            if args.cusum_confirm_num_bootstrap is not None
+            else args.sensitivity_num_bootstrap
+        ),
+        cusum_confirm_cache_dir=(
+            None if args.no_sensitivity_cache else args.sensitivity_cache_dir
+        ),
+        cusum_confirm_bootstrap_n_jobs=args.sensitivity_bootstrap_n_jobs,
+        cusum_confirm_gen_kwargs=(
+            {"gen_batch": args.gen_batch} if args.gen_batch else None
+        ),
     )
     elapsed = time.time() - t0
     mon = model.cusum_monitor
@@ -1279,6 +1292,32 @@ def main():
         "whether the drift will be slow/gradual or sharp/sudden. Defaults to a "
         "small ensemble; pass a single value (e.g. --cusum-delta 0.5) for the "
         "original single-tracker behavior.",
+    )
+    parser.add_argument(
+        "--cusum-confirm-with-sensitivity",
+        action="store_true",
+        default=False,
+        help="When CUSUM fires, don't stop immediately -- run ONE sensitivity-"
+        "style confirmation check first (one .generate() call plus a bootstrap-"
+        "DCR comparison against a threshold precomputed once before training). "
+        "A confirmed alarm stops as normal; a false alarm resets CUSUM's "
+        "accumulated evidence and training continues until it fires again. "
+        "Exists because CUSUM was found to sometimes fire on a slow, genuine-"
+        "learning trend it can't statistically tell apart from memorization "
+        "onset -- see this investigation's own trajectory-shape findings "
+        "(diabetes/insurance fire sharply in 2-3 checks; abalone/wilt/churn2 "
+        "fire gradually over 6-16). Off by default.",
+    )
+    parser.add_argument(
+        "--cusum-confirm-num-bootstrap",
+        type=int,
+        default=None,
+        help="Bootstrap rounds for the confirmation's own precomputed threshold "
+        "-- only used with --cusum-confirm-with-sensitivity. Defaults to "
+        "--sensitivity-num-bootstrap's own value (itself size-aware unless you "
+        "override it), so the two share a cache entry when frac/qt_max/etc "
+        "also match (the common case) instead of computing the bootstrap "
+        "twice.",
     )
     parser.add_argument(
         "--sensitivity-n-critic",
