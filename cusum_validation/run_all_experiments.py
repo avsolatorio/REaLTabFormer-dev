@@ -66,6 +66,7 @@ def run_one(dataset, args, log_dir: Path) -> dict:
         cmd += ["--gen-batch", str(args.gen_batch)]
     if args.paper_metrics:
         cmd += ["--paper-metrics"]
+        cmd += ["--eval-n-jobs", str(args.eval_n_jobs)]
 
     print(
         f"\n{'=' * 70}\nSTARTING {dataset} (run_id={run_id})\n"
@@ -129,6 +130,17 @@ def main():
         "MLE (CatBoost)/DM (RandomForest discriminator) metrics to every "
         "dataset in the batch. Requires `pip install catboost`; meaningfully "
         "slower per run -- see run_experiment.py's own --help.",
+    )
+    parser.add_argument(
+        "--eval-n-jobs",
+        type=int,
+        default=-1,
+        help="Passed through to run_experiment.py's own --eval-n-jobs "
+        "(only used with --paper-metrics) -- how many of the per-seed "
+        "CatBoost/RandomForest fits to run in parallel across CPU cores. "
+        "Safe to leave at the default (-1, all cores) here since datasets "
+        "in this batch run one at a time, never concurrently with each "
+        "other.",
     )
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(

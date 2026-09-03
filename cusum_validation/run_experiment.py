@@ -482,6 +482,7 @@ def measure_mle(
     n_seeds_synthetic: int = 50,
     n_seeds_real: int = 10,
     dataset_name: str = None,
+    n_jobs: int = 1,
 ):
     """Machine-learning efficacy (MLE) matching the metric definition
     used in the REaLTabFormer paper's benchmark table and the
@@ -525,6 +526,22 @@ def measure_mle(
     already disjoint from real data, so nothing needs excluding there.
     Falls back to CatBoost defaults (no eval_set/early stopping) when
     `dataset_name` is unset or has no tuned config on file.
+
+    `n_jobs`: the 50+10 per-label seed fits are independent (different
+    random seeds, no shared state) and were originally run one at a
+    time -- on a many-core box that leaves most of the CPU idle while
+    GPU-bound model training elsewhere finishes, since a single
+    CatBoost fit here only uses `thread_count` threads (4, from the
+    tuned config). Set `n_jobs=-1` (joblib's own "all cores"
+    convention -- already a dependency via scikit-learn, nothing new
+    to install) to fit seeds in parallel via joblib's process-based
+    backend instead; each worker's own CatBoost `thread_count` is then
+    forced to 1 to avoid oversubscription (n_jobs processes x
+    thread_count threads each would otherwise exceed the core count).
+    Leave at the default `n_jobs=1` (plain sequential, tuned_config's
+    own thread_count honored) when running standalone on a
+    CPU-constrained box, or to keep wall-clock/scheduling predictable
+    for a single run.
     """
     if bench.synth_train_df is None:
         print(f"[{label}] skipping MLE -- no synthetic data registered", flush=True)
@@ -540,8 +557,16 @@ def measure_mle(
         )
         return None
 
+    from joblib import Parallel, delayed
     from sklearn.metrics import f1_score, r2_score
     from sklearn.model_selection import train_test_split
+
+    # Parallelizing across seeds (independent fits) means each worker
+    # process must not ALSO ask CatBoost for `thread_count` threads of
+    # its own -- n_jobs processes x thread_count threads each would
+    # oversubscribe the box. Sequential (n_jobs=1) keeps the tuned
+    # config's own thread_count untouched.
+    per_fit_thread_count = 1 if n_jobs != 1 else None
 
     tuned_config = CATBOOST_TUNED_CONFIGS.get(dataset_name)
     if tuned_config is not None:
@@ -574,6 +599,9 @@ def measure_mle(
         X_train = train_df[feature_cols]
         X_test = bench.test_df[feature_cols]
         fit_kwargs = {}
+        model_config = dict(tuned_config or {})
+        if per_fit_thread_count is not None:
+            model_config["thread_count"] = per_fit_thread_count
 
         if categorical:
             y_train = (train_df[bench.target_col] == bench.target_pos_val).astype(int)
@@ -581,7 +609,7 @@ def measure_mle(
                 int
             )
             model = CatBoostClassifier(
-                **(tuned_config or {}),
+                **model_config,
                 loss_function="Logloss",
                 eval_metric="TotalF1",
                 random_seed=seed,
@@ -598,7 +626,7 @@ def measure_mle(
             y_train = train_df[bench.target_col]
             y_test = bench.test_df[bench.target_col]
             model = CatBoostRegressor(
-                **(tuned_config or {}),
+                **model_config,
                 eval_metric="RMSE",
                 random_seed=seed,
                 verbose=False,
@@ -613,10 +641,12 @@ def measure_mle(
             pred = model.predict(X_test)
             return r2_score(y_test, pred)
 
-    synth_scores = [
-        _fit_score(bench.synth_train_df, s) for s in range(n_seeds_synthetic)
-    ]
-    real_scores = [_fit_score(real_fit_df, s) for s in range(n_seeds_real)]
+    synth_scores = Parallel(n_jobs=n_jobs)(
+        delayed(_fit_score)(bench.synth_train_df, s) for s in range(n_seeds_synthetic)
+    )
+    real_scores = Parallel(n_jobs=n_jobs)(
+        delayed(_fit_score)(real_fit_df, s) for s in range(n_seeds_real)
+    )
 
     metric = "f1_macro" if categorical else "r2"
     result = dict(
@@ -643,7 +673,7 @@ def measure_mle(
     return result
 
 
-def measure_dm(bench, label, summary_path, n_seeds: int = 10):
+def measure_dm(bench, label, summary_path, n_seeds: int = 10, n_jobs: int = 1):
     """Discriminator measure (DM): a classifier's accuracy (as a
     percentage) at telling a real training row from a synthetic one on
     a held-out split -- 50% means real and synthetic are
@@ -662,21 +692,33 @@ def measure_dm(bench, label, summary_path, n_seeds: int = 10):
     `n_seeds` RandomForest fits (same train/test row split from the
     bench each time, only the forest's own random_state varies) for a
     mean+/-std instead of a single noisy draw.
+
+    `n_jobs`: as in `measure_mle`, fits seeds in parallel via joblib
+    when set to -1 (or any value != 1) -- each RandomForest's own
+    `n_jobs` is then forced to 1 (its default -1 would otherwise
+    compete with the outer per-seed parallelism for the same cores;
+    many small independent forests beat one forest with excess inner
+    parallelism here anyway, given how small n_estimators=200 on these
+    dataset sizes actually is per fit).
     """
     if bench.synth_train_df is None or bench.synth_test_df is None:
         print(f"[{label}] skipping DM -- no synthetic data registered", flush=True)
         return None
 
+    from joblib import Parallel, delayed
     from sklearn.ensemble import RandomForestClassifier
     from sklearn.metrics import accuracy_score
 
-    scores = []
-    for seed in range(n_seeds):
+    rf_n_jobs = 1 if n_jobs != 1 else -1
+
+    def _fit_one(seed):
         model = RandomForestClassifier(
-            n_estimators=200, oob_score=True, random_state=seed, n_jobs=-1
+            n_estimators=200, oob_score=True, random_state=seed, n_jobs=rf_n_jobs
         )
         preds = bench.get_discriminator_performance(model)
-        scores.append(100.0 * accuracy_score(preds["y_test"], preds["y_preds"]))
+        return 100.0 * accuracy_score(preds["y_test"], preds["y_preds"])
+
+    scores = Parallel(n_jobs=n_jobs)(delayed(_fit_one)(seed) for seed in range(n_seeds))
 
     result = dict(
         dm_mean=float(np.mean(scores)), dm_std=float(np.std(scores)), n_seeds=n_seeds
@@ -800,8 +842,15 @@ def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
             dataset_name=args.dataset,
+            n_jobs=args.eval_n_jobs,
         )
-        measure_dm(bench, "cusum_stop_at_alarm", summary_path, n_seeds=args.dm_n_seeds)
+        measure_dm(
+            bench,
+            "cusum_stop_at_alarm",
+            summary_path,
+            n_seeds=args.dm_n_seeds,
+            n_jobs=args.eval_n_jobs,
+        )
     print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
 
 
@@ -875,8 +924,15 @@ def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
             dataset_name=args.dataset,
+            n_jobs=args.eval_n_jobs,
         )
-        measure_dm(bench, "full_schedule", summary_path, n_seeds=args.dm_n_seeds)
+        measure_dm(
+            bench,
+            "full_schedule",
+            summary_path,
+            n_seeds=args.dm_n_seeds,
+            n_jobs=args.eval_n_jobs,
+        )
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -988,8 +1044,15 @@ def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_v
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
             dataset_name=args.dataset,
+            n_jobs=args.eval_n_jobs,
         )
-        measure_dm(bench, "sensitivity_stop", summary_path, n_seeds=args.dm_n_seeds)
+        measure_dm(
+            bench,
+            "sensitivity_stop",
+            summary_path,
+            n_seeds=args.dm_n_seeds,
+            n_jobs=args.eval_n_jobs,
+        )
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -1041,8 +1104,15 @@ def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_p
             n_seeds_synthetic=args.mle_n_seeds_synthetic,
             n_seeds_real=args.mle_n_seeds_real,
             dataset_name=args.dataset,
+            n_jobs=args.eval_n_jobs,
         )
-        measure_dm(bench, "checkpoint_recheck", summary_path, n_seeds=args.dm_n_seeds)
+        measure_dm(
+            bench,
+            "checkpoint_recheck",
+            summary_path,
+            n_seeds=args.dm_n_seeds,
+            n_jobs=args.eval_n_jobs,
+        )
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -1151,6 +1221,21 @@ def main():
         default=10,
         help="RandomForest discriminator fits, different seeds each -- only "
         "used with --paper-metrics.",
+    )
+    parser.add_argument(
+        "--eval-n-jobs",
+        type=int,
+        default=-1,
+        help="Only used with --paper-metrics: how many of the per-seed "
+        "CatBoost/RandomForest fits to run in parallel (joblib's own "
+        "convention -- -1 means all cores, 1 means the old fully-sequential "
+        "behavior). These fits are CPU-only and independent regardless of "
+        "--device, so this is what actually uses a machine's extra CPU "
+        "cores during the MLE/DM step -- GPU is already used for the "
+        "REaLTabFormer training itself via --device and isn't affected by "
+        "this flag. Defaults to using every core; pass 1 to go back to "
+        "sequential (e.g. for predictable wall-clock on a shared box), or a "
+        "smaller positive number to cap how many cores this step claims.",
     )
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(
