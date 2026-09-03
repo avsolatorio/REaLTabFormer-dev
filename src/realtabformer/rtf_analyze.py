@@ -620,7 +620,6 @@ class SyntheticDataBench:
     @staticmethod
     def _sensitivity_threshold_cache_key(
         train_data: pd.DataFrame,
-        num_bootstrap: int,
         frac: float,
         qt_max: float,
         qt_interval: int,
@@ -634,13 +633,21 @@ class SyntheticDataBench:
         """Content-based cache key for `compute_sensitivity_threshold`'s
         bootstrap loop: hashes `train_data`'s actual values (not just
         its shape) via pandas' own per-row hashing, combined with
-        every parameter that affects the bootstrap computation, so a
-        different dataset or a different setting never collides with
-        an unrelated cache entry. `frac` here is the FINAL, already-
-        resolved value (post `test_size`/`full_sensitivity` adjustment
-        in the caller), matching exactly what `bootstrap_inner_loop`
-        actually uses -- not the raw, possibly-`None` constructor
-        argument.
+        every parameter that affects an individual bootstrap round's
+        result, so a different dataset or a different setting never
+        collides with an unrelated cache entry. `frac` here is the
+        FINAL, already-resolved value (post `test_size`/
+        `full_sensitivity` adjustment in the caller), matching exactly
+        what `bootstrap_inner_loop` actually uses -- not the raw,
+        possibly-`None` constructor argument.
+
+        Deliberately excludes `num_bootstrap`: each round is an
+        independent, identically-distributed draw, so a cache entry is
+        a growable POOL of rounds for a given config, not a snapshot
+        tied to one exact count -- asking for more rounds than are
+        cached extends the same file (computing only the shortfall);
+        asking for fewer just reads a prefix of it. See
+        `compute_sensitivity_threshold`'s own cache handling.
         """
         row_hashes = pd.util.hash_pandas_object(train_data, index=True).values
         data_digest = hashlib.sha256(row_hashes.tobytes()).hexdigest()[:16]
@@ -648,7 +655,6 @@ class SyntheticDataBench:
             str(part)
             for part in [
                 data_digest,
-                num_bootstrap,
                 frac,
                 qt_max,
                 qt_interval,
@@ -699,23 +705,28 @@ class SyntheticDataBench:
             sensitivity_orig_frac_multiple: The size of the training data relative to the chosen `frac` that will be
              used in computing the sensitivity. The larger this value is, the more robust the sensitivity threshold
              will be. However, `(sensitivity_orig_frac_multiple + 2)` multiplied by `frac` must be less than 1.
-            cache_dir: When set, this method's whole `num_bootstrap`-round
-             loop -- expensive, and entirely independent of any trained
-             model since it only ever resamples `train_data` against
-             itself -- is cached to disk, keyed on `train_data`'s own
-             content plus every parameter that affects the result (see
-             `_sensitivity_threshold_cache_key`). A cache hit skips the
-             loop entirely. IMPORTANT: `bootstrap_inner_loop`'s
-             `train_test_split` calls are NOT seeded, so this method's
-             output is already one particular random realization of the
-             bootstrap on every call, not a deterministic function of
-             its inputs -- caching means REUSING that one realization on
-             a hit rather than drawing a fresh one, which is just as
-             statistically valid (same null distribution, same
-             `num_bootstrap` draw count) but means repeated cache-hit
-             calls stop seeing fresh sampling noise between them.
-             `None` (default): no caching, identical behavior to before
-             this parameter existed.
+            cache_dir: When set, this method's `num_bootstrap`-round loop
+             -- expensive, and entirely independent of any trained model
+             since it only ever resamples `train_data` against itself --
+             is cached to disk as a growable POOL of rounds, keyed on
+             `train_data`'s own content plus every parameter that
+             affects an individual round's result EXCEPT `num_bootstrap`
+             itself (see `_sensitivity_threshold_cache_key`): asking for
+             more rounds than are cached computes only the shortfall and
+             extends the same cache file; asking for the same or fewer
+             skips computation entirely and reads a prefix of it. E.g. a
+             prior `num_bootstrap=500` run followed by a
+             `num_bootstrap=1000` run (same data/settings) only ever
+             computes 500 fresh rounds, not 1000. IMPORTANT:
+             `bootstrap_inner_loop`'s `train_test_split` calls are NOT
+             seeded, so each round is already one particular random
+             realization, not a deterministic function of its inputs --
+             caching means REUSING previously-drawn rounds rather than
+             redrawing them, which is just as statistically valid (still
+             i.i.d. draws of the same null distribution) but means a
+             cache hit doesn't see fresh sampling noise on those reused
+             rounds. `None` (default): no caching, identical behavior to
+             before this parameter existed.
             n_jobs: Explicit joblib worker count for the bootstrap loop
              (joblib's own convention -- `-1` means every core). `None`
              (default): falls back to the original heuristic
@@ -750,12 +761,12 @@ class SyntheticDataBench:
             assert (sensitivity_orig_frac_multiple + 2) * frac <= 1
 
         cache_path = None
+        cached_values: List[float] = []
         if cache_dir is not None:
             cache_dir = Path(cache_dir)
             cache_dir.mkdir(parents=True, exist_ok=True)
             cache_key = SyntheticDataBench._sensitivity_threshold_cache_key(
                 train_data,
-                num_bootstrap,
                 frac,
                 qt_max,
                 qt_interval,
@@ -768,12 +779,25 @@ class SyntheticDataBench:
             )
             cache_path = cache_dir / f"sensitivity_threshold_{cache_key}.json"
             if cache_path.exists():
-                values = json.loads(cache_path.read_text())
+                cached_values = json.loads(cache_path.read_text())
+                if len(cached_values) >= num_bootstrap:
+                    values = cached_values[:num_bootstrap]
+                    print(
+                        f"Reusing {num_bootstrap} of {len(cached_values)} "
+                        f"cached sensitivity threshold rounds from "
+                        f"{cache_path} -- no new bootstrap rounds needed"
+                    )
+                    return values if return_values else np.quantile(values, quantile)
                 print(
-                    f"Loaded cached sensitivity threshold bootstrap "
-                    f"({len(values)} values) from {cache_path}"
+                    f"Found {len(cached_values)} cached sensitivity "
+                    f"threshold rounds at {cache_path}; computing the "
+                    f"remaining {num_bootstrap - len(cached_values)} fresh"
                 )
-                return values if return_values else np.quantile(values, quantile)
+
+        # Only the shortfall needs computing -- either every round (no
+        # cache, or cache_dir unset) or whatever's missing from a
+        # smaller cached pool (see above).
+        rounds_needed = num_bootstrap - len(cached_values)
 
         def bootstrap_inner_loop():
             original: pd.DataFrame = None
@@ -819,26 +843,37 @@ class SyntheticDataBench:
                 n_jobs = min(max(2, cpu_count // 4), 16)
 
         if n_jobs == 1:
-            for _ in tqdm(range(num_bootstrap), desc="Bootstrap round"):
+            for _ in tqdm(range(rounds_needed), desc="Bootstrap round"):
                 values.append(bootstrap_inner_loop())
         else:
             print("Using parallel computation!!!")
             with joblib.Parallel(n_jobs=n_jobs) as parallel:
                 values = parallel(
                     joblib.delayed(bootstrap_inner_loop)()
-                    for _ in tqdm(range(num_bootstrap), desc="Bootstrap round")
+                    for _ in tqdm(range(rounds_needed), desc="Bootstrap round")
                 )
+
+        # `values` entries are numpy scalars (from `.mean()` etc in
+        # compute_sensitivity_metric) -- normalize to plain floats before
+        # combining with `cached_values` (already plain floats, loaded
+        # from JSON) or serializing.
+        values = [float(v) for v in values]
+
+        if cached_values:
+            # Prepend the reused rounds -- order doesn't matter
+            # statistically (i.i.d. draws), but keeping the cached
+            # portion first means a later, even-larger request extends
+            # from a stable prefix rather than reshuffling what's cached.
+            values = cached_values + values
 
         print("Sensitivity threshold summary:")
         print(pd.Series(values).describe())
 
         if cache_path is not None:
-            # `values` entries are numpy scalars (from `.mean()` etc in
-            # compute_sensitivity_metric), not JSON-serializable as-is.
-            cache_path.write_text(json.dumps([float(v) for v in values]))
+            cache_path.write_text(json.dumps(values))
             print(
-                f"Cached sensitivity threshold bootstrap ({len(values)} "
-                f"values) to {cache_path}"
+                f"Cached sensitivity threshold bootstrap pool "
+                f"({len(values)} rounds total) to {cache_path}"
             )
 
         return values if return_values else np.quantile(values, quantile)
