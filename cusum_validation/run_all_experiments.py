@@ -64,6 +64,8 @@ def run_one(dataset, args, log_dir: Path) -> dict:
     ]
     if args.gen_batch:
         cmd += ["--gen-batch", str(args.gen_batch)]
+    if args.paper_metrics:
+        cmd += ["--paper-metrics"]
 
     print(
         f"\n{'=' * 70}\nSTARTING {dataset} (run_id={run_id})\n"
@@ -118,6 +120,15 @@ def main():
         type=int,
         default=None,
         help="Passed through to run_experiment.py -- see its own --help.",
+    )
+    parser.add_argument(
+        "--paper-metrics",
+        action="store_true",
+        default=False,
+        help="Passed through to run_experiment.py -- adds the paper-matching "
+        "MLE (CatBoost)/DM (RandomForest discriminator) metrics to every "
+        "dataset in the batch. Requires `pip install catboost`; meaningfully "
+        "slower per run -- see run_experiment.py's own --help.",
     )
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(

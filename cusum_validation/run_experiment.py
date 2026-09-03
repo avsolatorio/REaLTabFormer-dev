@@ -55,6 +55,27 @@ still leaves usable, committable data:
 After running, commit the `results/` directory's new files back to the
 repo (they're plain JSON/JSONL, small, and are exactly what the
 research log needs to pick this validation back up).
+
+Pass `--paper-metrics` to additionally compute MLE and DM matching the
+REaLTabFormer paper's own published benchmark table (Table 1): MLE
+(machine-learning efficacy -- macro-F1 for classification, R^2 for
+regression) via CatBoost trained repeatedly on TSTR/TRTR and scored
+mean+/-std over many seeds, the same methodology as the tab-ddpm
+benchmark framework (github.com/rotot0/tab-ddpm,
+scripts/eval_catboost.py) that avsolatorio/REaLTabFormer-Experiments
+reuses -- confirmed by reading that framework's actual eval code, not
+guessed from file naming. DM (discriminator measure -- a classifier's
+accuracy at telling real from synthetic rows apart, 50% = best/
+indistinguishable) reuses this library's own
+`SyntheticDataBench.get_discriminator_performance`, with
+RandomForestClassifier(oob_score=True) as the default model -- the
+only model type that method's own oob_score_ check would report
+anything for, strongly suggesting it's what the paper's own DM column
+was computed with. Requires `pip install catboost` (not otherwise a
+dependency of this script or the library); off by default since it's
+meaningfully more expensive than the existing frac_suspicious/AUC-or-R2
+check (default 50 synthetic-seed + 10 real-seed CatBoost fits, plus 10
+RandomForest fits, per label).
 """
 
 import argparse
@@ -360,6 +381,166 @@ def measure_utility(bench, label, summary_path, categorical: bool = True):
     return result
 
 
+def measure_mle(
+    bench,
+    label,
+    summary_path,
+    categorical: bool,
+    n_seeds_synthetic: int = 50,
+    n_seeds_real: int = 10,
+):
+    """Machine-learning efficacy (MLE) matching the metric definition
+    used in the REaLTabFormer paper's benchmark table and the
+    tab-ddpm evaluation framework it's built on (rotot0/tab-ddpm,
+    scripts/eval_catboost.py -- confirmed by reading that script, not
+    guessed): CatBoost trained repeatedly, on different seeds, on TSTR
+    (synthetic) and separately on TRTR (real), each scored against the
+    SAME real held-out test set -- macro-F1 for classification, R^2
+    for regression -- reporting mean+/-std over the repeats. This is a
+    materially more expensive but also more statistically grounded
+    version of `measure_utility`'s single-fit AUC/R^2 check: a single
+    fit's own training-seed variance is exactly what a single-seed
+    check can't tell apart from a real effect (this is what would have
+    settled whether wilt's utility-gap jump after the calibration-pace
+    fix was signal or noise, instead of just flagging it as an open
+    question).
+
+    Defaults (50 synthetic-seed fits, 10 real-seed fits) mirror
+    tab-ddpm's own eval_seeds.py defaults, for direct comparability
+    with the numbers already published for these same datasets.
+    """
+    if bench.synth_train_df is None:
+        print(f"[{label}] skipping MLE -- no synthetic data registered", flush=True)
+        return None
+
+    try:
+        from catboost import CatBoostClassifier, CatBoostRegressor
+    except ImportError:
+        print(
+            f"[{label}] skipping MLE -- catboost not installed "
+            "(pip install catboost)",
+            flush=True,
+        )
+        return None
+
+    from sklearn.metrics import f1_score, r2_score
+
+    feature_cols = [c for c in bench.train_df.columns if c != bench.target_col]
+    cat_feature_idx = [
+        i for i, c in enumerate(feature_cols) if bench.train_df[c].dtype == object
+    ]
+
+    def _fit_score(train_df, seed):
+        X_train = train_df[feature_cols]
+        X_test = bench.test_df[feature_cols]
+        if categorical:
+            y_train = (train_df[bench.target_col] == bench.target_pos_val).astype(int)
+            y_test = (bench.test_df[bench.target_col] == bench.target_pos_val).astype(
+                int
+            )
+            model = CatBoostClassifier(
+                loss_function="Logloss",
+                eval_metric="TotalF1",
+                random_seed=seed,
+                verbose=False,
+                cat_features=cat_feature_idx,
+            )
+            model.fit(X_train, y_train)
+            pred = (model.predict_proba(X_test)[:, 1] >= 0.5).astype(int)
+            return f1_score(y_test, pred, average="macro")
+        else:
+            y_train = train_df[bench.target_col]
+            y_test = bench.test_df[bench.target_col]
+            model = CatBoostRegressor(
+                eval_metric="RMSE",
+                random_seed=seed,
+                verbose=False,
+                cat_features=cat_feature_idx,
+            )
+            model.fit(X_train, y_train)
+            pred = model.predict(X_test)
+            return r2_score(y_test, pred)
+
+    synth_scores = [
+        _fit_score(bench.synth_train_df, s) for s in range(n_seeds_synthetic)
+    ]
+    real_scores = [_fit_score(bench.train_df, s) for s in range(n_seeds_real)]
+
+    metric = "f1_macro" if categorical else "r2"
+    result = dict(
+        metric=metric,
+        synthetic_mean=float(np.mean(synth_scores)),
+        synthetic_std=float(np.std(synth_scores)),
+        real_mean=float(np.mean(real_scores)),
+        real_std=float(np.std(real_scores)),
+        n_seeds_synthetic=n_seeds_synthetic,
+        n_seeds_real=n_seeds_real,
+    )
+    print(
+        f"[{label}] MLE ({metric}): synthetic={result['synthetic_mean']:.4f}"
+        f"±{result['synthetic_std']:.4f}  real={result['real_mean']:.4f}"
+        f"±{result['real_std']:.4f}",
+        flush=True,
+    )
+    existing = {}
+    if summary_path.exists():
+        existing = json.loads(summary_path.read_text())
+    existing[f"{label}_mle"] = result
+    summary_path.write_text(json.dumps(existing, indent=2))
+    return result
+
+
+def measure_dm(bench, label, summary_path, n_seeds: int = 10):
+    """Discriminator measure (DM): a classifier's accuracy (as a
+    percentage) at telling a real training row from a synthetic one on
+    a held-out split -- 50% means real and synthetic are
+    indistinguishable (best case), 100% means trivially separable.
+    Reuses this library's own
+    `SyntheticDataBench.get_discriminator_performance` rather than
+    reimplementing it -- `compute_discriminator_predictions` already
+    does exactly this, including an `oob_score_` check that only a
+    bagging ensemble like RandomForestClassifier(oob_score=True)
+    satisfies, which is a strong signal that's the model type the
+    paper's own DM column was computed with (confirmed by reading that
+    method's code, not assumed). Test classes are balanced by
+    construction (equal real/synthetic counts in the held-out split),
+    so plain accuracy is the right metric here, unlike an imbalanced
+    classification problem where it wouldn't be. Repeated over
+    `n_seeds` RandomForest fits (same train/test row split from the
+    bench each time, only the forest's own random_state varies) for a
+    mean+/-std instead of a single noisy draw.
+    """
+    if bench.synth_train_df is None or bench.synth_test_df is None:
+        print(f"[{label}] skipping DM -- no synthetic data registered", flush=True)
+        return None
+
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.metrics import accuracy_score
+
+    scores = []
+    for seed in range(n_seeds):
+        model = RandomForestClassifier(
+            n_estimators=200, oob_score=True, random_state=seed, n_jobs=-1
+        )
+        preds = bench.get_discriminator_performance(model)
+        scores.append(100.0 * accuracy_score(preds["y_test"], preds["y_preds"]))
+
+    result = dict(
+        dm_mean=float(np.mean(scores)), dm_std=float(np.std(scores)), n_seeds=n_seeds
+    )
+    print(
+        f"[{label}] DM: {result['dm_mean']:.2f}±{result['dm_std']:.2f}% "
+        "(50% = indistinguishable from real, best case)",
+        flush=True,
+    )
+    existing = {}
+    if summary_path.exists():
+        existing = json.loads(summary_path.read_text())
+    existing[f"{label}_dm"] = result
+    summary_path.write_text(json.dumps(existing, indent=2))
+    return result
+
+
 def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
     bench = SyntheticDataBench(
         data=full_df,
@@ -457,6 +638,16 @@ def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
         gen_batch=args.gen_batch,
     )
     measure_utility(bench, "cusum_stop_at_alarm", summary_path, categorical=categorical)
+    if args.paper_metrics:
+        measure_mle(
+            bench,
+            "cusum_stop_at_alarm",
+            summary_path,
+            categorical=categorical,
+            n_seeds_synthetic=args.mle_n_seeds_synthetic,
+            n_seeds_real=args.mle_n_seeds_real,
+        )
+        measure_dm(bench, "cusum_stop_at_alarm", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {trajectory_path} and {summary_path}", flush=True)
 
 
@@ -521,6 +712,16 @@ def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
         gen_batch=args.gen_batch,
     )
     measure_utility(bench, "full_schedule", summary_path, categorical=categorical)
+    if args.paper_metrics:
+        measure_mle(
+            bench,
+            "full_schedule",
+            summary_path,
+            categorical=categorical,
+            n_seeds_synthetic=args.mle_n_seeds_synthetic,
+            n_seeds_real=args.mle_n_seeds_real,
+        )
+        measure_dm(bench, "full_schedule", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -623,6 +824,16 @@ def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_v
         gen_batch=args.gen_batch,
     )
     measure_utility(bench, "sensitivity_stop", summary_path, categorical=categorical)
+    if args.paper_metrics:
+        measure_mle(
+            bench,
+            "sensitivity_stop",
+            summary_path,
+            categorical=categorical,
+            n_seeds_synthetic=args.mle_n_seeds_synthetic,
+            n_seeds_real=args.mle_n_seeds_real,
+        )
+        measure_dm(bench, "sensitivity_stop", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -665,6 +876,16 @@ def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_p
         gen_batch=args.gen_batch,
     )
     measure_utility(bench, "checkpoint_recheck", summary_path, categorical=categorical)
+    if args.paper_metrics:
+        measure_mle(
+            bench,
+            "checkpoint_recheck",
+            summary_path,
+            categorical=categorical,
+            n_seeds_synthetic=args.mle_n_seeds_synthetic,
+            n_seeds_real=args.mle_n_seeds_real,
+        )
+        measure_dm(bench, "checkpoint_recheck", summary_path, n_seeds=args.dm_n_seeds)
     print(f"\nWrote {summary_path}", flush=True)
 
 
@@ -741,6 +962,39 @@ def main():
     )
     parser.add_argument("--sensitivity-n-critic-stop", type=int, default=2)
     parser.add_argument("--sensitivity-num-bootstrap", type=int, default=500)
+    parser.add_argument(
+        "--paper-metrics",
+        action="store_true",
+        default=False,
+        help="Additionally compute MLE (CatBoost, macro-F1/R^2, TSTR+TRTR, "
+        "mean+/-std over many seeds) and DM (RandomForest discriminator "
+        "accuracy) matching the REaLTabFormer paper's own benchmark table "
+        "methodology -- see the module docstring. Requires `pip install "
+        "catboost`; off by default since it's meaningfully more expensive "
+        "than the existing frac_suspicious/AUC-or-R2 check.",
+    )
+    parser.add_argument(
+        "--mle-n-seeds-synthetic",
+        type=int,
+        default=50,
+        help="CatBoost fits on the synthetic (TSTR) data, different seeds "
+        "each -- only used with --paper-metrics. Matches tab-ddpm's own "
+        "eval_seeds.py default.",
+    )
+    parser.add_argument(
+        "--mle-n-seeds-real",
+        type=int,
+        default=10,
+        help="CatBoost fits on the real (TRTR) data -- only used with "
+        "--paper-metrics. Matches tab-ddpm's own eval_seeds.py default.",
+    )
+    parser.add_argument(
+        "--dm-n-seeds",
+        type=int,
+        default=10,
+        help="RandomForest discriminator fits, different seeds each -- only "
+        "used with --paper-metrics.",
+    )
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(
         "--run-id",
