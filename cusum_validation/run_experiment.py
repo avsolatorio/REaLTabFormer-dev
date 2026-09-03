@@ -84,13 +84,21 @@ meaningfully more expensive than the existing frac_suspicious/AUC-or-R2
 check (default 50 synthetic-seed + 10 real-seed CatBoost fits, plus 10
 RandomForest fits, per label).
 
-Sensitivity mode's own expensive part -- a pre-training, num_bootstrap
-=500-round threshold computation that only ever resamples the training
-data against itself (no model involved) -- is cached to disk by
-default (see --sensitivity-cache-dir/--no-sensitivity-cache), so a
-repeat run against the same dataset skips it entirely; and its
-parallelism defaults to every CPU core (--sensitivity-bootstrap-n-jobs
--1) rather than the library's own conservative built-in cap.
+Sensitivity mode's own expensive part -- a pre-training bootstrap
+threshold computation that only ever resamples the training data
+against itself (no model involved) -- is cached to disk by default
+(see --sensitivity-cache-dir/--no-sensitivity-cache), as a growable
+pool of rounds rather than an exact-num_bootstrap snapshot: asking for
+more than what's cached only computes the shortfall and extends the
+same file. Its parallelism defaults to every CPU core
+(--sensitivity-bootstrap-n-jobs -1) rather than the library's own
+conservative built-in cap. And --sensitivity-num-bootstrap itself
+defaults to a size-aware heuristic instead of a flat 500 -- small
+datasets measurably need more rounds for a stable threshold (~29%
+run-to-run instability at 500 rounds on a 768-row dataset), large ones
+are already stable at 500 and each round gets more expensive as the
+dataset grows, so the default scales down accordingly (see
+default_sensitivity_num_bootstrap).
 """
 
 import argparse
@@ -1182,6 +1190,33 @@ def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_p
         sync_results_to_repo(Path(args.output_dir), run_id)
 
 
+def default_sensitivity_num_bootstrap(n_rows: int) -> int:
+    """Size-aware default for --sensitivity-num-bootstrap, replacing a
+    single fixed 500 for every dataset. Empirically calibrated (not
+    guessed): at the library's real defaults (frac=0.165/2, qt_max=
+    0.05, qt_interval=100), an unseeded sensitivity threshold varied
+    ~29% run-to-run on a 768-row dataset at num_bootstrap=500 --
+    bumping to ~2000 rounds there cut that to ~7%. But at 1500 and
+    5000 rows, the SAME num_bootstrap=500 was *already* down to ~10%
+    spread -- evidently a fixed `frac` means a bigger dataset gives
+    bigger, less noisy per-round subsets for free, so bigger datasets
+    need FEWER extra rounds for the same stability, not more (the
+    opposite of what you'd want if you just scaled --sensitivity-
+    num-bootstrap up for every dataset uniformly, since each round
+    also gets more expensive as the dataset grows).
+
+    `1_500_000 // n_rows`, clipped to [500, 4000], reproduces ~2000 at
+    n=768 (the verified-good value) and decays to the 500 floor by
+    around n=3000 (matching 1500/5000 rows both already being fine at
+    500). This is a starting point from three calibration points, not
+    a precisely-derived formula -- the growable cache (see
+    SyntheticDataBench.compute_sensitivity_threshold's cache_dir) means
+    it's cheap to ask for more later if a specific dataset still looks
+    unstable at this default.
+    """
+    return int(np.clip(round(1_500_000 / max(n_rows, 1)), 500, 4000))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1254,7 +1289,19 @@ def main():
         "method's own default.",
     )
     parser.add_argument("--sensitivity-n-critic-stop", type=int, default=2)
-    parser.add_argument("--sensitivity-num-bootstrap", type=int, default=500)
+    parser.add_argument(
+        "--sensitivity-num-bootstrap",
+        type=int,
+        default=None,
+        help="Bootstrap rounds for sensitivity's pre-training threshold "
+        "computation. Defaults to a size-aware heuristic (see "
+        "default_sensitivity_num_bootstrap) instead of a fixed 500 -- "
+        "small datasets get meaningfully more rounds (measured ~29% "
+        "run-to-run threshold instability at 500 rounds on a 768-row "
+        "dataset), large ones stay at the 500 floor (already stable "
+        "there, and each round gets more expensive as the dataset "
+        "grows). Pass an explicit value to override.",
+    )
     parser.add_argument(
         "--sensitivity-cache-dir",
         default=str(SCRIPT_DIR / "results" / ".sensitivity_cache"),
@@ -1370,6 +1417,15 @@ def main():
     print(f"Loading {args.dataset} data from {DATA_DIR} ...", flush=True)
     full_df = loader()
     print(f"full cleaned dataset: {len(full_df)} rows", flush=True)
+
+    if args.sensitivity_num_bootstrap is None:
+        args.sensitivity_num_bootstrap = default_sensitivity_num_bootstrap(len(full_df))
+        print(
+            f"--sensitivity-num-bootstrap not set; using size-aware default "
+            f"{args.sensitivity_num_bootstrap} for this {len(full_df)}-row "
+            "dataset",
+            flush=True,
+        )
 
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
