@@ -506,6 +506,19 @@ class REaLTabFormer:
         cusum_max_calibration_epochs: float = 10.0,
         cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
+        cusum_confirm_with_sensitivity: bool = False,
+        cusum_confirm_frac: float = 0.165,
+        cusum_confirm_frac_max_data: int = 10000,
+        cusum_confirm_qt_max: Union[str, float] = 0.05,
+        cusum_confirm_qt_max_default: float = 0.05,
+        cusum_confirm_qt_interval: int = 100,
+        cusum_confirm_num_bootstrap: int = 500,
+        cusum_confirm_quantile: float = 0.95,
+        cusum_confirm_sensitivity_orig_frac_multiple: int = 4,
+        cusum_confirm_sensitivity_max_col_nums: int = 20,
+        cusum_confirm_cache_dir: Optional[Union[str, Path]] = None,
+        cusum_confirm_bootstrap_n_jobs: Optional[int] = None,
+        cusum_confirm_gen_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
 
@@ -615,6 +628,15 @@ class REaLTabFormer:
               any tracker crosses its own (Bonferroni-corrected) threshold.
             cusum_target_far: Only used when `overfitting_detection_method="cusum"`. Target
               false-alarm rate for the detector's decision threshold.
+            cusum_confirm_with_sensitivity: Only used when
+              `overfitting_detection_method="cusum"`. When True, a fired
+              alarm triggers a ONE-OFF sensitivity-style confirmation
+              (one `.generate()` call plus a bootstrap-DCR comparison,
+              not `_train_with_sensitivity`'s full periodic schedule)
+              before actually stopping -- a false-alarm result clears
+              CUSUM's accumulated evidence and training continues. See
+              `_train_with_cusum`'s own docstring for the full rationale
+              and every `cusum_confirm_*` parameter's meaning.
 
         Returns:
             Trainer
@@ -660,6 +682,23 @@ class REaLTabFormer:
                     cusum_max_calibration_epochs=cusum_max_calibration_epochs,
                     cusum_delta=cusum_delta,
                     cusum_target_far=cusum_target_far,
+                    cusum_confirm_with_sensitivity=cusum_confirm_with_sensitivity,
+                    cusum_confirm_frac=cusum_confirm_frac,
+                    cusum_confirm_frac_max_data=cusum_confirm_frac_max_data,
+                    cusum_confirm_qt_max=cusum_confirm_qt_max,
+                    cusum_confirm_qt_max_default=cusum_confirm_qt_max_default,
+                    cusum_confirm_qt_interval=cusum_confirm_qt_interval,
+                    cusum_confirm_num_bootstrap=cusum_confirm_num_bootstrap,
+                    cusum_confirm_quantile=cusum_confirm_quantile,
+                    cusum_confirm_sensitivity_orig_frac_multiple=(
+                        cusum_confirm_sensitivity_orig_frac_multiple
+                    ),
+                    cusum_confirm_sensitivity_max_col_nums=(
+                        cusum_confirm_sensitivity_max_col_nums
+                    ),
+                    cusum_confirm_cache_dir=cusum_confirm_cache_dir,
+                    cusum_confirm_bootstrap_n_jobs=cusum_confirm_bootstrap_n_jobs,
+                    cusum_confirm_gen_kwargs=cusum_confirm_gen_kwargs,
                 )
             elif overfitting_detection_method == "none" or n_critic <= 0:
                 # NOTE: field_weights/predict_fields/compute_loss_func were
@@ -1710,6 +1749,125 @@ class REaLTabFormer:
 
         return trainer
 
+    def _build_cusum_confirm_fn(
+        self,
+        df: pd.DataFrame,
+        device,
+        frac: float,
+        frac_max_data: int,
+        qt_max: Union[str, float],
+        qt_max_default: float,
+        qt_interval: int,
+        num_bootstrap: int,
+        quantile: float,
+        sensitivity_orig_frac_multiple: int,
+        sensitivity_max_col_nums: int,
+        cache_dir: Optional[Union[str, Path]],
+        bootstrap_n_jobs: Optional[int],
+        gen_kwargs: Optional[Dict[str, Any]],
+    ):
+        """Builds the `confirm_fn` `CUSUMEarlyStoppingCallback` calls
+        when CUSUM fires (see `_train_with_cusum`'s
+        `cusum_confirm_with_sensitivity`). Precomputes the sensitivity
+        bootstrap threshold ONCE, here, before training starts --
+        mirrors `_train_with_sensitivity`'s own setup (same
+        `qt_max="compute"` duplicate-rate handling, same `frac_max_data`
+        cap, same `SyntheticDataBench.compute_sensitivity_threshold`
+        call, now with `cache_dir`/`n_jobs` since this reuses the
+        growable, parallelizable cache built for that same computation)
+        -- so the per-alarm confirmation itself only ever pays for the
+        cheap part: one `.generate()` call plus one
+        `compute_sensitivity_metric` comparison, not another bootstrap
+        round.
+
+        The non-`full_sensitivity` original/synthetic/test split (the
+        library's own real default) is used throughout, for direct
+        comparability with `_train_with_sensitivity`'s own numbers on
+        the same data/settings.
+        """
+        frac = min(frac, frac_max_data / len(df))
+
+        if isinstance(qt_max, str):
+            if qt_max != "compute":
+                raise ValueError(f"Unexpected qt_max value: {qt_max}")
+            dup_rate = df.duplicated().mean() / 2
+            qt_max = dup_rate if dup_rate > 0 else qt_max_default
+
+        print(
+            "Computing the CUSUM-confirmation sensitivity threshold...",
+            flush=True,
+        )
+        sensitivity_values = SyntheticDataBench.compute_sensitivity_threshold(
+            train_data=df,
+            num_bootstrap=num_bootstrap,
+            frac=frac / 2,
+            qt_max=qt_max,
+            qt_interval=qt_interval,
+            return_values=True,
+            quantile=quantile,
+            max_col_nums=sensitivity_max_col_nums,
+            full_sensitivity=False,
+            sensitivity_orig_frac_multiple=sensitivity_orig_frac_multiple,
+            cache_dir=cache_dir,
+            n_jobs=bootstrap_n_jobs,
+        )
+        sensitivity_threshold = float(np.quantile(sensitivity_values, quantile))
+        print(
+            f"CUSUM-confirmation sensitivity threshold: {sensitivity_threshold}",
+            flush=True,
+        )
+
+        gen_total = int(len(df) * frac)
+        n_train_size = sensitivity_orig_frac_multiple * gen_total
+
+        def confirm_fn(model) -> bool:
+            if len(df) < n_train_size + gen_total:
+                # Not enough training data left to draw a disjoint
+                # original/test split at this frac/multiple -- fail
+                # open (let the alarm stand) rather than crash on a
+                # config this small.
+                return True
+            try:
+                gen_df = self.sample(
+                    n_samples=gen_total, device=device, **(gen_kwargs or {})
+                )
+            except SampleEmptyLimitError:
+                # Can't generate stable samples yet -- not evidence of
+                # memorization either way; treat as unconfirmed so
+                # training continues rather than crashing or stopping
+                # on a model that isn't generating usefully yet.
+                print(
+                    "CUSUM-confirm: model can't generate stable samples "
+                    "yet -- treating alarm as unconfirmed",
+                    flush=True,
+                )
+                return False
+            if len(gen_df) < gen_total:
+                return False
+
+            original_df = df.sample(n=n_train_size, replace=False)
+            test_df = df.loc[df.index.difference(original_df.index)].sample(
+                n=gen_total, replace=False
+            )
+            val_sensitivity = SyntheticDataBench.compute_sensitivity_metric(
+                original=original_df,
+                synthetic=gen_df.iloc[:gen_total],
+                test=test_df,
+                qt_max=qt_max,
+                qt_interval=qt_interval,
+                max_col_nums=sensitivity_max_col_nums,
+            )
+            confirmed = val_sensitivity >= sensitivity_threshold
+            print(
+                f"CUSUM-confirm: val_sensitivity={val_sensitivity:.5f} "
+                f"threshold={sensitivity_threshold:.5f} -> "
+                + ("CONFIRMED, stopping" if confirmed else "false alarm, continuing"),
+                flush=True,
+            )
+            return confirmed
+
+        return confirm_fn
+
     def _train_with_cusum(
         self,
         df: pd.DataFrame,
@@ -1724,6 +1882,19 @@ class REaLTabFormer:
         cusum_target_far: float = 0.01,
         cusum_seen_pool_size: int = 256,
         cusum_min_seen_pool: int = 32,
+        cusum_confirm_with_sensitivity: bool = False,
+        cusum_confirm_frac: float = 0.165,
+        cusum_confirm_frac_max_data: int = 10000,
+        cusum_confirm_qt_max: Union[str, float] = 0.05,
+        cusum_confirm_qt_max_default: float = 0.05,
+        cusum_confirm_qt_interval: int = 100,
+        cusum_confirm_num_bootstrap: int = 500,
+        cusum_confirm_quantile: float = 0.95,
+        cusum_confirm_sensitivity_orig_frac_multiple: int = 4,
+        cusum_confirm_sensitivity_max_col_nums: int = 20,
+        cusum_confirm_cache_dir: Optional[Union[str, Path]] = None,
+        cusum_confirm_bootstrap_n_jobs: Optional[int] = None,
+        cusum_confirm_gen_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Trainer:
         """Train with the CUSUM-based, generation-free overfitting
         detector (see `rtf_cusum.py`) instead of the bootstrap-DCR
@@ -1774,6 +1945,78 @@ class REaLTabFormer:
               check.
             cusum_min_seen_pool: Minimum cooled-pool size required
               before a check can run at all.
+            cusum_confirm_with_sensitivity: When True, a fired CUSUM
+              alarm doesn't stop training immediately -- it triggers a
+              ONE-OFF sensitivity-style confirmation check first (a
+              `.generate()` call plus the same bootstrap-DCR comparison
+              `_train_with_sensitivity` uses, but run once, at the
+              candidate stop point, not on a periodic schedule from
+              epoch 0). If that check finds real elevated risk, training
+              stops as normal. If not, the alarm is treated as a false
+              positive: CUSUM's accumulated evidence is cleared (see
+              `CUSUMOverfittingMonitor.reset_after_false_alarm`) and
+              training continues, un-stopped, until CUSUM fires again on
+              new evidence. Exists because CUSUM was found to sometimes
+              fire on a slow, genuine-learning trend it can't
+              statistically tell apart from memorization onset -- this
+              resolves that ambiguity directly, at a fraction of
+              `_train_with_sensitivity`'s full cost (one confirmation
+              per alarm, not one check every `n_critic` epochs).
+              Requires the model to already be able to generate stable
+              samples; if it can't yet, the alarm is treated as
+              unconfirmed (training continues) rather than crashing.
+              `False` (default): unchanged behavior, alarm always stops
+              training immediately.
+            cusum_confirm_frac: Only used when
+              `cusum_confirm_with_sensitivity=True`. Same role as
+              `_train_with_sensitivity`'s own `frac` -- the fraction of
+              training data used for the confirmation's generated/
+              original/test samples.
+            cusum_confirm_frac_max_data: Only used when
+              `cusum_confirm_with_sensitivity=True`. Caps the absolute
+              sample size the same way `_train_with_sensitivity`'s own
+              `frac_max_data` does.
+            cusum_confirm_qt_max: Only used when
+              `cusum_confirm_with_sensitivity=True`. Same role as
+              `_train_with_sensitivity`'s own `qt_max` (accepts
+              `"compute"` too).
+            cusum_confirm_qt_max_default: Fallback `qt_max` when
+              `cusum_confirm_qt_max="compute"` and the training data has
+              no natural duplicates to derive a rate from.
+            cusum_confirm_qt_interval: Only used when
+              `cusum_confirm_with_sensitivity=True`. Same role as
+              `_train_with_sensitivity`'s own `qt_interval`.
+            cusum_confirm_num_bootstrap: Only used when
+              `cusum_confirm_with_sensitivity=True`. Bootstrap rounds
+              for the ONE-TIME confirmation threshold, computed before
+              training starts (same mechanism as
+              `SyntheticDataBench.compute_sensitivity_threshold`, so
+              `cusum_confirm_cache_dir` applies to it too).
+            cusum_confirm_quantile: Only used when
+              `cusum_confirm_with_sensitivity=True`. Same role as
+              `_train_with_sensitivity`'s own `quantile`.
+            cusum_confirm_sensitivity_orig_frac_multiple: Only used when
+              `cusum_confirm_with_sensitivity=True`. Same role as
+              `_train_with_sensitivity`'s own
+              `sensitivity_orig_frac_multiple`.
+            cusum_confirm_sensitivity_max_col_nums: Only used when
+              `cusum_confirm_with_sensitivity=True`. Same role as
+              `_train_with_sensitivity`'s own `sensitivity_max_col_nums`.
+            cusum_confirm_cache_dir: Only used when
+              `cusum_confirm_with_sensitivity=True`. Caches the
+              confirmation threshold's bootstrap computation the same
+              way `sensitivity_cache_dir` does for
+              `_train_with_sensitivity` -- see
+              `SyntheticDataBench.compute_sensitivity_threshold`'s own
+              `cache_dir` docs (growable pool, keyed on data content).
+            cusum_confirm_bootstrap_n_jobs: Only used when
+              `cusum_confirm_with_sensitivity=True`. Worker count for
+              that same bootstrap computation -- see
+              `compute_sensitivity_threshold`'s own `n_jobs`.
+            cusum_confirm_gen_kwargs: Only used when
+              `cusum_confirm_with_sensitivity=True`. Extra kwargs for
+              the confirmation's own `.generate()` call (e.g.
+              `{"gen_batch": 128}`).
         """
         # HF's Trainer defaults to stripping any dataset column not in
         # the model's forward() signature (`remove_unused_columns=True`)
@@ -1833,9 +2076,33 @@ class REaLTabFormer:
         if "label_ids" in callback_dataset.column_names:
             callback_dataset = callback_dataset.rename_column("label_ids", "labels")
 
+        confirm_fn = None
+        if cusum_confirm_with_sensitivity:
+            confirm_fn = self._build_cusum_confirm_fn(
+                df,
+                device=device,
+                frac=cusum_confirm_frac,
+                frac_max_data=cusum_confirm_frac_max_data,
+                qt_max=cusum_confirm_qt_max,
+                qt_max_default=cusum_confirm_qt_max_default,
+                qt_interval=cusum_confirm_qt_interval,
+                num_bootstrap=cusum_confirm_num_bootstrap,
+                quantile=cusum_confirm_quantile,
+                sensitivity_orig_frac_multiple=(
+                    cusum_confirm_sensitivity_orig_frac_multiple
+                ),
+                sensitivity_max_col_nums=cusum_confirm_sensitivity_max_col_nums,
+                cache_dir=cusum_confirm_cache_dir,
+                bootstrap_n_jobs=cusum_confirm_bootstrap_n_jobs,
+                gen_kwargs=cusum_confirm_gen_kwargs,
+            )
+
         trainer.add_callback(
             CUSUMEarlyStoppingCallback(
-                monitor, callback_dataset, alarm_checkpoint_dir=alarm_checkpoint_dir
+                monitor,
+                callback_dataset,
+                alarm_checkpoint_dir=alarm_checkpoint_dir,
+                confirm_fn=confirm_fn,
             )
         )
 

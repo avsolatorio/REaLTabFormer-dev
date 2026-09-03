@@ -8,6 +8,7 @@ import torch
 from transformers.models.gpt2 import GPT2LMHeadModel
 
 from realtabformer.realtabformer import REaLTabFormer
+from realtabformer.rtf_analyze import SyntheticDataBench
 from realtabformer.rtf_cusum import (
     CUSUMOverfittingMonitor,
     _robust_noise_std,
@@ -140,6 +141,31 @@ def _make_monitor(**overrides):
     )
     kwargs.update(overrides)
     return CUSUMOverfittingMonitor(**kwargs)
+
+
+def test_monitor_reset_after_false_alarm_clears_evidence_and_alarm():
+    mon = _make_monitor(delta=[0.25, 0.5])
+    mon.alarm_step = 42
+    mon.alarm_delta = 0.5
+    mon.cusum_S_by_delta = {0.25: 3.0, 0.5: 7.0}
+
+    mon.reset_after_false_alarm()
+
+    assert mon.alarm_step is None
+    assert mon.alarm_delta is None
+    assert mon.cusum_S_by_delta == {0.25: 0.0, 0.5: 0.0}
+    assert mon.false_alarms == [(42, 0.5)]
+    # mu0/sigma0 (calibration) must be untouched -- only accumulated
+    # drift EVIDENCE is discarded, not the "normal" noise baseline.
+    assert mon.mu0 is None  # unset in this fresh monitor either way
+    assert mon.warmup_checks == 3  # config itself is obviously untouched
+
+
+def test_monitor_reset_after_false_alarm_noop_when_never_fired():
+    mon = _make_monitor()
+    mon.reset_after_false_alarm()
+    assert mon.false_alarms == []  # nothing to record -- alarm_step was already None
+    assert mon.cusum_S_by_delta == {mon.delta: 0.0}
 
 
 def test_monitor_rejects_bad_config():
@@ -770,3 +796,80 @@ def test_fit_default_path_unaffected_by_cusum_module():
     assert "idx" not in trainer.train_dataset.column_names
     assert trainer.args.remove_unused_columns is True
     assert not hasattr(model, "cusum_monitor") or model.cusum_monitor is None
+
+
+# ---------------------------------------------------------------------
+# cusum_confirm_with_sensitivity: alarm -> one-off sensitivity-style
+# confirmation before actually stopping
+# ---------------------------------------------------------------------
+def test_fit_cusum_confirm_false_alarm_keeps_training(monkeypatch):
+    # Force EVERY confirmation check to say "not real risk" (a value far
+    # below any plausible threshold) -- if the wiring is correct, CUSUM
+    # should never actually stop training: every alarm gets reset via
+    # reset_after_false_alarm and training runs the full epoch budget.
+    monkeypatch.setattr(
+        SyntheticDataBench,
+        "compute_sensitivity_metric",
+        staticmethod(lambda **kwargs: -999.0),
+    )
+
+    df = _tiny_df(n=100)
+    epochs = 12
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=epochs,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+    )
+    trainer = model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_confirm_with_sensitivity=True,
+        cusum_confirm_num_bootstrap=5,
+    )
+    mon = model.cusum_monitor
+    # Every fire got vetoed -- alarm_step must be None (reset each time),
+    # and training must have run to the full epoch budget rather than
+    # stopping early.
+    assert mon.alarm_step is None
+    assert trainer.state.epoch is not None and trainer.state.epoch >= epochs - 1
+
+
+def test_fit_cusum_confirm_true_stops_like_unconfirmed_alarm(monkeypatch):
+    # Force EVERY confirmation check to say "real risk" (a value far
+    # above any plausible threshold) -- the very first alarm should be
+    # confirmed and stop training immediately, same observable behavior
+    # as the existing (non-confirm) alarm path.
+    monkeypatch.setattr(
+        SyntheticDataBench,
+        "compute_sensitivity_metric",
+        staticmethod(lambda **kwargs: 999.0),
+    )
+
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=30,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+    )
+    model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_confirm_with_sensitivity=True,
+        cusum_confirm_num_bootstrap=5,
+    )
+    mon = model.cusum_monitor
+    assert mon.alarm_step is not None, "expected the confirmed alarm to stick"
+    assert mon.false_alarms == []
+    assert mon.alarm_checkpoint_dir is not None

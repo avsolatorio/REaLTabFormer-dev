@@ -99,7 +99,7 @@ from __future__ import annotations
 
 import math
 import warnings
-from typing import Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -324,6 +324,10 @@ class CUSUMOverfittingMonitor:
         # (step, Delta, Z, S_by_delta) -- S_by_delta is a dict even in
         # the single-tracker (default) case, for one uniform shape.
         self.history: List[Tuple[int, float, float, Dict[float, float]]] = []
+        # (step, delta) pairs for alarms an external confirmation check
+        # (see CUSUMEarlyStoppingCallback's confirm_fn) investigated and
+        # found to be false positives -- see reset_after_false_alarm.
+        self.false_alarms: List[Tuple[int, float]] = []
 
     @property
     def delta(self) -> float:
@@ -551,6 +555,30 @@ class CUSUMOverfittingMonitor:
             return True
         return False
 
+    def reset_after_false_alarm(self) -> None:
+        """Called when an external confirmation check (e.g. a
+        sensitivity-style generate-and-DCR check, see
+        `CUSUMEarlyStoppingCallback`'s `confirm_fn`) investigates a
+        fired alarm and determines it was a false positive -- clears
+        the accumulated CUSUM evidence (`cusum_S_by_delta`) and the
+        `alarm_step`/`alarm_delta` markers so monitoring genuinely
+        resumes and can fire again on NEW evidence, rather than sitting
+        at/above threshold forever (`maybe_check`'s `self.alarm_step is
+        None` guard means it would otherwise never fire a second time).
+
+        Standard practice for a change-point detector after an
+        investigated false alarm: restart the accumulator. `mu0`/
+        `sigma0` (the calibrated "normal" noise baseline) are left
+        untouched -- they're independent of the alarm event itself and
+        presumably still valid; only the accumulated drift EVIDENCE is
+        discarded, not the calibration.
+        """
+        if self.alarm_step is not None:
+            self.false_alarms.append((self.alarm_step, self.alarm_delta))
+        self.cusum_S_by_delta = {d: 0.0 for d in self.deltas}
+        self.alarm_step = None
+        self.alarm_delta = None
+
 
 class CUSUMTrainer(ResumableTrainer):
     """``ResumableTrainer`` that also feeds per-row gated scores to a
@@ -604,6 +632,24 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
     the instant the alarm fires, regardless of any other mechanism's
     later behavior. Still sets ``control.should_save = True`` too, for
     interoperability with ``resume_from_checkpoint``.
+
+    ``confirm_fn``, if given, turns a fired alarm into a candidate
+    rather than an immediate stop: called as ``confirm_fn(model)`` the
+    moment CUSUM fires, it does its own (typically much more expensive
+    but more trustworthy) check and returns ``True`` to confirm the
+    stop, or ``False`` to treat it as a false alarm -- in which case
+    ``monitor.reset_after_false_alarm()`` is called and training
+    continues, un-stopped, with CUSUM's accumulated evidence cleared so
+    it can genuinely fire again later on NEW evidence. Exists because a
+    real investigation (see this feature's own research log) found
+    CUSUM sometimes fires on a slow, sustained-but-genuine improvement
+    trend it can't statistically distinguish from memorization onset --
+    a cheap, trustworthy confirmation at the actual candidate stop
+    point (rather than a periodic schedule from epoch 0, which is what
+    the sensitivity mechanism this can reuse for confirmation already
+    pays for) directly resolves that ambiguity without needing a new
+    detection theory. ``None`` (default): unchanged behavior, alarm
+    always stops training immediately.
     """
 
     def __init__(
@@ -611,10 +657,12 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         monitor: CUSUMOverfittingMonitor,
         train_dataset,
         alarm_checkpoint_dir: Optional[str] = None,
+        confirm_fn: Optional[Callable[[torch.nn.Module], bool]] = None,
     ) -> None:
         self.monitor = monitor
         self.train_dataset = train_dataset
         self.alarm_checkpoint_dir = alarm_checkpoint_dir
+        self.confirm_fn = confirm_fn
 
     def _get_rows(self, indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         rows = self.train_dataset[indices]
@@ -681,6 +729,29 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         self._model = model
 
         alarmed = self.monitor.maybe_check(step, model, self._get_rows)
+        if alarmed and self.confirm_fn is not None:
+            # `confirm_fn` typically calls `.sample()` to generate real
+            # data for its own check -- generation is normally called
+            # BETWEEN separate `trainer.train()` calls elsewhere in this
+            # codebase (`_train_with_sensitivity`'s own periodic checks),
+            # never from inside an ACTIVE one. Found the hard way: doing
+            # it from here, mid-`trainer.train()`, can leave the model
+            # split across devices (generation-related device placement
+            # disagreeing with the live Trainer's own), crashing the
+            # very next training step with an opaque device-mismatch
+            # error. Capture the device beforehand and force the model
+            # back onto it afterward, regardless of what confirm_fn did
+            # internally -- cheap, and makes this safe by construction
+            # rather than by trusting `.sample()` never to move it.
+            was_training = model.training
+            device = next(model.parameters()).device
+            confirmed = self.confirm_fn(model)
+            model.to(device)
+            if was_training:
+                model.train()
+            if not confirmed:
+                self.monitor.reset_after_false_alarm()
+                alarmed = False
         if alarmed:
             control.should_training_stop = True
             control.should_save = True
