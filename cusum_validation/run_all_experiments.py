@@ -67,6 +67,11 @@ def run_one(dataset, args, log_dir: Path) -> dict:
     if args.paper_metrics:
         cmd += ["--paper-metrics"]
         cmd += ["--eval-n-jobs", str(args.eval_n_jobs)]
+    cmd += ["--sensitivity-bootstrap-n-jobs", str(args.sensitivity_bootstrap_n_jobs)]
+    if args.sensitivity_cache_dir:
+        cmd += ["--sensitivity-cache-dir", args.sensitivity_cache_dir]
+    if args.no_sensitivity_cache:
+        cmd += ["--no-sensitivity-cache"]
 
     print(
         f"\n{'=' * 70}\nSTARTING {dataset} (run_id={run_id})\n"
@@ -141,6 +146,29 @@ def main():
         "Safe to leave at the default (-1, all cores) here since datasets "
         "in this batch run one at a time, never concurrently with each "
         "other.",
+    )
+    parser.add_argument(
+        "--sensitivity-bootstrap-n-jobs",
+        type=int,
+        default=-1,
+        help="Passed through to run_experiment.py's own "
+        "--sensitivity-bootstrap-n-jobs -- worker count for sensitivity's "
+        "pre-training bootstrap threshold computation. Defaults to every "
+        "core, same reasoning as --eval-n-jobs.",
+    )
+    parser.add_argument(
+        "--sensitivity-cache-dir",
+        default=None,
+        help="Passed through to run_experiment.py's own "
+        "--sensitivity-cache-dir. Leave unset to use that script's own "
+        "default (results/.sensitivity_cache/, shared across every dataset "
+        "in this batch).",
+    )
+    parser.add_argument(
+        "--no-sensitivity-cache",
+        action="store_true",
+        default=False,
+        help="Passed through to run_experiment.py's own --no-sensitivity-cache.",
     )
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(

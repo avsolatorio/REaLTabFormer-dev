@@ -83,6 +83,14 @@ dependency of this script or the library); off by default since it's
 meaningfully more expensive than the existing frac_suspicious/AUC-or-R2
 check (default 50 synthetic-seed + 10 real-seed CatBoost fits, plus 10
 RandomForest fits, per label).
+
+Sensitivity mode's own expensive part -- a pre-training, num_bootstrap
+=500-round threshold computation that only ever resamples the training
+data against itself (no model involved) -- is cached to disk by
+default (see --sensitivity-cache-dir/--no-sensitivity-cache), so a
+repeat run against the same dataset skips it entirely; and its
+parallelism defaults to every CPU core (--sensitivity-bootstrap-n-jobs
+-1) rather than the library's own conservative built-in cap.
 """
 
 import argparse
@@ -1036,6 +1044,10 @@ def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_v
         n_critic=args.sensitivity_n_critic,
         n_critic_stop=args.sensitivity_n_critic_stop,
         num_bootstrap=args.sensitivity_num_bootstrap,
+        sensitivity_cache_dir=(
+            None if args.no_sensitivity_cache else args.sensitivity_cache_dir
+        ),
+        sensitivity_bootstrap_n_jobs=args.sensitivity_bootstrap_n_jobs,
         gen_kwargs={"gen_batch": args.gen_batch} if args.gen_batch else None,
     )
     elapsed = time.time() - t0
@@ -1243,6 +1255,36 @@ def main():
     )
     parser.add_argument("--sensitivity-n-critic-stop", type=int, default=2)
     parser.add_argument("--sensitivity-num-bootstrap", type=int, default=500)
+    parser.add_argument(
+        "--sensitivity-cache-dir",
+        default=str(SCRIPT_DIR / "results" / ".sensitivity_cache"),
+        help="Caches sensitivity's pre-training num_bootstrap-round threshold "
+        "computation here, keyed on the training data's own content plus "
+        "every parameter that affects it -- this step never touches the "
+        "trained model (it only resamples the training data against "
+        "itself), so a repeat run against the same dataset/settings can "
+        "skip it entirely. On by default; pass --no-sensitivity-cache to "
+        "disable.",
+    )
+    parser.add_argument(
+        "--no-sensitivity-cache",
+        action="store_true",
+        default=False,
+        help="Disable --sensitivity-cache-dir (always recompute the "
+        "bootstrap threshold from scratch, matching the library's original "
+        "behavior).",
+    )
+    parser.add_argument(
+        "--sensitivity-bootstrap-n-jobs",
+        type=int,
+        default=-1,
+        help="Worker count (joblib's own convention -- -1 means all cores) "
+        "for sensitivity's pre-training bootstrap computation. Defaults to "
+        "every core here, overriding the library's own conservative "
+        "built-in default (min(max(2, cpu_count // 4), 16)) -- pass 1 for "
+        "fully sequential, or a smaller positive number to cap how many "
+        "cores this step claims.",
+    )
     parser.add_argument(
         "--paper-metrics",
         action="store_true",
