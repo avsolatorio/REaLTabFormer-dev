@@ -1,0 +1,45 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "numeric_quantile_encoding": false,
+    "cusum_confirm_with_sensitivity": false,
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 80,
+    "alarm_delta": 1.0,
+    "global_step": 80,
+    "steps_per_epoch": 4,
+    "effective_epochs": 20.0,
+    "elapsed_s": 30.96721577644348,
+    "mu0": 2.0898381491657347,
+    "sigma0": 0.018495067766514273,
+    "cusum_h": 8.842940651369034,
+    "cusum_h_by_delta": {
+      "0.25": 8.842940651369034,
+      "0.5": 9.826371584485825,
+      "1.0": 10.683748595537399
+    },
+    "cooldown_steps_final": 2,
+    "alarm_checkpoint_dir": "/data/wb536061/REaLTabFormer-dev/cusum_validation/results/diabetes_cusum_base_ep300_1788549364_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 1068,
+    "dcr_synth_mean": 2.330281700284429,
+    "dcr_synth_min": 0.6097048603266002,
+    "dcr_test_mean": 2.513550583328174,
+    "frac_suspicious": 0.12987012987012986
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "auc",
+    "trtr": 0.822038567493113,
+    "tstr": 0.785307621671258,
+    "gap": 0.03673094582185499
+  }
+}

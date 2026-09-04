@@ -1,0 +1,45 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "numeric_quantile_encoding": false,
+    "cusum_confirm_with_sensitivity": false,
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 420,
+    "alarm_delta": 1.0,
+    "global_step": 420,
+    "steps_per_epoch": 30,
+    "effective_epochs": 14.0,
+    "elapsed_s": 91.01161503791809,
+    "mu0": 0.9093430017121136,
+    "sigma0": 0.050630130091223434,
+    "cusum_h": 8.842940651369034,
+    "cusum_h_by_delta": {
+      "0.25": 8.842940651369034,
+      "0.5": 9.826371584485825,
+      "1.0": 10.683748595537399
+    },
+    "cooldown_steps_final": 15,
+    "alarm_checkpoint_dir": "/data/wb536061/REaLTabFormer-dev/cusum_validation/results/wilt_cusum_base_ep300_1788551524_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 5139,
+    "dcr_synth_mean": 0.5141519559581602,
+    "dcr_synth_min": 0.07902236365624955,
+    "dcr_test_mean": 0.5094122719049272,
+    "frac_suspicious": 0.047520661157024795
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "auc",
+    "trtr": 0.9599648855314529,
+    "tstr": 0.8929239725552707,
+    "gap": 0.0670409129761822
+  }
+}

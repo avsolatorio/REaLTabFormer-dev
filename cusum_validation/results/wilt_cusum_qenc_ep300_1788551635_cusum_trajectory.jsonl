@@ -1,0 +1,23 @@
+{"phase": "settle", "step": 15}
+{"phase": "settle", "step": 30}
+{"phase": "settle", "step": 45}
+{"phase": "settle", "step": 60}
+{"phase": "settle", "step": 75}
+{"phase": "settle", "step": 90}
+{"phase": "settle", "step": 105}
+{"phase": "settle", "step": 120}
+{"phase": "settle", "step": 135}
+{"phase": "settle", "step": 150}
+{"phase": "warmup", "step": 165, "delta": 0.6479952558875084}
+{"phase": "warmup", "step": 180, "delta": 0.6445526713505387}
+{"phase": "warmup", "step": 195, "delta": 0.6574955862015486}
+{"phase": "warmup", "step": 210, "delta": 0.6428955057635903}
+{"phase": "warmup", "step": 225, "delta": 0.6876688254997134}
+{"phase": "warmup", "step": 240, "delta": 0.6934167016297579}
+{"phase": "warmup", "step": 255, "delta": 0.748629323206842}
+{"phase": "warmup", "step": 270, "delta": 0.7381608774885535}
+{"phase": "warmup", "step": 285, "delta": 0.6955132111907005}
+{"phase": "warmup", "step": 300, "delta": 0.8130856119096279}
+{"phase": "post_calibration", "step": 320, "delta": 0.849057026207447, "z": 3.4941725735007734, "cusum_S": 0.8422931433751933, "cusum_S_by_delta": {"0.25": 0.8422931433751933, "0.5": 1.6220862867503867, "1.0": 2.9941725735007734}, "mu0": 0.6969413570128381, "sigma0": 0.03372871722424209, "cusum_h": 8.842940651369034, "cusum_h_by_delta": {"0.25": 8.842940651369034, "0.5": 9.826371584485825, "1.0": 10.683748595537399}, "alarm_step": null, "alarm_delta": null}
+{"phase": "post_calibration", "step": 340, "delta": 0.8860227363184094, "z": 4.32810471538252, "cusum_S": 1.8930693222208235, "cusum_S_by_delta": {"0.25": 1.8930693222208235, "0.5": 3.661138644441647, "1.0": 6.822277288883294}, "mu0": 0.6969413570128381, "sigma0": 0.03372871722424209, "cusum_h": 8.842940651369034, "cusum_h_by_delta": {"0.25": 8.842940651369034, "0.5": 9.826371584485825, "1.0": 10.683748595537399}, "alarm_step": null, "alarm_delta": null}
+{"phase": "post_calibration", "step": 360, "delta": 0.9232295942492783, "z": 5.017360475599308, "cusum_S": 3.116159441120651, "cusum_S_by_delta": {"0.25": 3.116159441120651, "0.5": 6.044818882241302, "1.0": 11.339637764482603}, "mu0": 0.6969413570128381, "sigma0": 0.03372871722424209, "cusum_h": 8.842940651369034, "cusum_h_by_delta": {"0.25": 8.842940651369034, "0.5": 9.826371584485825, "1.0": 10.683748595537399}, "alarm_step": 360, "alarm_delta": 1.0}

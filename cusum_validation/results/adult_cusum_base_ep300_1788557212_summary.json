@@ -1,0 +1,45 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "numeric_quantile_encoding": false,
+    "cusum_confirm_with_sensitivity": false,
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 1360,
+    "alarm_delta": 0.5,
+    "global_step": 1360,
+    "steps_per_epoch": 282,
+    "effective_epochs": 4.822695035460993,
+    "elapsed_s": 236.59773993492126,
+    "mu0": 0.1324420636985451,
+    "sigma0": 0.03927341684746259,
+    "cusum_h": 9.555587901991844,
+    "cusum_h_by_delta": {
+      "0.25": 9.555587901991844,
+      "0.5": 10.550258360730805,
+      "1.0": 10.997661745552808
+    },
+    "cooldown_steps_final": 40,
+    "alarm_checkpoint_dir": "/data/wb536061/REaLTabFormer-dev/cusum_validation/results/adult_cusum_base_ep300_1788557212_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 45522,
+    "dcr_synth_mean": 1.1034724479866642,
+    "dcr_synth_min": 3.779376182200256e-05,
+    "dcr_test_mean": 1.2003299913189371,
+    "frac_suspicious": 0.06335692171605484
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "auc",
+    "trtr": 0.9093962761272137,
+    "tstr": 0.9076560378864029,
+    "gap": 0.0017402382408108208
+  }
+}

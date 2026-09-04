@@ -1,0 +1,21 @@
+{"phase": "settle", "step": 2}
+{"phase": "settle", "step": 4}
+{"phase": "settle", "step": 6}
+{"phase": "settle", "step": 8}
+{"phase": "settle", "step": 10}
+{"phase": "settle", "step": 12}
+{"phase": "settle", "step": 14}
+{"phase": "settle", "step": 16}
+{"phase": "settle", "step": 18}
+{"phase": "settle", "step": 20}
+{"phase": "warmup", "step": 22, "delta": 2.1550911841914058}
+{"phase": "warmup", "step": 24, "delta": 2.1929119182750583}
+{"phase": "warmup", "step": 26, "delta": 2.233213117811829}
+{"phase": "warmup", "step": 28, "delta": 2.298044986091554}
+{"phase": "warmup", "step": 30, "delta": 2.3789820964448154}
+{"phase": "warmup", "step": 32, "delta": 2.4017728716135025}
+{"phase": "warmup", "step": 34, "delta": 2.507826911751181}
+{"phase": "warmup", "step": 36, "delta": 2.4993956522084773}
+{"phase": "warmup", "step": 38, "delta": 2.5537162432447076}
+{"phase": "warmup", "step": 40, "delta": 2.6040386403910816}
+{"phase": "post_calibration", "step": 60, "delta": 3.028950455132872, "z": 17.89405964508749, "cusum_S": 4.442264911271873, "cusum_S_by_delta": {"0.25": 4.442264911271873, "0.5": 8.822029822543746, "1.0": 17.39405964508749}, "mu0": 2.382499362202361, "sigma0": 0.023364968620696026, "cusum_h": 8.842940651369034, "cusum_h_by_delta": {"0.25": 8.842940651369034, "0.5": 9.826371584485825, "1.0": 10.683748595537399}, "alarm_step": 60, "alarm_delta": 1.0}

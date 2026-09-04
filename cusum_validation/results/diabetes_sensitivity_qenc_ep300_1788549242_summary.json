@@ -1,0 +1,29 @@
+{
+  "sensitivity_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "numeric_quantile_encoding": true,
+    "n_critic": 5,
+    "n_critic_stop": 2,
+    "num_bootstrap": 1953,
+    "elapsed_s": 113.95888781547546,
+    "global_step": 195,
+    "steps_per_epoch": 4,
+    "stopped_epoch": 48.75
+  },
+  "sensitivity_stop": {
+    "label": "sensitivity_stop",
+    "n_samples_generated": 1068,
+    "dcr_synth_mean": 2.0156526471220273,
+    "dcr_synth_min": 0.14703736748321505,
+    "dcr_test_mean": 2.513550583328174,
+    "frac_suspicious": 0.22077922077922077
+  },
+  "sensitivity_stop_utility": {
+    "metric": "auc",
+    "trtr": 0.822038567493113,
+    "tstr": 0.8115702479338843,
+    "gap": 0.010468319559228667
+  }
+}
