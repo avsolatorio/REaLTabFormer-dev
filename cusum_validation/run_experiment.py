@@ -431,8 +431,23 @@ def sync_results_to_repo(output_dir: Path, run_id: str) -> None:
 
 
 def measure_dcr(
-    model, bench, train_df, test_df, device, label, summary_path, gen_batch=None
+    model,
+    bench,
+    train_df,
+    test_df,
+    device,
+    label,
+    summary_path,
+    gen_batch=None,
+    dcr_test=None,
 ):
+    """`dcr_test`: precomputed `bench.get_dcr(is_test=True)` result, if
+    the caller already has one -- it depends only on `bench.train_df`/
+    `bench.test_df` (never on the model or synthetic data), so it's
+    identical across every label for a given dataset/split and doesn't
+    need recomputing per label. `None` (default): compute it here, as
+    before.
+    """
     n_needed = len(train_df) + len(test_df) + 300
     samples = model.sample(
         n_samples=n_needed,
@@ -445,7 +460,8 @@ def measure_dcr(
     if len(samples) >= len(train_df) + len(test_df):
         bench.register_synthetic_data(samples)
         dcr_synth = bench.get_dcr(is_test=False)
-        dcr_test = bench.get_dcr(is_test=True)
+        if dcr_test is None:
+            dcr_test = bench.get_dcr(is_test=True)
         threshold = dcr_test.quantile(0.05)
         frac_suspicious = float((dcr_synth < threshold).mean())
         result.update(
@@ -798,7 +814,9 @@ def measure_dm(bench, label, summary_path, n_seeds: int = 10, n_jobs: int = 1):
     return result
 
 
-def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
+def run_cusum(
+    args, run_id, full_df, target_col, categorical, target_pos_val, dcr_test=None
+):
     bench = SyntheticDataBench(
         data=full_df,
         target_col=target_col,
@@ -906,6 +924,7 @@ def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
         "cusum_stop_at_alarm",
         summary_path,
         gen_batch=args.gen_batch,
+        dcr_test=dcr_test,
     )
     measure_utility(bench, "cusum_stop_at_alarm", summary_path, categorical=categorical)
     if args.paper_metrics:
@@ -931,7 +950,9 @@ def run_cusum(args, run_id, full_df, target_col, categorical, target_pos_val):
         sync_results_to_repo(Path(args.output_dir), run_id)
 
 
-def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
+def run_full(
+    args, run_id, full_df, target_col, categorical, target_pos_val, dcr_test=None
+):
     bench = SyntheticDataBench(
         data=full_df,
         target_col=target_col,
@@ -990,6 +1011,7 @@ def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
         "full_schedule",
         summary_path,
         gen_batch=args.gen_batch,
+        dcr_test=dcr_test,
     )
     measure_utility(bench, "full_schedule", summary_path, categorical=categorical)
     if args.paper_metrics:
@@ -1015,7 +1037,9 @@ def run_full(args, run_id, full_df, target_col, categorical, target_pos_val):
         sync_results_to_repo(Path(args.output_dir), run_id)
 
 
-def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_val):
+def run_sensitivity(
+    args, run_id, full_df, target_col, categorical, target_pos_val, dcr_test=None
+):
     """The EXISTING bootstrap-DCR overfitting_detection_method="sensitivity"
     (the default, pre-CUSUM mechanism) -- the actually meaningful
     baseline for this whole research thread, since CUSUM's point was to
@@ -1116,6 +1140,7 @@ def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_v
         "sensitivity_stop",
         summary_path,
         gen_batch=args.gen_batch,
+        dcr_test=dcr_test,
     )
     measure_utility(bench, "sensitivity_stop", summary_path, categorical=categorical)
     if args.paper_metrics:
@@ -1141,7 +1166,9 @@ def run_sensitivity(args, run_id, full_df, target_col, categorical, target_pos_v
         sync_results_to_repo(Path(args.output_dir), run_id)
 
 
-def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_pos_val):
+def run_from_checkpoint(
+    args, run_id, full_df, target_col, categorical, target_pos_val, dcr_test=None
+):
     """Re-measure DCR + utility for an ALREADY-TRAINED checkpoint --
     no retraining, just reload and score. Rebuilds the same
     SyntheticDataBench split (same RANDOM_SEED, same full_df) any of
@@ -1178,6 +1205,7 @@ def run_from_checkpoint(args, run_id, full_df, target_col, categorical, target_p
         "checkpoint_recheck",
         summary_path,
         gen_batch=args.gen_batch,
+        dcr_test=dcr_test,
     )
     measure_utility(bench, "checkpoint_recheck", summary_path, categorical=categorical)
     if args.paper_metrics:
@@ -1469,17 +1497,69 @@ def main():
     torch.manual_seed(RANDOM_SEED)
     np.random.seed(RANDOM_SEED)
 
+    # dcr_test (train_df-vs-test_df DCR, and the frac_suspicious
+    # threshold derived from it) depends only on full_df + the fixed
+    # test_size/random_state every run_* function already uses to split
+    # it -- identical across cusum/full/sensitivity/checkpoint, so
+    # there's no reason to recompute it (a real, sometimes-large dense-
+    # or-NearestNeighbors distance calculation) once per label when
+    # --mode all runs up to four. Computed once here and threaded
+    # through instead.
+    dcr_test_bench = SyntheticDataBench(
+        data=full_df,
+        target_col=target_col,
+        categorical=categorical,
+        target_pos_val=target_pos_val,
+        test_size=0.2,
+        random_state=RANDOM_SEED,
+    )
+    dcr_test = dcr_test_bench.get_dcr(is_test=True)
+    print(
+        f"Precomputed dcr_test once ({len(dcr_test)} rows, "
+        f"5th-pct threshold={dcr_test.quantile(0.05):.4f}) -- reused across "
+        "every label below instead of being recomputed per label.",
+        flush=True,
+    )
+
     if args.mode in ("cusum", "both", "all"):
-        run_cusum(args, args.run_id, full_df, target_col, categorical, target_pos_val)
+        run_cusum(
+            args,
+            args.run_id,
+            full_df,
+            target_col,
+            categorical,
+            target_pos_val,
+            dcr_test=dcr_test,
+        )
     if args.mode in ("full", "both", "all"):
-        run_full(args, args.run_id, full_df, target_col, categorical, target_pos_val)
+        run_full(
+            args,
+            args.run_id,
+            full_df,
+            target_col,
+            categorical,
+            target_pos_val,
+            dcr_test=dcr_test,
+        )
     if args.mode in ("sensitivity", "all"):
         run_sensitivity(
-            args, args.run_id, full_df, target_col, categorical, target_pos_val
+            args,
+            args.run_id,
+            full_df,
+            target_col,
+            categorical,
+            target_pos_val,
+            dcr_test=dcr_test,
         )
     if args.mode == "checkpoint":
         run_from_checkpoint(
-            args, args.run_id, full_df, target_col, categorical, target_pos_val
+            args,
+            args.run_id,
+            full_df,
+            target_col,
+            categorical,
+            target_pos_val,
+            dcr_test=dcr_test,
         )
 
     print("\nDone. Commit the new files under results/ to share them.", flush=True)
