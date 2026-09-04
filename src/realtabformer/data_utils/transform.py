@@ -29,6 +29,11 @@ class NumericTransformData(TypedDict, total=False):
     - `mean_date` is set only for datetime-derived columns.
     - `numeric_nparts` is stamped by `process_data`, not by these
       functions themselves.
+    - `quantile_encoding=True` columns set neither `mx_sig`, `zfill`, nor
+      `ljust` -- they use a dedicated fixed-width digit-index formatting
+      path (see `process_numeric_data`) that bypasses the generic
+      magnitude-alignment code those three keys support, and nothing
+      outside `process_numeric_data` itself reads them.
     """
 
     max_len: int
@@ -272,37 +277,55 @@ def process_numeric_data(
             "quantile_encoding requires numeric_precision > 0 -- a quantile "
             "value with zero fractional digits has no resolution at all."
         )
-        # "0." + numeric_precision digits, or the formatted quantile string
-        # would be silently truncated by the max_len slice further below.
-        assert max_len >= numeric_precision + 2, (
-            f"max_len ({max_len}) is too small to hold a quantile-encoded "
-            f"value at numeric_precision={numeric_precision} (needs at least "
-            f"{numeric_precision + 2}, for \"0.\" plus the precision digits)."
-        )
         series, transform_data = _apply_quantile_encoding(
             series, transform_data, is_transform, n_quantiles=quantile_n_bins
         )
 
+        # `series` now holds q in [0, 1) (NaN preserved by
+        # `_apply_quantile_encoding`). Format it as a bare zero-padded
+        # digit-index string -- q quantized to numeric_precision decimal
+        # digits, written with no decimal point -- instead of routing it
+        # through the generic "0.XXXX" formatting path below. Dropping the
+        # "0." saves two structurally-constant characters per row: q is
+        # *always* < 1 by construction, so the leading digit is always "0"
+        # and the point's position never varies -- neither carries any
+        # information the model needs to learn or the vocab needs a token
+        # for. The width is fixed at exactly numeric_precision digits by
+        # construction here, unlike the generic zfill branch below (whose
+        # width is `series.str.len().max()`, i.e. data-dependent) -- a low
+        # digit-index like 5 ("0005" at precision=4) is a perfectly
+        # ordinary value, not a case that should shrink the column's width.
+        # `rtf_sampler.py::_recover_data_values` reverses this: divides the
+        # recovered digit-index back by the same grid to recover q, then
+        # applies dequantization dithering before the inverse np.interp.
+        grid = 10**numeric_precision
+
+        def _format_quantile_digits(x, grid=grid, numeric_precision=numeric_precision):
+            if pd.isna(x):
+                # Matches the plain-float path's own NaN formatting
+                # (`f"{x:.{p}f}"` on NaN gives the literal "nan") so the
+                # existing INVALID_NUMS_RE-based NaN detection in
+                # `tokenize_numeric_col` catches it identically, with no
+                # separate handling needed there.
+                return "nan"
+            d = int(np.clip(round(x * grid), 0, grid - 1))
+            return str(d).zfill(numeric_precision)
+
+        series = series.map(_format_quantile_digits)
+        return series, transform_data
+
     # Note that at this point, we should have casted int-like values to
     # pd.Int64Dtype but just to be very sure, let's do that again here.
-    #
-    # Skipped entirely for quantile-encoded values: a quantile is always a
-    # fractional [0, 1) value by construction and must always go through
-    # the decimal-precision formatting path below, never the integer/zfill
-    # path -- but a quantile that happens to land exactly on a whole
-    # number (0.0, or 1.0 at the clipped boundary of an out-of-range
-    # input) casts to Int64Dtype *successfully*, which would otherwise
-    # silently misroute it into the wrong (no-decimal-point) formatting
-    # branch and corrupt the encoding. Confirmed empirically: an
-    # out-of-range seed value clipping to exactly q=1.0 formatted as
-    # "001000" (the zfill branch) instead of "1.0000" without this guard.
-    if not quantile_encoding:
-        try:
-            series = series.astype(pd.Int64Dtype())
-        except TypeError:
-            pass
-        except ValueError:
-            pass
+    # (quantile_encoding=True never reaches this point at all -- its
+    # branch above returns directly with its own dedicated, always-integer
+    # digit-index formatting, so there's no analogous whole-number/
+    # misrouting hazard here to guard against.)
+    try:
+        series = series.astype(pd.Int64Dtype())
+    except TypeError:
+        pass
+    except ValueError:
+        pass
 
     if series.dtype == pd.Int64Dtype():
         series = series.astype(str)

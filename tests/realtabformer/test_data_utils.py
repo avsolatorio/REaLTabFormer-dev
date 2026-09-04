@@ -1225,7 +1225,10 @@ def test_numeric_quantile_encoding_round_trip_recovers_observed_values():
     quantile_values = np.array(transform_data["quantile_values"])
     quantile_positions = np.array(transform_data["quantile_positions"])
 
-    q = formatted.astype(float).to_numpy()
+    # `formatted` is now a bare zero-padded digit-index string (no "0."
+    # prefix) -- divide back by the grid to recover q itself.
+    grid = 10 ** transform_data["numeric_precision"]
+    q = formatted.astype(float).to_numpy() / grid
     recovered = np.interp(q, quantile_positions, quantile_values)
 
     rel_err = np.abs(recovered - s.to_numpy()) / s.to_numpy()
@@ -1272,8 +1275,12 @@ def test_numeric_quantile_encoding_clips_out_of_range_values():
         too_small, max_len=8, numeric_precision=4,
         transform_data=dict(transform_data), quantile_encoding=True,
     )
-    assert formatted_big.iloc[0] == "1.0000"
-    assert formatted_small.iloc[0] == "0.0000"
+    # Digit-index format: the top representable value is grid - 1 (e.g.
+    # "9999" at precision=4), not a digit-index of exactly `grid` -- that
+    # would need a 5th digit and break the fixed-width guarantee, so the
+    # forward transform's exact q=1.0 clips down by one grid cell instead.
+    assert formatted_big.iloc[0] == "9999"
+    assert formatted_small.iloc[0] == "0000"
 
 
 def test_numeric_quantile_encoding_requires_positive_precision():
@@ -1284,12 +1291,16 @@ def test_numeric_quantile_encoding_requires_positive_precision():
         )
 
 
-def test_numeric_quantile_encoding_requires_sufficient_max_len():
+def test_numeric_quantile_encoding_max_len_is_irrelevant():
+    # The digit-index representation (no "0." prefix) never runs through
+    # the generic max_len-truncation code path at all -- its width is
+    # exactly numeric_precision by construction -- so a max_len far too
+    # small for the old "0." + digits format no longer matters.
     s = _heavy_tailed_series()
-    with pytest.raises(AssertionError, match="too small to hold a quantile-encoded"):
-        du.process_numeric_data(
-            s, max_len=3, numeric_precision=4, quantile_encoding=True
-        )
+    formatted, _ = du.process_numeric_data(
+        s, max_len=1, numeric_precision=4, quantile_encoding=True
+    )
+    assert (formatted.str.len() == 4).all()
 
 
 def test_numeric_quantile_encoding_default_off_leaves_transform_data_unchanged():
@@ -1377,7 +1388,10 @@ def test_numeric_quantile_encoding_point_mass_round_trip_precision_improves():
     )
     quantile_values = np.array(transform_data["quantile_values"])
     quantile_positions = np.array(transform_data["quantile_positions"])
-    decoded = np.interp(formatted.astype(float).to_numpy(), quantile_positions, quantile_values)
+    grid = 10 ** transform_data["numeric_precision"]
+    decoded = np.interp(
+        formatted.astype(float).to_numpy() / grid, quantile_positions, quantile_values
+    )
 
     nonzero_mask = s.to_numpy() != 0
     rel_err = np.abs(decoded[nonzero_mask] - s.to_numpy()[nonzero_mask]) / s.to_numpy()[nonzero_mask]
@@ -1419,7 +1433,10 @@ def test_numeric_quantile_encoding_mid_distribution_point_mass():
     mass_formatted = formatted.loc[s[s == 200.0].index]
     assert mass_formatted.nunique() == 1
 
-    decoded = np.interp(formatted.astype(float).to_numpy(), quantile_positions, quantile_values)
+    grid = 10 ** transform_data["numeric_precision"]
+    decoded = np.interp(
+        formatted.astype(float).to_numpy() / grid, quantile_positions, quantile_values
+    )
     mass_mask = s.to_numpy() == 200.0
     assert np.allclose(decoded[mass_mask], 200.0, atol=1e-6)
 
@@ -1498,7 +1515,10 @@ def test_numeric_quantile_encoding_zero_inflated_point_mass_round_trip():
 
     # Decoding that string must recover exactly 0, for every zero row --
     # not an interpolated near-miss.
-    decoded = np.interp(formatted.astype(float).to_numpy(), quantile_positions, quantile_values)
+    grid = 10 ** transform_data["numeric_precision"]
+    decoded = np.interp(
+        formatted.astype(float).to_numpy() / grid, quantile_positions, quantile_values
+    )
     zero_mask = s.to_numpy() == 0
     assert np.allclose(decoded[zero_mask], 0.0, atol=1e-9)
 
@@ -1522,8 +1542,10 @@ def test_numeric_quantile_encoding_digit_entropy_near_maximal_through_real_pipel
         numeric_quantile_encoding=True,
     )
     price_cols = sorted(c for c in pr_df.columns if "price" in c)
-    # "0" + "." + 4 fractional digits.
-    assert len(price_cols) == 6
+    # 4 digit-index positions -- no more structurally-constant "0"/"."
+    # prefix columns (dropped; see process_numeric_data's quantile_encoding
+    # branch).
+    assert len(price_cols) == 4
 
     def norm_entropy(col):
         chars = pr_df[col].str.split(du.SPECIAL_COL_SEP).str[-1]
@@ -1532,14 +1554,11 @@ def test_numeric_quantile_encoding_digit_entropy_near_maximal_through_real_pipel
         h = -(p * np.log2(p)).sum()
         return h / np.log2(10)
 
-    # Positions 0 ("0") and 1 (".") are structurally constant for any
-    # quantile value in [0, 1) -- known, separately-flagged wasted
-    # positions, not a bug. The 4 fractional-digit positions carry
-    # essentially maximal entropy.
+    # Every remaining position is a genuine fractional digit of q --
+    # all carry essentially maximal entropy now that the constant "0"/"."
+    # positions are gone entirely.
     entropies = [norm_entropy(c) for c in price_cols]
-    assert entropies[0] < 0.01
-    assert entropies[1] < 0.01
-    assert all(e > 0.9 for e in entropies[2:])
+    assert all(e > 0.9 for e in entropies)
 
 
 def test_numeric_quantile_encoding_mutually_exclusive_with_categorical_threshold():
@@ -1591,6 +1610,9 @@ def test_numeric_quantile_encoding_composes_with_digit_entropy_weighting():
     assert set(price_cols).issubset(weights.keys())
 
     price_weights = [weights[c] for c in price_cols]
-    # The constant "0"/"." positions get pulled toward the floor; the
-    # near-maximal-entropy fractional-digit positions get pulled above it.
-    assert min(price_weights) < 1.0 < max(price_weights)
+    # No more constant "0"/"." positions to pull toward the floor -- all 4
+    # positions are genuine fractional digits of q with near-maximal,
+    # near-equal entropy, so their renormalized-within-block weights
+    # should all cluster close to 1.0 rather than showing the old strong
+    # low/high split.
+    assert all(0.9 < w < 1.1 for w in price_weights)

@@ -370,6 +370,18 @@ class REaLSampler:
             numeric_datetime_cols.map(decode_partition_numeric_col)
         )
 
+        # Shared across every quantile-encoded column recovered below
+        # (dequantization dithering, further down) -- seeded from
+        # `self.random_state` for the same run-to-run reproducibility
+        # `.sample(random_state=...)` already guarantees for everything
+        # else (token sampling itself, via `torch.manual_seed`/HF
+        # `generate(seed=...)`; see realtabformer.py/rtf_sampler.py's own
+        # other `self.random_state` uses). One instance shared across
+        # columns (rather than one freshly re-seeded per column) so two
+        # quantile-encoded columns in the same fit don't draw identical
+        # noise sequences against their own, independent q values.
+        quantile_dither_rng = np.random.default_rng(self.random_state)
+
         for col, c_group in numeric_col_group.items():
             # Aggregate the partitioned data for the actual column.
             group_series = synth_sample[c_group].sum(axis=1)
@@ -417,17 +429,24 @@ class REaLSampler:
                 if is_numeric_col(col):
                     # numeric_quantile_encoding (beta, v1 and v2 both).
                     # `group_series` at this point holds the recovered
-                    # *quantile* value (q -- process_data's forward
-                    # transform, data_utils/transform.py::_apply_quantile_encoding,
-                    # ran x -> q before formatting/chunking), not the
-                    # original column's value. Invert it back via the same
-                    # `np.interp` mechanism, against the same stored
-                    # breakpoint arrays, before anything downstream (the
-                    # Int64Dtype cast attempt right below, then
-                    # `_convert_to_table`'s final dtype cast) sees it.
-                    # `col` here is only partition-decoded (e.g.
-                    # "00___NUMERIC___price"), not yet the original column
-                    # name -- `_convert_to_table` doesn't run
+                    # *digit-index* value -- process_numeric_data's
+                    # quantile_encoding branch (data_utils/transform.py)
+                    # formats q (the forward-transformed quantile position,
+                    # from `_apply_quantile_encoding`) as a bare zero-padded
+                    # integer string with no decimal point (dropping the
+                    # structurally-constant "0." every row would otherwise
+                    # share), so the generic parsing above this block
+                    # already recovered it as a plain integer-valued float,
+                    # not q itself and not the original column's value.
+                    # Recover q by dividing back by the same
+                    # 10**numeric_precision grid, then invert back to the
+                    # original value via the same `np.interp` mechanism
+                    # against the same stored breakpoint arrays, before
+                    # anything downstream (the Int64Dtype cast attempt
+                    # right below, then `_convert_to_table`'s final dtype
+                    # cast) sees it. `col` here is only partition-decoded
+                    # (e.g. "00___NUMERIC___price"), not yet the original
+                    # column name -- `_convert_to_table` doesn't run
                     # `decode_processed_column` until later, so
                     # `col_transform_data` (keyed by the original name,
                     # e.g. "price") must be looked up with that name
@@ -444,10 +463,46 @@ class REaLSampler:
                         quantile_positions = np.array(
                             quantile_transform_data["quantile_positions"]
                         )
+                        grid = 10 ** quantile_transform_data["numeric_precision"]
+
                         valid = group_series.notna()
                         group_series = group_series.astype("float64")
+                        q = group_series.loc[valid].to_numpy() / grid
+
+                        # Dequantization dithering. `q` is confined to one
+                        # of `grid` discrete points -- numeric_precision
+                        # decimal digits of resolution -- purely as a
+                        # formatting artifact, not because the underlying
+                        # variable is actually discrete at that scale.
+                        # `np.interp` maps that discreteness straight
+                        # through its piecewise-linear breakpoint curve
+                        # into the reconstructed value, manufacturing
+                        # visible "steps" in the generated marginal
+                        # distribution that the real training data never
+                        # had. Adding noise drawn uniformly across each
+                        # grid cell before interpolating removes exactly
+                        # this artifact -- and only this one: it adds no
+                        # cross-column or genuinely-learned resolution
+                        # beyond what the model actually generated, it
+                        # just declines to *pretend* q was measured more
+                        # precisely than the grid the model was trained to
+                        # produce allows. Half a grid step in each
+                        # direction keeps the dithered value inside the
+                        # cell the model actually generated (centered,
+                        # unbiased); the clip keeps it a valid np.interp
+                        # input (q must stay in [0, 1)).
+                        half_step = 0.5 / grid
+                        q = np.clip(
+                            q
+                            + quantile_dither_rng.uniform(
+                                -half_step, half_step, size=len(q)
+                            ),
+                            0.0,
+                            np.nextafter(1.0, 0.0),
+                        )
+
                         group_series.loc[valid] = np.interp(
-                            group_series.loc[valid].to_numpy(),
+                            q,
                             quantile_positions,
                             quantile_values,
                         )
