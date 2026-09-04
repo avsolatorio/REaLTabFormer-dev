@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import pytest
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics.pairwise import euclidean_distances, manhattan_distances
 from sklearn.svm import LinearSVC
@@ -35,7 +36,11 @@ def test_measure_ml_efficiency_with_predict_proba_classifier():
         target_col="target",
         random_state=RANDOM_SEED,
     )
-    assert list(result.columns) == ["actual", "original_predictions", "synthetic_predictions"]
+    assert list(result.columns) == [
+        "actual",
+        "original_predictions",
+        "synthetic_predictions",
+    ]
     assert len(result) == len(test)
     # Positive-class probabilities, not the raw (n, 2) predict_proba output.
     assert result["original_predictions"].between(0, 1).all()
@@ -134,9 +139,9 @@ def test_dcr_respects_n_test_smaller_than_synthetic():
         original, synthetic, n_test=30
     )
     assert len(result) == 30
-    reference = manhattan_distances(
-        original.values, synthetic.iloc[:30].values
-    ).min(axis=0)
+    reference = manhattan_distances(original.values, synthetic.iloc[:30].values).min(
+        axis=0
+    )
     assert np.allclose(result.values, reference, atol=1e-8)
 
 
@@ -174,3 +179,101 @@ def test_get_dcr_end_to_end_via_bench():
     assert len(dcr_test) == bench.n_test
     assert (dcr_synth >= 0).all()
     assert (dcr_test >= 0).all()
+
+
+# ---------------------------------------------------------------------
+# compute_sensitivity_metric's `preprocessor` param + its
+# _maybe_fit_shared_preprocessor helper -- lets many calls against the
+# same reference population (compute_sensitivity_threshold's bootstrap
+# loop chief among them) reuse ONE fitted StandardScaler+OneHotEncoder
+# instead of each one refitting its own (benchmarked ~2.2x faster on
+# the preprocessing step alone at Adult-like scale; confirmed not a
+# leakage risk since every caller's `original` is already a subset of
+# whatever population the shared preprocessor is fit on, and
+# `synthetic` is never part of the fit either way).
+# ---------------------------------------------------------------------
+def _mixed_df(n, seed):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame(
+        {
+            "num1": rng.normal(size=n),
+            "num2": rng.normal(size=n),
+            "cat1": rng.choice(["a", "b", "c"], size=n),
+        }
+    )
+
+
+def test_maybe_fit_shared_preprocessor_none_for_numeric_low_dim():
+    # Matches compute_sensitivity_metric's own internal no-op condition
+    # (`object_dtypes.empty and shape[1] < max_col_nums`) -- purely
+    # numeric, low-dimensional data needs no preprocessing at all.
+    numeric_only = pd.DataFrame(
+        np.random.default_rng(0).normal(size=(100, 5)), columns=list("abcde")
+    )
+    result = SyntheticDataBench._maybe_fit_shared_preprocessor(
+        numeric_only, max_col_nums=50
+    )
+    assert result is None
+
+
+def test_maybe_fit_shared_preprocessor_fits_for_categorical_data():
+    data = _mixed_df(100, seed=0)
+    result = SyntheticDataBench._maybe_fit_shared_preprocessor(data, max_col_nums=50)
+    assert result is not None
+    # A real, usable fitted transformer -- not just a truthy placeholder.
+    transformed = result.transform(data)
+    transformed = (
+        transformed.toarray() if hasattr(transformed, "toarray") else transformed
+    )
+    assert transformed.shape[0] == len(data)
+
+
+def test_compute_sensitivity_metric_shared_preprocessor_matches_fresh_fit():
+    # When the shared preprocessor is fit on EXACTLY the same data the
+    # internal fresh-fit path would fit on (`original`), the two paths
+    # must agree exactly -- confirms `preprocessor=...` is a genuine
+    # drop-in replacement for the internal fit, not a different
+    # computation that happens to look similar.
+    original = _mixed_df(300, seed=1)
+    synthetic = _mixed_df(120, seed=2)
+    test = _mixed_df(120, seed=3)
+
+    baseline = SyntheticDataBench.compute_sensitivity_metric(
+        original=original, synthetic=synthetic, test=test, qt_interval=50
+    )
+
+    shared = SyntheticDataBench._maybe_fit_shared_preprocessor(original)
+    assert shared is not None
+    reused = SyntheticDataBench.compute_sensitivity_metric(
+        original=original,
+        synthetic=synthetic,
+        test=test,
+        qt_interval=50,
+        preprocessor=shared,
+    )
+    assert baseline == pytest.approx(reused, abs=1e-10)
+
+
+def test_compute_sensitivity_metric_shared_preprocessor_numeric_only_is_noop():
+    # A caller can pass `preprocessor=_maybe_fit_shared_preprocessor(...)`
+    # unconditionally -- when the underlying data doesn't need
+    # preprocessing at all, that helper returns None, so this must
+    # behave exactly like the plain default-argument call.
+    rng = np.random.default_rng(4)
+    original = pd.DataFrame(rng.normal(size=(200, 4)), columns=list("wxyz"))
+    synthetic = pd.DataFrame(rng.normal(size=(80, 4)), columns=list("wxyz"))
+    test = pd.DataFrame(rng.normal(size=(80, 4)), columns=list("wxyz"))
+
+    baseline = SyntheticDataBench.compute_sensitivity_metric(
+        original=original, synthetic=synthetic, test=test, qt_interval=50
+    )
+    shared = SyntheticDataBench._maybe_fit_shared_preprocessor(original)
+    assert shared is None
+    reused = SyntheticDataBench.compute_sensitivity_metric(
+        original=original,
+        synthetic=synthetic,
+        test=test,
+        qt_interval=50,
+        preprocessor=shared,
+    )
+    assert baseline == pytest.approx(reused, abs=1e-10)

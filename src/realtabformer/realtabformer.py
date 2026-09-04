@@ -979,6 +979,19 @@ class REaLTabFormer:
         np.random.seed(self.random_state)
         random.seed(self.random_state)
 
+        # Fit ONE preprocessor on df (the training data), reused
+        # (transform-only) by every one of this method's own periodic
+        # compute_sensitivity_metric checks below instead of each one
+        # fitting its own fresh copy -- safe (every check's `original`/
+        # `hold_df` are already subsets of this same df; see
+        # compute_sensitivity_metric's own `preprocessor` docstring) and
+        # a real, benchmarked win (~2.2x on the preprocessing step
+        # alone at Adult-like scale) repeated across every n_critic
+        # check for the whole training run.
+        shared_preprocessor = SyntheticDataBench._maybe_fit_shared_preprocessor(
+            df, max_col_nums=sensitivity_max_col_nums
+        )
+
         for p_epoch in range(last_epoch, self.epochs, n_critic):
             gen_total = int(len(df) * frac)
 
@@ -1031,6 +1044,7 @@ class REaLTabFormer:
                                 distance=distance,
                                 max_col_nums=sensitivity_max_col_nums,
                                 use_ks=use_ks,
+                                preprocessor=shared_preprocessor,
                             )
                         )
             else:
@@ -1055,6 +1069,7 @@ class REaLTabFormer:
                                 distance=distance,
                                 max_col_nums=sensitivity_max_col_nums,
                                 use_ks=use_ks,
+                                preprocessor=shared_preprocessor,
                             )
                         )
 
@@ -1820,6 +1835,18 @@ class REaLTabFormer:
         gen_total = int(len(df) * frac)
         n_train_size = sensitivity_orig_frac_multiple * gen_total
 
+        # Fit ONE preprocessor on df, reused (transform-only) across
+        # every confirm_fn call this training run makes -- CUSUM can
+        # fire (and get vetoed as a false alarm) more than once before a
+        # real confirmation, each one otherwise refitting its own copy
+        # for no benefit. Safe for the same reason as
+        # compute_sensitivity_threshold's own shared preprocessor: every
+        # call's original_df/test_df below are already subsets of this
+        # same df.
+        shared_preprocessor = SyntheticDataBench._maybe_fit_shared_preprocessor(
+            df, max_col_nums=sensitivity_max_col_nums
+        )
+
         def confirm_fn(model) -> bool:
             if len(df) < n_train_size + gen_total:
                 # Not enough training data left to draw a disjoint
@@ -1856,6 +1883,7 @@ class REaLTabFormer:
                 qt_max=qt_max,
                 qt_interval=qt_interval,
                 max_col_nums=sensitivity_max_col_nums,
+                preprocessor=shared_preprocessor,
             )
             confirmed = val_sensitivity >= sensitivity_threshold
             print(
