@@ -847,6 +847,7 @@ def run_cusum(
         batch_size=args.batch_size,
         random_state=RANDOM_SEED,
         checkpoints_dir=str(results_dir / f"{run_id}_ckpt_cusum"),
+        numeric_quantile_encoding=args.numeric_quantile_encoding,
     )
     t0 = time.time()
     trainer = model.fit(
@@ -898,6 +899,8 @@ def run_cusum(
         epochs_ceiling=args.epochs,
         batch_size=args.batch_size,
         device=args.device,
+        numeric_quantile_encoding=args.numeric_quantile_encoding,
+        cusum_confirm_with_sensitivity=args.cusum_confirm_with_sensitivity,
         cusum_check_every=args.cusum_check_every,
         cusum_deltas=mon.deltas,
         alarm_step=mon.alarm_step,
@@ -979,6 +982,7 @@ def run_full(
         batch_size=args.batch_size,
         random_state=RANDOM_SEED,
         checkpoints_dir=str(results_dir / f"{run_id}_ckpt_full"),
+        numeric_quantile_encoding=args.numeric_quantile_encoding,
     )
     t0 = time.time()
     trainer = model.fit(
@@ -997,6 +1001,7 @@ def run_full(
         epochs_ceiling=args.epochs,
         batch_size=args.batch_size,
         device=args.device,
+        numeric_quantile_encoding=args.numeric_quantile_encoding,
         global_step=trainer.state.global_step,
         elapsed_s=elapsed,
     )
@@ -1080,6 +1085,7 @@ def run_sensitivity(
         batch_size=args.batch_size,
         random_state=RANDOM_SEED,
         checkpoints_dir=str(results_dir / f"{run_id}_ckpt_sensitivity"),
+        numeric_quantile_encoding=args.numeric_quantile_encoding,
     )
     t0 = time.time()
     trainer = model.fit(
@@ -1121,6 +1127,7 @@ def run_sensitivity(
         epochs_ceiling=args.epochs,
         batch_size=args.batch_size,
         device=args.device,
+        numeric_quantile_encoding=args.numeric_quantile_encoding,
         n_critic=args.sensitivity_n_critic,
         n_critic_stop=args.sensitivity_n_critic_stop,
         num_bootstrap=args.sensitivity_num_bootstrap,
@@ -1472,13 +1479,33 @@ def main():
         default=None,
         help="Prefix for output files; defaults to mode+epochs+timestamp.",
     )
+    parser.add_argument(
+        "--numeric-quantile-encoding",
+        action="store_true",
+        default=False,
+        help="Represent numeric columns by their quantile position (CDF value) "
+        "under the column's own empirical distribution instead of fixed "
+        "absolute-precision digits -- see REaLTabFormer's own "
+        "numeric_quantile_encoding docstring. Threaded into every training "
+        "mode's REaLTabFormer(...) constructor (cusum/full/sensitivity); "
+        "not applicable to --mode checkpoint (an already-trained model's "
+        "own fit-time setting applies there instead). Off by default, "
+        "matching the library's own default -- pass this to compare "
+        "against a --numeric-quantile-encoding run of the same dataset/"
+        "mode (see run_quantile_comparison.py for a script that runs both "
+        "sides of that comparison, across every stopping method, and "
+        "aggregates the results).",
+    )
     args = parser.parse_args()
 
     if args.mode == "checkpoint" and not args.checkpoint_dir:
         parser.error("--mode checkpoint requires --checkpoint-dir")
 
     if args.run_id is None:
-        args.run_id = f"{args.dataset}_{args.mode}_ep{args.epochs}_{int(time.time())}"
+        qenc_tag = "qenc" if args.numeric_quantile_encoding else "base"
+        args.run_id = (
+            f"{args.dataset}_{args.mode}_{qenc_tag}_ep{args.epochs}_{int(time.time())}"
+        )
 
     loader, target_col, categorical, target_pos_val = DATASET_CONFIGS[args.dataset]
     print(f"Loading {args.dataset} data from {DATA_DIR} ...", flush=True)

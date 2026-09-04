@@ -79,6 +79,8 @@ def run_one(dataset, args, log_dir: Path) -> dict:
                 "--cusum-confirm-num-bootstrap",
                 str(args.cusum_confirm_num_bootstrap),
             ]
+    if args.numeric_quantile_encoding:
+        cmd += ["--numeric-quantile-encoding"]
 
     print(
         f"\n{'=' * 70}\nSTARTING {dataset} (run_id={run_id})\n"
@@ -193,6 +195,19 @@ def main():
         help="Passed through to run_experiment.py's own "
         "--cusum-confirm-num-bootstrap. Leave unset to reuse each dataset's "
         "own --sensitivity-num-bootstrap value.",
+    )
+    parser.add_argument(
+        "--numeric-quantile-encoding",
+        action="store_true",
+        default=False,
+        help="Passed through to run_experiment.py's own "
+        "--numeric-quantile-encoding -- for every dataset in this batch, "
+        "represent numeric columns by their quantile position instead of "
+        "fixed absolute-precision digits. Off by default; see "
+        "run_quantile_comparison.py for a script that runs both sides of "
+        "this comparison, across every stopping method, and aggregates "
+        "the results, rather than needing two separate batches of this "
+        "script.",
     )
     parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "results"))
     parser.add_argument(
