@@ -836,6 +836,26 @@ def run_cusum(
 
     attach_trajectory_logger(trajectory_path)
 
+    def cusum_diagnostic_log_fn(step, val_sensitivity, threshold):
+        # Written to the SAME trajectory file as the regular
+        # "post_calibration"/"settle"/"warmup" lines (attach_trajectory_logger
+        # above), distinguished by phase="diagnostic" -- joinable on `step`
+        # against the regular check that ran at the same step, rather than
+        # needing a separate file.
+        record = dict(
+            phase="diagnostic",
+            step=step,
+            val_sensitivity=val_sensitivity,
+            threshold=threshold,
+        )
+        with open(trajectory_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+        print(
+            f"[cusum-diagnostic] step={step} val_sensitivity={val_sensitivity} "
+            f"threshold={threshold:.5f}",
+            flush=True,
+        )
+
     print(
         f"\n=== RUN: overfitting_detection_method='cusum', "
         f"epochs={args.epochs}, device={args.device} ===",
@@ -868,6 +888,10 @@ def run_cusum(
         cusum_confirm_bootstrap_n_jobs=args.sensitivity_bootstrap_n_jobs,
         cusum_confirm_gen_kwargs=(
             {"gen_batch": args.gen_batch} if args.gen_batch else None
+        ),
+        cusum_diagnostic_with_sensitivity=args.cusum_diagnostic_with_sensitivity,
+        cusum_diagnostic_log_fn=(
+            cusum_diagnostic_log_fn if args.cusum_diagnostic_with_sensitivity else None
         ),
     )
     elapsed = time.time() - t0
@@ -1353,6 +1377,25 @@ def main():
         "override it), so the two share a cache entry when frac/qt_max/etc "
         "also match (the common case) instead of computing the bootstrap "
         "twice.",
+    )
+    parser.add_argument(
+        "--cusum-diagnostic-with-sensitivity",
+        action="store_true",
+        default=False,
+        help="Research-probe flag, independent of "
+        "--cusum-confirm-with-sensitivity: runs the same sensitivity-style "
+        "generate-and-DCR check at EVERY CUSUM check from the start (not "
+        "just when CUSUM fires), logging val_sensitivity/threshold as "
+        "phase='diagnostic' lines in the trajectory file, joinable on "
+        "step against the regular post_calibration lines. Never gates "
+        "anything -- purely observational. Reuses every "
+        "--cusum-confirm-* flag's value for its own threshold/generation "
+        "setup, even when --cusum-confirm-with-sensitivity itself is "
+        "off. Meaningfully more expensive than plain CUSUM (a real "
+        ".generate() call on every check) -- a tool for investigating "
+        "one dataset's behavior (e.g. whether the risk signal is already "
+        "elevated from the very first check), not for a normal run. "
+        "Only used with --mode cusum.",
     )
     parser.add_argument(
         "--sensitivity-n-critic",

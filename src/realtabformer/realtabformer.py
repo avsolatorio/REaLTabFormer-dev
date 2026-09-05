@@ -519,6 +519,10 @@ class REaLTabFormer:
         cusum_confirm_cache_dir: Optional[Union[str, Path]] = None,
         cusum_confirm_bootstrap_n_jobs: Optional[int] = None,
         cusum_confirm_gen_kwargs: Optional[Dict[str, Any]] = None,
+        cusum_diagnostic_with_sensitivity: bool = False,
+        cusum_diagnostic_log_fn: Optional[
+            Callable[[int, Optional[float], float], None]
+        ] = None,
     ) -> Trainer:
         """Train the REaLTabFormer model on the tabular data.
 
@@ -637,6 +641,15 @@ class REaLTabFormer:
               CUSUM's accumulated evidence and training continues. See
               `_train_with_cusum`'s own docstring for the full rationale
               and every `cusum_confirm_*` parameter's meaning.
+            cusum_diagnostic_with_sensitivity: Research-probe flag,
+              independent of `cusum_confirm_with_sensitivity` -- runs
+              the same sensitivity-style check at EVERY CUSUM check
+              (not just at the alarm) purely to observe the signal,
+              never gating anything. See `_train_with_cusum`'s own
+              docstring.
+            cusum_diagnostic_log_fn: Only used when
+              `cusum_diagnostic_with_sensitivity=True`. See
+              `_train_with_cusum`'s own docstring.
 
         Returns:
             Trainer
@@ -699,6 +712,10 @@ class REaLTabFormer:
                     cusum_confirm_cache_dir=cusum_confirm_cache_dir,
                     cusum_confirm_bootstrap_n_jobs=cusum_confirm_bootstrap_n_jobs,
                     cusum_confirm_gen_kwargs=cusum_confirm_gen_kwargs,
+                    cusum_diagnostic_with_sensitivity=(
+                        cusum_diagnostic_with_sensitivity
+                    ),
+                    cusum_diagnostic_log_fn=cusum_diagnostic_log_fn,
                 )
             elif overfitting_detection_method == "none" or n_critic <= 0:
                 # NOTE: field_weights/predict_fields/compute_loss_func were
@@ -1896,6 +1913,126 @@ class REaLTabFormer:
 
         return confirm_fn
 
+    def _build_cusum_diagnostic_fn(
+        self,
+        df: pd.DataFrame,
+        device,
+        frac: float,
+        frac_max_data: int,
+        qt_max: Union[str, float],
+        qt_max_default: float,
+        qt_interval: int,
+        num_bootstrap: int,
+        quantile: float,
+        sensitivity_orig_frac_multiple: int,
+        sensitivity_max_col_nums: int,
+        cache_dir: Optional[Union[str, Path]],
+        bootstrap_n_jobs: Optional[int],
+        gen_kwargs: Optional[Dict[str, Any]],
+        log_fn: Callable[[int, Optional[float], float], None],
+    ):
+        """Research-probe variant of `_build_cusum_confirm_fn`: computes
+        the exact same sensitivity-style statistic (one `.generate()`
+        call plus one `compute_sensitivity_metric` comparison against a
+        bootstrap threshold precomputed once, before training), but at
+        EVERY CUSUM check -- not just when CUSUM actually fires. Never
+        gates anything (the returned closure has no return value CUSUM's
+        control flow depends on); its only effect is calling
+        `log_fn(step, val_sensitivity, sensitivity_threshold)` --
+        `val_sensitivity=None` on the same fail-open paths
+        `_build_cusum_confirm_fn` has (can't generate stable samples
+        yet, or not enough data left for a disjoint split).
+
+        Exists to answer a question a single confirmation at the alarm
+        point can't: whether this more expensive, trustworthy risk
+        signal is already close to `sensitivity_threshold` from the very
+        first post-calibration check -- which would mean a dataset where
+        CUSUM fires much earlier than the sensitivity mechanism isn't
+        catching a noisy false alarm a confirmation would reject, but
+        reading a genuinely elevated signal from the start (e.g. because
+        every numeric column is high-cardinality enough that even an
+        early, undertrained model's synthetic rows already sit close to
+        some real one). Meaningfully more expensive than plain CUSUM --
+        pays for a real `.generate()` on every check, not just at the
+        eventual alarm -- so this is a diagnostic tool for investigating
+        one specific dataset's behavior, not something to combine with
+        an ordinary training run.
+        """
+        frac = min(frac, frac_max_data / len(df))
+
+        if isinstance(qt_max, str):
+            if qt_max != "compute":
+                raise ValueError(f"Unexpected qt_max value: {qt_max}")
+            dup_rate = df.duplicated().mean() / 2
+            qt_max = dup_rate if dup_rate > 0 else qt_max_default
+
+        print(
+            "Computing the CUSUM-diagnostic sensitivity threshold...",
+            flush=True,
+        )
+        sensitivity_values = SyntheticDataBench.compute_sensitivity_threshold(
+            train_data=df,
+            num_bootstrap=num_bootstrap,
+            frac=frac / 2,
+            qt_max=qt_max,
+            qt_interval=qt_interval,
+            return_values=True,
+            quantile=quantile,
+            max_col_nums=sensitivity_max_col_nums,
+            full_sensitivity=False,
+            sensitivity_orig_frac_multiple=sensitivity_orig_frac_multiple,
+            cache_dir=cache_dir,
+            n_jobs=bootstrap_n_jobs,
+        )
+        sensitivity_threshold = float(np.quantile(sensitivity_values, quantile))
+        print(
+            f"CUSUM-diagnostic sensitivity threshold: {sensitivity_threshold}",
+            flush=True,
+        )
+
+        gen_total = int(len(df) * frac)
+        n_train_size = sensitivity_orig_frac_multiple * gen_total
+
+        # Same reasoning as `_build_cusum_confirm_fn`'s own shared
+        # preprocessor -- fit once, reused (transform-only) across every
+        # diagnostic check this training run makes, since every call's
+        # original_df/test_df below are already subsets of this same df.
+        shared_preprocessor = SyntheticDataBench._maybe_fit_shared_preprocessor(
+            df, max_col_nums=sensitivity_max_col_nums
+        )
+
+        def diagnostic_fn(model, step) -> None:
+            if len(df) < n_train_size + gen_total:
+                log_fn(step, None, sensitivity_threshold)
+                return
+            try:
+                gen_df = self.sample(
+                    n_samples=gen_total, device=device, **(gen_kwargs or {})
+                )
+            except SampleEmptyLimitError:
+                log_fn(step, None, sensitivity_threshold)
+                return
+            if len(gen_df) < gen_total:
+                log_fn(step, None, sensitivity_threshold)
+                return
+
+            original_df = df.sample(n=n_train_size, replace=False)
+            test_df = df.loc[df.index.difference(original_df.index)].sample(
+                n=gen_total, replace=False
+            )
+            val_sensitivity = SyntheticDataBench.compute_sensitivity_metric(
+                original=original_df,
+                synthetic=gen_df.iloc[:gen_total],
+                test=test_df,
+                qt_max=qt_max,
+                qt_interval=qt_interval,
+                max_col_nums=sensitivity_max_col_nums,
+                preprocessor=shared_preprocessor,
+            )
+            log_fn(step, float(val_sensitivity), sensitivity_threshold)
+
+        return diagnostic_fn
+
     def _train_with_cusum(
         self,
         df: pd.DataFrame,
@@ -1923,6 +2060,10 @@ class REaLTabFormer:
         cusum_confirm_cache_dir: Optional[Union[str, Path]] = None,
         cusum_confirm_bootstrap_n_jobs: Optional[int] = None,
         cusum_confirm_gen_kwargs: Optional[Dict[str, Any]] = None,
+        cusum_diagnostic_with_sensitivity: bool = False,
+        cusum_diagnostic_log_fn: Optional[
+            Callable[[int, Optional[float], float], None]
+        ] = None,
     ) -> Trainer:
         """Train with the CUSUM-based, generation-free overfitting
         detector (see `rtf_cusum.py`) instead of the bootstrap-DCR
@@ -2045,6 +2186,24 @@ class REaLTabFormer:
               `cusum_confirm_with_sensitivity=True`. Extra kwargs for
               the confirmation's own `.generate()` call (e.g.
               `{"gen_batch": 128}`).
+            cusum_diagnostic_with_sensitivity: Research-probe flag,
+              independent of `cusum_confirm_with_sensitivity` -- when
+              True, runs the SAME sensitivity-style generate-and-DCR
+              check `cusum_confirm_with_sensitivity` runs at the alarm
+              point, but at EVERY CUSUM check from the start, purely to
+              observe the signal (never gates anything). Reuses every
+              `cusum_confirm_*` parameter above for its own threshold/
+              generation setup. Meaningfully more expensive than plain
+              CUSUM (a real `.generate()` call on every check); a tool
+              for investigating one dataset's behavior, not a training
+              default. See `_build_cusum_diagnostic_fn`'s own docstring.
+            cusum_diagnostic_log_fn: Only used when
+              `cusum_diagnostic_with_sensitivity=True`. Called as
+              `log_fn(step, val_sensitivity, sensitivity_threshold)` at
+              every check -- `val_sensitivity=None` when a stable sample
+              couldn't be generated yet. `None` (default): prints each
+              result instead, so the diagnostic is still visible without
+              needing to wire a custom logger.
         """
         # HF's Trainer defaults to stripping any dataset column not in
         # the model's forward() signature (`remove_unused_columns=True`)
@@ -2125,12 +2284,46 @@ class REaLTabFormer:
                 gen_kwargs=cusum_confirm_gen_kwargs,
             )
 
+        diagnostic_fn = None
+        if cusum_diagnostic_with_sensitivity:
+            log_fn = cusum_diagnostic_log_fn
+            if log_fn is None:
+
+                def log_fn(step, val_sensitivity, threshold):
+                    print(
+                        f"CUSUM-diagnostic: step={step} "
+                        f"val_sensitivity={val_sensitivity} "
+                        f"threshold={threshold:.5f}",
+                        flush=True,
+                    )
+
+            diagnostic_fn = self._build_cusum_diagnostic_fn(
+                df,
+                device=device,
+                frac=cusum_confirm_frac,
+                frac_max_data=cusum_confirm_frac_max_data,
+                qt_max=cusum_confirm_qt_max,
+                qt_max_default=cusum_confirm_qt_max_default,
+                qt_interval=cusum_confirm_qt_interval,
+                num_bootstrap=cusum_confirm_num_bootstrap,
+                quantile=cusum_confirm_quantile,
+                sensitivity_orig_frac_multiple=(
+                    cusum_confirm_sensitivity_orig_frac_multiple
+                ),
+                sensitivity_max_col_nums=cusum_confirm_sensitivity_max_col_nums,
+                cache_dir=cusum_confirm_cache_dir,
+                bootstrap_n_jobs=cusum_confirm_bootstrap_n_jobs,
+                gen_kwargs=cusum_confirm_gen_kwargs,
+                log_fn=log_fn,
+            )
+
         trainer.add_callback(
             CUSUMEarlyStoppingCallback(
                 monitor,
                 callback_dataset,
                 alarm_checkpoint_dir=alarm_checkpoint_dir,
                 confirm_fn=confirm_fn,
+                diagnostic_fn=diagnostic_fn,
             )
         )
 

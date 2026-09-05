@@ -650,6 +650,23 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
     pays for) directly resolves that ambiguity without needing a new
     detection theory. ``None`` (default): unchanged behavior, alarm
     always stops training immediately.
+
+    ``diagnostic_fn``, if given, is called as ``diagnostic_fn(model,
+    step)`` at EVERY real post-calibration check -- not just when CUSUM
+    fires, unlike ``confirm_fn`` -- purely as an observational side
+    channel: its return value (if any) is ignored and it never affects
+    ``control.should_training_stop`` or anything else CUSUM does. Exists
+    to answer a research question ``confirm_fn`` alone can't: whether a
+    more expensive, trustworthy risk signal (e.g. a real sensitivity-
+    style generate-and-DCR check) is already close to "risky" from the
+    very first check, which would explain a dataset where CUSUM fires
+    much earlier than the sensitivity mechanism would, in a way a single
+    confirmation at the eventual alarm point can't reveal. Meaningfully
+    more expensive than plain CUSUM when set (pays for whatever
+    ``diagnostic_fn`` does -- typically a real ``.generate()`` call --
+    on every check, not just at the alarm), so this is a diagnostic tool
+    for investigating a specific dataset's behavior, not a training
+    default. ``None`` (default): not called, zero overhead.
     """
 
     def __init__(
@@ -658,11 +675,13 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         train_dataset,
         alarm_checkpoint_dir: Optional[str] = None,
         confirm_fn: Optional[Callable[[torch.nn.Module], bool]] = None,
+        diagnostic_fn: Optional[Callable[[torch.nn.Module, int], None]] = None,
     ) -> None:
         self.monitor = monitor
         self.train_dataset = train_dataset
         self.alarm_checkpoint_dir = alarm_checkpoint_dir
         self.confirm_fn = confirm_fn
+        self.diagnostic_fn = diagnostic_fn
 
     def _get_rows(self, indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         rows = self.train_dataset[indices]
@@ -729,6 +748,31 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         self._model = model
 
         alarmed = self.monitor.maybe_check(step, model, self._get_rows)
+
+        if (
+            self.diagnostic_fn is not None
+            and self.monitor.history
+            and self.monitor.history[-1][0] == step
+        ):
+            # A real post-calibration check happened at this step (not a
+            # settle/warmup step consumed without scoring) -- same
+            # detection `attach_trajectory_logger` (cusum_validation/
+            # run_experiment.py) uses to know when to log a
+            # "post_calibration" line, reused here for the same reason:
+            # `maybe_check`'s own return value can't distinguish "no
+            # check ran yet" from "checked, didn't alarm". Runs
+            # regardless of `alarmed` -- unlike `confirm_fn`, this is
+            # meant to observe the signal from the very first check, not
+            # just at the eventual alarm point. Same device-safety
+            # wrapping as `confirm_fn` below, for the same reason
+            # (`diagnostic_fn` typically calls `.sample()` too).
+            was_training = model.training
+            device = next(model.parameters()).device
+            self.diagnostic_fn(model, step)
+            model.to(device)
+            if was_training:
+                model.train()
+
         if alarmed and self.confirm_fn is not None:
             # `confirm_fn` typically calls `.sample()` to generate real
             # data for its own check -- generation is normally called

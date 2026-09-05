@@ -873,3 +873,117 @@ def test_fit_cusum_confirm_true_stops_like_unconfirmed_alarm(monkeypatch):
     assert mon.alarm_step is not None, "expected the confirmed alarm to stick"
     assert mon.false_alarms == []
     assert mon.alarm_checkpoint_dir is not None
+
+
+# ---------------------------------------------------------------------
+# cusum_diagnostic_with_sensitivity: an observational-only check run at
+# EVERY CUSUM check (not just when CUSUM fires), used to investigate
+# whether a sensitivity-style risk signal is already elevated from the
+# start on a specific dataset -- must never gate training, unlike
+# cusum_confirm_with_sensitivity.
+# ---------------------------------------------------------------------
+def test_fit_cusum_diagnostic_never_gates_training(monkeypatch):
+    # Force every diagnostic check to report a value far above any
+    # plausible threshold ("looks maximally risky") -- if diagnostic_fn
+    # were (incorrectly) wired to affect control flow the way confirm_fn
+    # does, this would stop training at the first alarm. It must not:
+    # cusum_confirm_with_sensitivity is left off here, so the plain
+    # (unconfirmed) CUSUM alarm still governs when training stops --
+    # diagnostic_with_sensitivity is purely a side channel on top of it.
+    monkeypatch.setattr(
+        SyntheticDataBench,
+        "compute_sensitivity_metric",
+        staticmethod(lambda **kwargs: 999.0),
+    )
+
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=30,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+    )
+    trainer = model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_diagnostic_with_sensitivity=True,
+        cusum_confirm_num_bootstrap=5,
+    )
+    mon = model.cusum_monitor
+    # The alarm still fires/stops exactly like the plain (no confirm, no
+    # diagnostic) path would -- diagnostic_with_sensitivity changed
+    # nothing about when/whether CUSUM stops.
+    assert mon.alarm_step is not None
+    assert trainer.args.remove_unused_columns is False
+
+
+def test_fit_cusum_diagnostic_logs_every_check_from_the_start(monkeypatch):
+    # The actual research-probe behavior: log_fn must be called on EVERY
+    # post-calibration check, starting from the FIRST one -- not just at
+    # the eventual alarm step (that's what distinguishes this from
+    # cusum_confirm_with_sensitivity, which only ever runs once, at the
+    # alarm). Uses a real, varying (not constant) fake sensitivity value
+    # so a real alarm still fires at some point, confirming the log
+    # covers checks both before and at the alarm.
+    calls = {"n": 0}
+
+    def fake_compute_sensitivity_metric(**kwargs):
+        calls["n"] += 1
+        # Strictly increasing -- crosses any fixed threshold eventually.
+        return float(calls["n"])
+
+    monkeypatch.setattr(
+        SyntheticDataBench,
+        "compute_sensitivity_metric",
+        staticmethod(fake_compute_sensitivity_metric),
+    )
+
+    logged = []
+
+    def log_fn(step, val_sensitivity, threshold):
+        logged.append((step, val_sensitivity, threshold))
+
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=30,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+    )
+    model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_diagnostic_with_sensitivity=True,
+        cusum_diagnostic_log_fn=log_fn,
+        cusum_confirm_num_bootstrap=5,
+    )
+    mon = model.cusum_monitor
+    assert mon.alarm_step is not None
+
+    # More than one call -- the whole point is observing the signal
+    # across multiple checks, not just once at the end.
+    assert len(logged) > 1
+    # Every logged val_sensitivity is a real (non-None) float here -- the
+    # tiny synthetic dataset generates stable samples throughout.
+    assert all(v is not None for _, v, _ in logged)
+    # Strictly increasing, matching fake_compute_sensitivity_metric's own
+    # call-count-based return value -- confirms log_fn really is called
+    # once per check, in order, not e.g. only at the final step.
+    values = [v for _, v, _ in logged]
+    assert values == sorted(values)
+    assert len(set(values)) == len(values)
+    # The threshold passed through is the same precomputed constant on
+    # every call (comes from one bootstrap computed before training, not
+    # recomputed per check).
+    thresholds = {t for _, _, t in logged}
+    assert len(thresholds) == 1
