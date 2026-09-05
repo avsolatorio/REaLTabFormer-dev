@@ -889,6 +889,7 @@ def run_cusum(
         cusum_confirm_gen_kwargs=(
             {"gen_batch": args.gen_batch} if args.gen_batch else None
         ),
+        cusum_confirm_patience=args.cusum_confirm_patience,
         cusum_diagnostic_with_sensitivity=args.cusum_diagnostic_with_sensitivity,
         cusum_diagnostic_log_fn=(
             cusum_diagnostic_log_fn if args.cusum_diagnostic_with_sensitivity else None
@@ -925,6 +926,7 @@ def run_cusum(
         device=args.device,
         numeric_quantile_encoding=args.numeric_quantile_encoding,
         cusum_confirm_with_sensitivity=args.cusum_confirm_with_sensitivity,
+        cusum_confirm_patience=args.cusum_confirm_patience,
         cusum_check_every=args.cusum_check_every,
         cusum_deltas=mon.deltas,
         alarm_step=mon.alarm_step,
@@ -1377,6 +1379,23 @@ def main():
         "override it), so the two share a cache entry when frac/qt_max/etc "
         "also match (the common case) instead of computing the bootstrap "
         "twice.",
+    )
+    parser.add_argument(
+        "--cusum-confirm-patience",
+        type=int,
+        default=1,
+        help="Only used with --cusum-confirm-with-sensitivity. Number of "
+        "CONSECUTIVE confirmed checks required before actually stopping, "
+        "instead of acting on the first one. Default 1 (original, "
+        "single-shot behavior). Added after instrumenting "
+        "--cusum-diagnostic-with-sensitivity on wilt found the "
+        "confirmation statistic itself can be too noisy to trust on a "
+        "single check -- it read clearly below its own decision "
+        "threshold at the exact step CUSUM fired, while briefly "
+        "crossing above it 40 steps earlier with no alarm to confirm at "
+        "the time. Mirrors the sensitivity mechanism's own "
+        "--sensitivity-n-critic-stop, which requires multiple "
+        "consecutive non-improving rounds for the same reason.",
     )
     parser.add_argument(
         "--cusum-diagnostic-with-sensitivity",

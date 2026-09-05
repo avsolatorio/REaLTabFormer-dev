@@ -79,6 +79,8 @@ def run_one(dataset, args, log_dir: Path) -> dict:
                 "--cusum-confirm-num-bootstrap",
                 str(args.cusum_confirm_num_bootstrap),
             ]
+        if args.cusum_confirm_patience != 1:
+            cmd += ["--cusum-confirm-patience", str(args.cusum_confirm_patience)]
     if args.numeric_quantile_encoding:
         cmd += ["--numeric-quantile-encoding"]
 
@@ -195,6 +197,14 @@ def main():
         help="Passed through to run_experiment.py's own "
         "--cusum-confirm-num-bootstrap. Leave unset to reuse each dataset's "
         "own --sensitivity-num-bootstrap value.",
+    )
+    parser.add_argument(
+        "--cusum-confirm-patience",
+        type=int,
+        default=1,
+        help="Passed through to run_experiment.py's own "
+        "--cusum-confirm-patience -- number of CONSECUTIVE confirmed checks "
+        "required before actually stopping. Default 1 (original behavior).",
     )
     parser.add_argument(
         "--numeric-quantile-encoding",

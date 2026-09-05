@@ -519,6 +519,7 @@ class REaLTabFormer:
         cusum_confirm_cache_dir: Optional[Union[str, Path]] = None,
         cusum_confirm_bootstrap_n_jobs: Optional[int] = None,
         cusum_confirm_gen_kwargs: Optional[Dict[str, Any]] = None,
+        cusum_confirm_patience: int = 1,
         cusum_diagnostic_with_sensitivity: bool = False,
         cusum_diagnostic_log_fn: Optional[
             Callable[[int, Optional[float], float], None]
@@ -634,13 +635,19 @@ class REaLTabFormer:
               false-alarm rate for the detector's decision threshold.
             cusum_confirm_with_sensitivity: Only used when
               `overfitting_detection_method="cusum"`. When True, a fired
-              alarm triggers a ONE-OFF sensitivity-style confirmation
-              (one `.generate()` call plus a bootstrap-DCR comparison,
-              not `_train_with_sensitivity`'s full periodic schedule)
-              before actually stopping -- a false-alarm result clears
-              CUSUM's accumulated evidence and training continues. See
+              alarm triggers a sensitivity-style confirmation (one
+              `.generate()` call plus a bootstrap-DCR comparison, not
+              `_train_with_sensitivity`'s full periodic schedule) before
+              actually stopping -- a false-alarm result clears CUSUM's
+              accumulated evidence and training continues. See
               `_train_with_cusum`'s own docstring for the full rationale
               and every `cusum_confirm_*` parameter's meaning.
+            cusum_confirm_patience: Only used when
+              `cusum_confirm_with_sensitivity=True`. Number of
+              CONSECUTIVE confirmed checks required before actually
+              stopping. `1` (default): one confirmation is enough
+              (original behavior). See `_train_with_cusum`'s own
+              docstring for why this exists.
             cusum_diagnostic_with_sensitivity: Research-probe flag,
               independent of `cusum_confirm_with_sensitivity` -- runs
               the same sensitivity-style check at EVERY CUSUM check
@@ -712,6 +719,7 @@ class REaLTabFormer:
                     cusum_confirm_cache_dir=cusum_confirm_cache_dir,
                     cusum_confirm_bootstrap_n_jobs=cusum_confirm_bootstrap_n_jobs,
                     cusum_confirm_gen_kwargs=cusum_confirm_gen_kwargs,
+                    cusum_confirm_patience=cusum_confirm_patience,
                     cusum_diagnostic_with_sensitivity=(
                         cusum_diagnostic_with_sensitivity
                     ),
@@ -2060,6 +2068,7 @@ class REaLTabFormer:
         cusum_confirm_cache_dir: Optional[Union[str, Path]] = None,
         cusum_confirm_bootstrap_n_jobs: Optional[int] = None,
         cusum_confirm_gen_kwargs: Optional[Dict[str, Any]] = None,
+        cusum_confirm_patience: int = 1,
         cusum_diagnostic_with_sensitivity: bool = False,
         cusum_diagnostic_log_fn: Optional[
             Callable[[int, Optional[float], float], None]
@@ -2186,6 +2195,36 @@ class REaLTabFormer:
               `cusum_confirm_with_sensitivity=True`. Extra kwargs for
               the confirmation's own `.generate()` call (e.g.
               `{"gen_batch": 128}`).
+            cusum_confirm_patience: Only used when
+              `cusum_confirm_with_sensitivity=True`. Number of
+              CONSECUTIVE confirmed checks required before actually
+              stopping, instead of acting on the first one. `1`
+              (default): unchanged, single-shot behavior. When greater
+              than 1, a confirmed-but-not-yet-sufficient check clears
+              CUSUM's accumulated evidence (via
+              `reset_after_pending_confirmation`, logged separately from
+              `false_alarms` since it wasn't rejected) and waits for the
+              next periodic check to confirm again -- independent of
+              whether CUSUM's own (reset) statistic alarms again on its
+              own. Any single non-confirmed check during the sequence
+              resets the count to zero, requiring a genuinely fresh
+              CUSUM alarm to restart. Exists because a single
+              confirmation check can itself be too noisy to trust on
+              some datasets: an actual investigation (instrumenting
+              `cusum_diagnostic_with_sensitivity` below) found the
+              confirmation statistic read clearly BELOW its own decision
+              threshold at the exact step CUSUM's own statistic fired,
+              while briefly crossing above it 40 steps earlier with no
+              alarm to confirm at the time -- single-shot noise on the
+              order of the threshold itself, the same problem the
+              sensitivity mechanism's own `n_critic_stop` (requiring
+              multiple consecutive non-improving rounds) already exists
+              to average out. Meaningfully increases the number of
+              `.generate()` calls paid for once CUSUM first fires
+              (up to `cusum_confirm_patience`, not just 1) -- still far
+              fewer than the sensitivity mechanism's full periodic
+              schedule from epoch 0, but a real added cost relative to
+              `cusum_confirm_patience=1`.
             cusum_diagnostic_with_sensitivity: Research-probe flag,
               independent of `cusum_confirm_with_sensitivity` -- when
               True, runs the SAME sensitivity-style generate-and-DCR
@@ -2323,6 +2362,7 @@ class REaLTabFormer:
                 callback_dataset,
                 alarm_checkpoint_dir=alarm_checkpoint_dir,
                 confirm_fn=confirm_fn,
+                confirm_patience=cusum_confirm_patience,
                 diagnostic_fn=diagnostic_fn,
             )
         )

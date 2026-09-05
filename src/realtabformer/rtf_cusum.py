@@ -328,6 +328,11 @@ class CUSUMOverfittingMonitor:
         # (see CUSUMEarlyStoppingCallback's confirm_fn) investigated and
         # found to be false positives -- see reset_after_false_alarm.
         self.false_alarms: List[Tuple[int, float]] = []
+        # (step, delta) pairs for alarms a confirmation check ACCEPTED
+        # but which didn't (yet) satisfy confirm_patience -- kept
+        # separate from false_alarms since these weren't rejected, just
+        # not persistent enough yet. See reset_after_pending_confirmation.
+        self.pending_confirmations: List[Tuple[int, float]] = []
 
     @property
     def delta(self) -> float:
@@ -579,6 +584,37 @@ class CUSUMOverfittingMonitor:
         self.alarm_step = None
         self.alarm_delta = None
 
+    def reset_after_pending_confirmation(self) -> None:
+        """Called when an external confirmation check ACCEPTS a fired
+        alarm as real risk, but `CUSUMEarlyStoppingCallback`'s
+        `confirm_patience` requires more than one such consecutive
+        confirmation before actually stopping, and this one wasn't the
+        last one needed yet.
+
+        Clears the accumulated evidence exactly like
+        `reset_after_false_alarm` does (same `maybe_check`
+        already-fired-guard reasoning: without this, CUSUM would never
+        report `alarmed=True` again, and the patience sequence could
+        never continue past its first step) -- but records the event in
+        `pending_confirmations`, not `false_alarms`, since this wasn't a
+        rejected alarm. Exists because a single one-off confirmation
+        check can be too noisy to trust alone on some datasets (found by
+        instrumenting the check itself, not assumed): on one real
+        investigation, the check read well below its own decision
+        threshold at the exact step CUSUM's own statistic fired, while
+        briefly crossing above it 40 steps earlier with no alarm to
+        confirm at the time -- i.e. single-shot noise on the order of
+        the threshold itself, the same problem the sensitivity
+        mechanism's own `n_critic_stop` (requiring multiple consecutive
+        non-improving rounds, not just one) already exists to average
+        out.
+        """
+        if self.alarm_step is not None:
+            self.pending_confirmations.append((self.alarm_step, self.alarm_delta))
+        self.cusum_S_by_delta = {d: 0.0 for d in self.deltas}
+        self.alarm_step = None
+        self.alarm_delta = None
+
 
 class CUSUMTrainer(ResumableTrainer):
     """``ResumableTrainer`` that also feeds per-row gated scores to a
@@ -651,6 +687,26 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
     detection theory. ``None`` (default): unchanged behavior, alarm
     always stops training immediately.
 
+    ``confirm_patience`` (only meaningful when ``confirm_fn`` is given):
+    number of CONSECUTIVE confirmed checks required before actually
+    stopping, rather than acting on the first one. ``1`` (default):
+    unchanged behavior, one confirmation is enough. When greater than
+    1, a confirmed-but-not-yet-sufficient check calls
+    ``monitor.reset_after_pending_confirmation`` (kept out of
+    ``false_alarms``, since it wasn't rejected) so CUSUM's own
+    already-fired guard clears and ``confirm_fn`` gets called again at
+    the next periodic check -- independent of whether CUSUM's own
+    (freshly-reset) accumulator alarms again on its own, since
+    persistence is being asked of ``confirm_fn``'s own answer, not of
+    CUSUM's internal statistic (the motivating investigation found the
+    two can be poorly correlated at the moment CUSUM fires). Any single
+    non-confirmed check during the sequence resets the count to zero
+    and requires a genuinely fresh CUSUM alarm to start over. Exists
+    because a single one-off confirmation can be too noisy to trust
+    alone on some datasets -- the same reason the sensitivity
+    mechanism's own ``n_critic_stop`` requires multiple consecutive
+    non-improving rounds rather than stopping on the first.
+
     ``diagnostic_fn``, if given, is called as ``diagnostic_fn(model,
     step)`` at EVERY real post-calibration check -- not just when CUSUM
     fires, unlike ``confirm_fn`` -- purely as an observational side
@@ -675,13 +731,18 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         train_dataset,
         alarm_checkpoint_dir: Optional[str] = None,
         confirm_fn: Optional[Callable[[torch.nn.Module], bool]] = None,
+        confirm_patience: int = 1,
         diagnostic_fn: Optional[Callable[[torch.nn.Module, int], None]] = None,
     ) -> None:
         self.monitor = monitor
         self.train_dataset = train_dataset
         self.alarm_checkpoint_dir = alarm_checkpoint_dir
         self.confirm_fn = confirm_fn
+        self.confirm_patience = confirm_patience
         self.diagnostic_fn = diagnostic_fn
+        self._pending_confirms = 0
+        self._pending_alarm_step = None
+        self._pending_alarm_delta = None
 
     def _get_rows(self, indices: List[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         rows = self.train_dataset[indices]
@@ -748,12 +809,9 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         self._model = model
 
         alarmed = self.monitor.maybe_check(step, model, self._get_rows)
+        check_happened = bool(self.monitor.history) and self.monitor.history[-1][0] == step
 
-        if (
-            self.diagnostic_fn is not None
-            and self.monitor.history
-            and self.monitor.history[-1][0] == step
-        ):
+        if self.diagnostic_fn is not None and check_happened:
             # A real post-calibration check happened at this step (not a
             # settle/warmup step consumed without scoring) -- same
             # detection `attach_trajectory_logger` (cusum_validation/
@@ -773,7 +831,18 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
             if was_training:
                 model.train()
 
-        if alarmed and self.confirm_fn is not None:
+        # Run confirm_fn when CUSUM just fired fresh, OR when we're
+        # mid-way through a confirm_patience sequence (at least one
+        # confirmation already banked) and a real check happened this
+        # step -- in that second case `alarmed` itself is very likely
+        # False (reset_after_pending_confirmation cleared the
+        # accumulator last time), but patience is about confirm_fn's own
+        # persistence, not CUSUM's internal statistic re-crossing
+        # threshold on its own.
+        should_confirm = self.confirm_fn is not None and (
+            alarmed or (self._pending_confirms > 0 and check_happened)
+        )
+        if should_confirm:
             # `confirm_fn` typically calls `.sample()` to generate real
             # data for its own check -- generation is normally called
             # BETWEEN separate `trainer.train()` calls elsewhere in this
@@ -793,8 +862,49 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
             model.to(device)
             if was_training:
                 model.train()
-            if not confirmed:
+
+            if self._pending_confirms == 0:
+                # First confirm check of a fresh sequence -- remember
+                # which tracker's alarm started it (maybe_check just set
+                # this on the monitor this call, since alarmed was True
+                # to get here). A LATER periodic recheck that continues
+                # or resolves this sequence won't go through maybe_check
+                # itself (CUSUM's own accumulator was already cleared),
+                # so alarm_step/alarm_delta need restoring from here
+                # before either reset_after_* call below, or their own
+                # `if self.alarm_step is not None` logging guard would
+                # silently skip recording the event.
+                self._pending_alarm_step = step
+                self._pending_alarm_delta = self.monitor.alarm_delta
+            elif self.monitor.alarm_step is None:
+                self.monitor.alarm_step = self._pending_alarm_step
+                self.monitor.alarm_delta = self._pending_alarm_delta
+
+            if confirmed:
+                self._pending_confirms += 1
+                if self._pending_confirms >= self.confirm_patience:
+                    # Patience satisfied -- record this step as the
+                    # official alarm point (overriding whatever
+                    # alarm_step/alarm_delta currently holds, fresh fire
+                    # or restored pending identity alike).
+                    self.monitor.alarm_step = step
+                    self.monitor.alarm_delta = self._pending_alarm_delta
+                    alarmed = True
+                    self._pending_confirms = 0
+                else:
+                    # Not enough consecutive confirmations yet -- clear
+                    # CUSUM's evidence (so `maybe_check`'s already-fired
+                    # guard doesn't block it forever) without touching
+                    # `false_alarms`, since this alarm was accepted, not
+                    # rejected, and wait for the next periodic check.
+                    self.monitor.reset_after_pending_confirmation()
+                    alarmed = False
+            else:
+                # A confirm failed -- abandon any accumulated patience
+                # and require a genuinely fresh CUSUM alarm to restart
+                # the whole sequence.
                 self.monitor.reset_after_false_alarm()
+                self._pending_confirms = 0
                 alarmed = False
         if alarmed:
             control.should_training_stop = True

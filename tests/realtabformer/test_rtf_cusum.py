@@ -987,3 +987,106 @@ def test_fit_cusum_diagnostic_logs_every_check_from_the_start(monkeypatch):
     # recomputed per check).
     thresholds = {t for _, _, t in logged}
     assert len(thresholds) == 1
+
+
+# ---------------------------------------------------------------------
+# cusum_confirm_patience: N CONSECUTIVE confirmations required before
+# actually stopping, instead of acting on the first one -- added after
+# instrumenting cusum_diagnostic_with_sensitivity on a real dataset
+# found a single confirmation check can itself be too noisy to trust.
+# ---------------------------------------------------------------------
+def test_fit_cusum_confirm_patience_requires_second_confirmation(monkeypatch):
+    # Every confirmation reads "real risk" -- with patience=1 this would
+    # stop at the very first alarm (as test_fit_cusum_confirm_true_stops_
+    # like_unconfirmed_alarm confirms). With patience=2, the first
+    # confirmed alarm must NOT stop training -- it should be logged as a
+    # pending confirmation (not a false alarm) and CUSUM must fire and
+    # get confirmed a second time before actually stopping.
+    monkeypatch.setattr(
+        SyntheticDataBench,
+        "compute_sensitivity_metric",
+        staticmethod(lambda **kwargs: 999.0),
+    )
+
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=40,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+    )
+    model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_confirm_with_sensitivity=True,
+        cusum_confirm_num_bootstrap=5,
+        cusum_confirm_patience=2,
+    )
+    mon = model.cusum_monitor
+    # Eventually stopped (the second consecutive confirmation stuck).
+    assert mon.alarm_step is not None
+    # The first confirmed-but-insufficient alarm was logged as pending,
+    # not rejected -- both lists distinguish "accepted but not enough
+    # yet" from "rejected outright".
+    assert len(mon.pending_confirmations) >= 1
+    assert mon.false_alarms == []
+
+
+def test_fit_cusum_confirm_patience_resets_count_on_any_rejection(monkeypatch):
+    # A specific sequence: confirmed, then REJECTED, then confirmed,
+    # confirmed. With patience=2, the rejection must discard the first
+    # confirmation entirely -- training only stops after two genuinely
+    # CONSECUTIVE confirmations (the 3rd and 4th confirm calls), not
+    # after any two confirmations regardless of an intervening
+    # rejection.
+    calls = {"n": 0}
+    sequence = [999.0, -999.0, 999.0, 999.0]
+
+    def fake_compute_sensitivity_metric(**kwargs):
+        idx = min(calls["n"], len(sequence) - 1)
+        calls["n"] += 1
+        return sequence[idx]
+
+    monkeypatch.setattr(
+        SyntheticDataBench,
+        "compute_sensitivity_metric",
+        staticmethod(fake_compute_sensitivity_metric),
+    )
+
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=60,
+        batch_size=16,
+        random_state=RANDOM_SEED,
+        train_size=1.0,
+    )
+    model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_confirm_with_sensitivity=True,
+        cusum_confirm_num_bootstrap=5,
+        cusum_confirm_patience=2,
+    )
+    mon = model.cusum_monitor
+    assert mon.alarm_step is not None, "expected the 3rd+4th confirms to stick"
+    # Exactly one rejection (call #2). Two pending-but-insufficient
+    # confirmations -- call #1 (pending=1, then rejected by call #2,
+    # discarding it) AND call #3 (the rejection restarted the count from
+    # zero, so call #3 is itself only a fresh pending=1, not enough on
+    # its own). Call #4 is the one that actually satisfies patience=2
+    # (following call #3 with no intervening rejection), so it must NOT
+    # show up in pending_confirmations -- training stopped instead of
+    # resetting again.
+    assert len(mon.false_alarms) == 1
+    assert len(mon.pending_confirmations) == 2
+    assert calls["n"] == 4
