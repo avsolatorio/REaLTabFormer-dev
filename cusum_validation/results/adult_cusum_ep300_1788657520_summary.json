@@ -1,0 +1,47 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "device": "cuda",
+    "numeric_quantile_encoding": false,
+    "cusum_statistic": "median",
+    "cusum_confirm_with_sensitivity": false,
+    "cusum_confirm_patience": 1,
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 920,
+    "alarm_delta": 1.0,
+    "global_step": 920,
+    "steps_per_epoch": 282,
+    "effective_epochs": 3.2624113475177303,
+    "elapsed_s": 157.63097715377808,
+    "mu0": 0.06615634560585022,
+    "sigma0": 0.020228489140494774,
+    "cusum_h": 9.555587901991844,
+    "cusum_h_by_delta": {
+      "0.25": 9.555587901991844,
+      "0.5": 10.550258360730805,
+      "1.0": 10.997661745552808
+    },
+    "cooldown_steps_final": 40,
+    "alarm_checkpoint_dir": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/cusum_validation/results/adult_cusum_ep300_1788657520_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 45522,
+    "dcr_synth_mean": 1.1772937406255843,
+    "dcr_synth_min": 3.7793761821891536e-05,
+    "dcr_test_mean": 1.2003299913189371,
+    "frac_suspicious": 0.04400707651481645
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "auc",
+    "trtr": 0.9093962761272137,
+    "tstr": 0.9079581783230913,
+    "gap": 0.0014380978041224068
+  }
+}
