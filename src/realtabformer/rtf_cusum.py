@@ -379,9 +379,13 @@ class CUSUMOverfittingMonitor:
         self.alarm_step: Optional[int] = None
         self.alarm_delta: Optional[float] = None
         self.alarm_checkpoint_dir: Optional[str] = None
-        # (step, Delta, Z, S_by_delta) -- S_by_delta is a dict even in
-        # the single-tracker (default) case, for one uniform shape.
-        self.history: List[Tuple[int, float, float, Dict[float, float]]] = []
+        # (step, Delta, Z, S_by_delta, p5, p50, p95) -- S_by_delta is a
+        # dict even in the single-tracker (default) case, for one uniform
+        # shape. p5/p50/p95 are the checked pool's own paired_diff
+        # percentiles, diagnostic only -- see maybe_check's own comment.
+        self.history: List[
+            Tuple[int, float, float, Dict[float, float], float, float, float]
+        ] = []
         # (step, delta) pairs for alarms an external confirmation check
         # (see CUSUMEarlyStoppingCallback's confirm_fn) investigated and
         # found to be false positives -- see reset_after_false_alarm.
@@ -583,6 +587,16 @@ class CUSUMOverfittingMonitor:
 
         n = len(sample_idx)
         Delta, var = _compute_check_statistic(paired_diff, self.cusum_statistic)
+        # Diagnostic only -- p5/p50/p95 of the SAME paired_diff sample this
+        # check's Delta already came from, logged alongside it (see
+        # `history` below) regardless of `cusum_statistic`. Distinguishes
+        # two failure modes a single aggregate Delta can't tell apart: a
+        # population-wide co-shift (p5/p50/p95 all move together, spread
+        # stays roughly constant) vs a handful of rows being individually
+        # memorized (p95 running away while p50/p5 stay near baseline --
+        # the "counterfactual memorization" pattern, Feldman & Zhang 2020).
+        # Purely observational -- never affects Delta, var, z, or S.
+        p5, p50, p95 = (float(x) for x in np.percentile(paired_diff, [5, 50, 95]))
 
         if self.mu0 is None:
             self._warmup_deltas.append(Delta)
@@ -609,7 +623,7 @@ class CUSUMOverfittingMonitor:
             self.cusum_S_by_delta[d] = s
             if fired_delta is None and s >= self.cusum_h_by_delta[d]:
                 fired_delta = d
-        self.history.append((step, Delta, z, dict(self.cusum_S_by_delta)))
+        self.history.append((step, Delta, z, dict(self.cusum_S_by_delta), p5, p50, p95))
 
         if fired_delta is not None and self.alarm_step is None:
             self.alarm_step = step

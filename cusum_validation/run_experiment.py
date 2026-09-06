@@ -347,7 +347,7 @@ def attach_trajectory_logger(trajectory_path: Path):
             # `Delta` in the module docstring/code) -- unrelated to the
             # `delta` hyperparameter(s) tracked in `s_by_delta` below,
             # confusing as the shared name is.
-            _, stat_delta, z, s_by_delta = self.history[-1]
+            _, stat_delta, z, s_by_delta, p5, p50, p95 = self.history[-1]
             record = dict(
                 phase="post_calibration",
                 step=step,
@@ -361,6 +361,17 @@ def attach_trajectory_logger(trajectory_path: Path):
                 cusum_h_by_delta=dict(self.cusum_h_by_delta),
                 alarm_step=self.alarm_step,
                 alarm_delta=self.alarm_delta,
+                # Diagnostic only (see CUSUMOverfittingMonitor.maybe_check's
+                # own comment) -- p5/p50/p95 of this check's own paired_diff
+                # sample, regardless of cusum_statistic. p95_minus_p50 is
+                # the one number to watch: roughly constant over time means
+                # a population-wide co-shift (what mean vs median swapping
+                # couldn't distinguish); a widening gap means a handful of
+                # rows individually running away from the rest.
+                p5=p5,
+                p50=p50,
+                p95=p95,
+                p95_minus_p50=p95 - p50,
             )
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")

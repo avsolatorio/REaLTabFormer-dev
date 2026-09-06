@@ -640,6 +640,134 @@ def test_monitor_calibrates_then_accumulates_and_can_fire():
     assert again is False
 
 
+# ---------------------------------------------------------------------
+# history's p5/p50/p95 diagnostic fields: distinguish a population-wide
+# co-shift (all checked rows improving together) from a handful of rows
+# being individually memorized -- a single aggregate Delta (mean or
+# median) can't tell these apart, but the spread of the checked pool's
+# own paired_diff can.
+# ---------------------------------------------------------------------
+def test_monitor_history_percentiles_distinguish_coshift_from_outlier_rows():
+    torch.manual_seed(RANDOM_SEED)
+    V = 30
+    T = 3
+    row_ids = list(range(20))
+    row_labels = torch.randint(1, V, (len(row_ids), T + 1))
+    row_labels[:, 0] = -100  # HF's own ignore-index convention, not -1.
+    labels_by_id = {idx: row_labels[i : i + 1] for i, idx in enumerate(row_ids)}
+
+    def get_rows(indices):
+        labels = torch.cat([labels_by_id[i] for i in indices], dim=0)
+        return None, labels
+
+    class PerRowBiasLM(torch.nn.Module):
+        """Like TinyLM elsewhere in this file, but the per-row confidence
+        bias is controllable per row_id (not one shared scalar) -- lets a
+        test simulate EITHER a population-wide co-shift (every row's bias
+        increases together) OR a handful of rows being individually
+        memorized (only those rows' bias increases, everyone else stays
+        at baseline), which a single global bias_scale can't distinguish.
+        """
+
+        def __init__(self, vocab_size):
+            super().__init__()
+            self.vocab_size = vocab_size
+            self.training = True
+            self.row_bias: dict = {}
+            self._current_indices: list = []
+
+        def eval(self):
+            self.training = False
+            return self
+
+        def train(self, mode=True):
+            self.training = mode
+            return self
+
+        def forward(self, input_ids, labels):
+            B, T = labels.shape
+            logits = torch.randn(B, T, self.vocab_size) * 0.1
+            for b in range(B):
+                bias = self.row_bias.get(self._current_indices[b], 0.0)
+                # compute_gated_row_scores uses the standard causal shift:
+                # logits[:, t, :] is scored against labels[:, t+1], not
+                # labels[:, t] -- boost the NEXT position's label, or the
+                # bias lands on a token that's never actually scored
+                # against this logit position.
+                for t in range(T - 1):
+                    tok = int(labels[b, t + 1].item())
+                    if tok >= 0:
+                        logits[b, t, tok] += bias
+
+            class Out:
+                pass
+
+            out = Out()
+            out.logits = logits
+            return out
+
+        def parameters(self):
+            return iter([torch.nn.Parameter(torch.zeros(1))])
+
+    def make_get_rows(model):
+        def _get_rows(indices):
+            model._current_indices = indices
+            return get_rows(indices)
+
+        return _get_rows
+
+    def run_to_calibrated(bias_after_warmup: dict):
+        model = PerRowBiasLM(V)
+        mon = _make_monitor(
+            cooldown_steps=1, min_seen_pool=8, warmup_checks=3, check_every=1,
+            total_checks_horizon=40,
+        )
+        wrapped_get_rows = make_get_rows(model)
+        model._current_indices = row_ids
+        logits = model(None, row_labels).logits
+        mon.record_batch(row_ids, logits, row_labels, step=1)
+
+        step = 2
+        for _ in range(5):
+            mon.maybe_check(step, model, wrapped_get_rows)
+            step += 1
+        assert mon.mu0 is not None
+
+        model.row_bias = bias_after_warmup
+        mon.maybe_check(step, model, wrapped_get_rows)
+        assert mon.history, "expected at least one post-calibration check"
+        return mon.history[-1]
+
+    # Co-shift: every row's bias increases by the same amount -- the
+    # whole distribution should translate together, so p95 - p50 stays
+    # small (comparable to the pre-shift, near-zero-bias noise floor).
+    coshift_bias = {rid: 4.0 for rid in row_ids}
+    _, _, _, _, coshift_p5, coshift_p50, coshift_p95 = run_to_calibrated(coshift_bias)
+
+    # Outlier rows: only 2 of 20 rows get a large bias increase, the
+    # other 18 stay at baseline (no shift) -- p95 should run far ahead
+    # of p50 (which stays near the unshifted bulk), a much wider gap
+    # than the co-shift case despite a similar-or-smaller mean Delta.
+    outlier_bias = {rid: 0.0 for rid in row_ids}
+    outlier_bias[row_ids[0]] = 12.0
+    outlier_bias[row_ids[1]] = 12.0
+    _, _, _, _, outlier_p5, outlier_p50, outlier_p95 = run_to_calibrated(outlier_bias)
+
+    assert coshift_p5 <= coshift_p50 <= coshift_p95
+    assert outlier_p5 <= outlier_p50 <= outlier_p95
+
+    coshift_gap = coshift_p95 - coshift_p50
+    outlier_gap = outlier_p95 - outlier_p50
+    assert outlier_gap > coshift_gap * 3, (
+        f"expected the outlier-row scenario's p95-p50 gap ({outlier_gap:.3f}) to be "
+        f"much wider than the co-shift scenario's ({coshift_gap:.3f})"
+    )
+    # The outlier scenario's median stays close to the UNSHIFTED bulk
+    # (18 of 20 rows never moved) -- much smaller than the co-shift
+    # scenario's median, which reflects every row's shared shift.
+    assert outlier_p50 < coshift_p50 / 2
+
+
 def test_monitor_settle_checks_are_discarded_before_calibration():
     # Regression test for a real bug found by replaying a real training
     # run's logged CUSUM trajectory: calibrating sigma0/mu0 from checks
