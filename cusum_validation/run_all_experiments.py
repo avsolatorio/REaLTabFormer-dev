@@ -72,6 +72,8 @@ def run_one(dataset, args, log_dir: Path) -> dict:
         cmd += ["--sensitivity-cache-dir", args.sensitivity_cache_dir]
     if args.no_sensitivity_cache:
         cmd += ["--no-sensitivity-cache"]
+    if args.cusum_statistic != "mean":
+        cmd += ["--cusum-statistic", args.cusum_statistic]
     if args.cusum_confirm_with_sensitivity:
         cmd += ["--cusum-confirm-with-sensitivity"]
         if args.cusum_confirm_num_bootstrap is not None:
@@ -180,6 +182,15 @@ def main():
         action="store_true",
         default=False,
         help="Passed through to run_experiment.py's own --no-sensitivity-cache.",
+    )
+    parser.add_argument(
+        "--cusum-statistic",
+        choices=["mean", "median"],
+        default="mean",
+        help="Passed through to run_experiment.py's own --cusum-statistic -- "
+        "'median' is a robust alternative to the original mean-based Delta, "
+        "prototyped after a real investigation found the mean overconfident "
+        "on wilt. Default 'mean' (original behavior).",
     )
     parser.add_argument(
         "--cusum-confirm-with-sensitivity",

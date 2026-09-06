@@ -506,6 +506,7 @@ class REaLTabFormer:
         cusum_max_calibration_epochs: float = 10.0,
         cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
+        cusum_statistic: str = "mean",
         cusum_confirm_with_sensitivity: bool = False,
         cusum_confirm_frac: float = 0.165,
         cusum_confirm_frac_max_data: int = 10000,
@@ -633,6 +634,17 @@ class REaLTabFormer:
               any tracker crosses its own (Bonferroni-corrected) threshold.
             cusum_target_far: Only used when `overfitting_detection_method="cusum"`. Target
               false-alarm rate for the detector's decision threshold.
+            cusum_statistic: Only used when `overfitting_detection_method="cusum"`.
+              One of `"mean"` (default, original behavior) or `"median"`. Controls
+              how each check's per-row paired-improvement statistic (`Delta`) is
+              summarized across the checked row pool -- `"mean"` can be dragged by
+              a handful of rows with a large improvement even if most checked rows
+              look normal; `"median"` is robust to that. Prototype, motivated by a
+              real investigation (`cusum_diagnostic_with_sensitivity`) finding
+              CUSUM's own statistic wildly overconfident on a dataset (wilt) whose
+              numeric columns are almost entirely unique values -- see
+              `_compute_check_statistic`'s own docstring for the exact formula and
+              its caveats.
             cusum_confirm_with_sensitivity: Only used when
               `overfitting_detection_method="cusum"`. When True, a fired
               alarm triggers a sensitivity-style confirmation (one
@@ -702,6 +714,7 @@ class REaLTabFormer:
                     cusum_max_calibration_epochs=cusum_max_calibration_epochs,
                     cusum_delta=cusum_delta,
                     cusum_target_far=cusum_target_far,
+                    cusum_statistic=cusum_statistic,
                     cusum_confirm_with_sensitivity=cusum_confirm_with_sensitivity,
                     cusum_confirm_frac=cusum_confirm_frac,
                     cusum_confirm_frac_max_data=cusum_confirm_frac_max_data,
@@ -2053,6 +2066,7 @@ class REaLTabFormer:
         cusum_max_calibration_epochs: float = 10.0,
         cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
+        cusum_statistic: str = "mean",
         cusum_seen_pool_size: int = 256,
         cusum_min_seen_pool: int = 32,
         cusum_confirm_with_sensitivity: bool = False,
@@ -2119,6 +2133,11 @@ class REaLTabFormer:
             cusum_target_far: Target false-alarm rate for the CUSUM
               threshold, calibrated via Monte Carlo simulation against
               the actual training length.
+            cusum_statistic: `"mean"` (default) or `"median"` -- how each
+              check's per-row paired-improvement statistic is summarized
+              across the checked pool. See `_compute_check_statistic`'s
+              own docstring for the exact formula, the motivating
+              investigation, and its caveats.
             cusum_seen_pool_size: Max number of cooled rows sampled per
               check.
             cusum_min_seen_pool: Minimum cooled-pool size required
@@ -2288,6 +2307,7 @@ class REaLTabFormer:
             delta=cusum_delta,
             target_quantile=1 - cusum_target_far,
             random_state=self.random_state,
+            cusum_statistic=cusum_statistic,
         )
         trainer.cusum_monitor = monitor
         self.cusum_monitor = monitor

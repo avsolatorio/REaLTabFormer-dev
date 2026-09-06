@@ -206,6 +206,58 @@ def _robust_noise_std(values: Sequence[float]) -> float:
     return max(float(np.std(diffs, ddof=1)) / math.sqrt(2), 1e-6)
 
 
+def _compute_check_statistic(
+    paired_diff: np.ndarray, statistic: str
+) -> Tuple[float, float]:
+    """Returns ``(Delta, var)`` for one check's ``paired_diff`` sample --
+    ``var`` is defined so that ``var / n`` is the correct sampling-
+    variance estimate for ``Delta`` itself, matching ``maybe_check``'s
+    existing ``se = sqrt(var / n + sigma0**2)`` formula unchanged
+    regardless of which statistic backs ``Delta`` (for "mean", ``var``
+    is literally ``Var(paired_diff)``; for "median" it isn't the raw
+    sample variance, just an estimate scaled to play the same role).
+
+    "mean" (default, original behavior): ``Delta`` is the sample mean.
+    A single row (or a handful) with a large ``paired_diff`` -- e.g. a
+    row the model has genuinely started to memorize while most others
+    are still just generalizing -- can drag the mean away from what the
+    BULK of the checked rows says, and CUSUM would then accumulate
+    evidence toward alarming on that pull, even if it doesn't reflect
+    the checked pool's typical row.
+
+    "median": robust to exactly that -- a handful of extreme rows can't
+    move the median the way they can the mean. Its own uncertainty is
+    estimated as ``(1.2533 * robust_scale)**2``, where ``robust_scale``
+    is a MAD-based (median absolute deviation) estimate of
+    ``paired_diff``'s spread -- reusing the same robust-scale idea
+    ``_robust_noise_std`` already uses elsewhere in this module, so
+    Delta and its own uncertainty are BOTH insensitive to the same
+    outlier rows, rather than pairing a robust Delta with a
+    non-robust uncertainty estimate. The ``1.2533`` factor is the
+    median's asymptotic relative efficiency vs the mean under
+    approximately Gaussian data (the median's standard error is
+    ``~1.2533x`` the mean's standard error, under normality) -- a
+    standard, well-known approximation, not an exact non-parametric
+    result for an arbitrary ``paired_diff`` distribution. Meant to be
+    validated empirically (e.g. via `cusum_diagnostic_with_sensitivity`)
+    on a real dataset before treating it as a settled improvement over
+    "mean" -- see this feature's own research log for the wilt
+    investigation that motivated it.
+    """
+    n = len(paired_diff)
+    if statistic == "mean":
+        Delta = float(paired_diff.mean())
+        var = float(paired_diff.var(ddof=1)) if n > 1 else float("nan")
+        return Delta, var
+    elif statistic == "median":
+        Delta = float(np.median(paired_diff))
+        mad = float(np.median(np.abs(paired_diff - Delta)))
+        robust_scale = 1.4826 * mad
+        var = (1.2533 * robust_scale) ** 2
+        return Delta, var
+    raise ValueError(f"Unknown cusum_statistic: {statistic!r}")
+
+
 class CUSUMOverfittingMonitor:
     """Owns all state for the CUSUM overfitting detector.
 
@@ -230,6 +282,7 @@ class CUSUMOverfittingMonitor:
         target_quantile: float = 0.99,
         total_checks_horizon: Optional[int] = None,
         random_state: Optional[int] = None,
+        cusum_statistic: str = "mean",
     ) -> None:
         if check_every <= 0:
             raise ValueError("check_every must be a positive integer.")
@@ -237,6 +290,10 @@ class CUSUMOverfittingMonitor:
             raise ValueError("cooldown_steps must be non-negative.")
         if warmup_checks < 2:
             raise ValueError("warmup_checks must be at least 2 to estimate a variance.")
+        if cusum_statistic not in ("mean", "median"):
+            raise ValueError(
+                f"cusum_statistic must be 'mean' or 'median', got {cusum_statistic!r}."
+            )
         if warmup_settle_checks is not None and warmup_settle_checks < 0:
             raise ValueError("warmup_settle_checks must be non-negative.")
         if max_calibration_epochs <= 0:
@@ -300,6 +357,7 @@ class CUSUMOverfittingMonitor:
         self.target_quantile = target_quantile
         self.random_state = random_state
         self._rng = np.random.default_rng(random_state)
+        self.cusum_statistic = cusum_statistic
 
         # Calibrated lazily: the false-alarm-rate guarantee is only
         # meaningful once we know how many checks the run will actually
@@ -524,8 +582,7 @@ class CUSUMOverfittingMonitor:
         paired_diff = current_np - base_np
 
         n = len(sample_idx)
-        Delta = float(paired_diff.mean())
-        var = float(paired_diff.var(ddof=1)) if n > 1 else float("nan")
+        Delta, var = _compute_check_statistic(paired_diff, self.cusum_statistic)
 
         if self.mu0 is None:
             self._warmup_deltas.append(Delta)
@@ -809,7 +866,9 @@ class CUSUMEarlyStoppingCallback(TrainerCallback):
         self._model = model
 
         alarmed = self.monitor.maybe_check(step, model, self._get_rows)
-        check_happened = bool(self.monitor.history) and self.monitor.history[-1][0] == step
+        check_happened = (
+            bool(self.monitor.history) and self.monitor.history[-1][0] == step
+        )
 
         if self.diagnostic_fn is not None and check_happened:
             # A real post-calibration check happened at this step (not a

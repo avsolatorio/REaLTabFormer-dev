@@ -11,6 +11,7 @@ from realtabformer.realtabformer import REaLTabFormer
 from realtabformer.rtf_analyze import SyntheticDataBench
 from realtabformer.rtf_cusum import (
     CUSUMOverfittingMonitor,
+    _compute_check_statistic,
     _robust_noise_std,
     calibrate_gaussian_cusum_threshold,
     compute_gated_row_scores,
@@ -373,6 +374,70 @@ def test_robust_noise_std_handles_degenerate_inputs():
     assert _robust_noise_std([1.0, 1.2]) > 0
 
 
+# ---------------------------------------------------------------------
+# _compute_check_statistic: cusum_statistic="mean" (original) vs
+# "median" (robust to a handful of outlier rows) -- prototyped after
+# the wilt CUSUM-diagnostic investigation found the mean-based Delta
+# wildly overconfident on a dataset whose numeric columns are almost
+# entirely unique values.
+# ---------------------------------------------------------------------
+def test_compute_check_statistic_mean_matches_original_formula():
+    # "mean" must be byte-for-byte the same computation the monitor used
+    # before cusum_statistic existed -- Delta = sample mean, var = sample
+    # variance (ddof=1).
+    paired_diff = np.array([0.1, -0.2, 0.3, 0.05, -0.15])
+    Delta, var = _compute_check_statistic(paired_diff, "mean")
+    assert Delta == pytest.approx(float(paired_diff.mean()))
+    assert var == pytest.approx(float(paired_diff.var(ddof=1)))
+
+
+def test_compute_check_statistic_median_is_robust_to_outlier_rows():
+    # A bulk of rows clustered near 0 (no real drift) plus a couple of
+    # extreme outliers (e.g. rows the model happens to have genuinely
+    # started memorizing) -- the outliers should dominate "mean" but
+    # barely move "median", which is exactly the robustness property
+    # cusum_statistic="median" exists for.
+    rng = np.random.default_rng(RANDOM_SEED)
+    bulk = rng.normal(0.0, 0.01, size=50)
+    outliers = np.array([5.0, 6.0])
+    paired_diff = np.concatenate([bulk, outliers])
+
+    mean_delta, _ = _compute_check_statistic(paired_diff, "mean")
+    median_delta, _ = _compute_check_statistic(paired_diff, "median")
+
+    assert mean_delta > 0.15  # pulled well above the bulk's own scale
+    assert abs(median_delta) < 0.05  # stays close to what the bulk says
+
+
+def test_compute_check_statistic_median_variance_scales_with_spread():
+    # Not a precise non-parametric claim -- just confirms the returned
+    # "var" (used downstream as var/n, matching the mean case's role)
+    # grows with the sample's actual spread, as any sane uncertainty
+    # estimate must, rather than being some unrelated constant.
+    rng = np.random.default_rng(RANDOM_SEED)
+    tight = rng.normal(0.0, 0.01, size=100)
+    wide = rng.normal(0.0, 0.5, size=100)
+
+    _, var_tight = _compute_check_statistic(tight, "median")
+    _, var_wide = _compute_check_statistic(wide, "median")
+    assert var_wide > var_tight
+
+
+def test_compute_check_statistic_rejects_unknown_statistic():
+    with pytest.raises(ValueError, match="Unknown cusum_statistic"):
+        _compute_check_statistic(np.array([0.1, 0.2]), "bogus")
+
+
+def test_monitor_rejects_unknown_cusum_statistic():
+    with pytest.raises(ValueError, match="cusum_statistic must be"):
+        _make_monitor(cusum_statistic="bogus")
+
+
+def test_monitor_defaults_to_mean_statistic():
+    mon = _make_monitor()
+    assert mon.cusum_statistic == "mean"
+
+
 def test_monitor_adjust_cooldown_caps_when_it_would_never_fit():
     # Found the hard way: with gradient_accumulation_steps multiplying
     # how much data one optimizer step covers, steps_per_epoch can end
@@ -690,6 +755,32 @@ def test_fit_cusum_path_runs_and_can_sample():
     # "idx" must not leak into the trainer's own reported dataset columns
     # in a way that breaks anything -- and remove_unused_columns must be
     # disabled specifically (and only) for this run.
+    assert trainer.args.remove_unused_columns is False
+
+    samples = model.sample(n_samples=5, device="cpu")
+    assert len(samples) <= 5
+    assert list(samples.columns) == list(df.columns)
+
+
+def test_fit_cusum_median_statistic_runs_and_can_sample():
+    # cusum_statistic="median" end to end, on real training -- not just
+    # the unit-level _compute_check_statistic tests above. Mirrors
+    # test_fit_cusum_path_runs_and_can_sample's own bar.
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular", epochs=6, batch_size=16, random_state=RANDOM_SEED, train_size=1.0
+    )
+    trainer = model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_statistic="median",
+    )
+    assert model.cusum_monitor is not None
+    assert model.cusum_monitor.cusum_statistic == "median"
     assert trainer.args.remove_unused_columns is False
 
     samples = model.sample(n_samples=5, device="cpu")

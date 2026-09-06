@@ -876,6 +876,7 @@ def run_cusum(
         overfitting_detection_method="cusum",
         cusum_check_every=args.cusum_check_every,
         cusum_delta=args.cusum_delta,
+        cusum_statistic=args.cusum_statistic,
         cusum_confirm_with_sensitivity=args.cusum_confirm_with_sensitivity,
         cusum_confirm_num_bootstrap=(
             args.cusum_confirm_num_bootstrap
@@ -925,6 +926,7 @@ def run_cusum(
         batch_size=args.batch_size,
         device=args.device,
         numeric_quantile_encoding=args.numeric_quantile_encoding,
+        cusum_statistic=args.cusum_statistic,
         cusum_confirm_with_sensitivity=args.cusum_confirm_with_sensitivity,
         cusum_confirm_patience=args.cusum_confirm_patience,
         cusum_check_every=args.cusum_check_every,
@@ -1353,6 +1355,21 @@ def main():
         "whether the drift will be slow/gradual or sharp/sudden. Defaults to a "
         "small ensemble; pass a single value (e.g. --cusum-delta 0.5) for the "
         "original single-tracker behavior.",
+    )
+    parser.add_argument(
+        "--cusum-statistic",
+        choices=["mean", "median"],
+        default="mean",
+        help="How each CUSUM check's per-row paired-improvement statistic "
+        "(Delta) is summarized across the checked row pool. 'mean' (default, "
+        "original behavior) can be dragged by a handful of rows with a large "
+        "improvement even if most checked rows look normal; 'median' is "
+        "robust to that. Prototype, motivated by a real investigation "
+        "(--cusum-diagnostic-with-sensitivity) finding CUSUM's own statistic "
+        "wildly overconfident on wilt, whose numeric columns are almost "
+        "entirely unique values -- see realtabformer.rtf_cusum."
+        "_compute_check_statistic's own docstring for the exact formula and "
+        "caveats.",
     )
     parser.add_argument(
         "--cusum-confirm-with-sensitivity",
