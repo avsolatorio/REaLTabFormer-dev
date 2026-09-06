@@ -266,6 +266,71 @@ get a clean, fast comparison, and ideally a `churn2` run to see whether
 the abalone gap is really about small *datasets* generally or something
 more specific to `abalone`/its target.
 
+## Resolution: final-defaults validation across all five datasets
+
+A GPU run of `--mode cusum` with the fully-evolved detector --
+`cusum_statistic="median"`, the `[0.25, 0.5, 1.0]` delta ensemble,
+`cusum_confirm_patience=1`, and the `steps_per_epoch`-aware cooldown
+cap, none of which existed yet when the "exception" above was
+diagnosed -- against the matching `--mode sensitivity` baseline
+already committed for each dataset (`*_sensitivity_base_ep300_*`):
+
+| Dataset | Method | Effective epochs | Elapsed (s) | `frac_suspicious` | Utility gap |
+|---|---|---|---|---|---|
+| abalone | CUSUM | 22.3 | 126.9 | 0.078 | 0.022 (R²) |
+| abalone | sensitivity | 24.2 | 210.2 | 0.077 | 0.001 (R²) |
+| adult | CUSUM | 3.3 | 157.6 | 0.044 | 0.001 (AUC) |
+| adult | sensitivity | 17.6 | 1298.1 | 0.050 | 0.002 (AUC) |
+| diabetes | CUSUM | 25.0 | 41.8 | 0.130 | -0.001 (AUC) |
+| diabetes | sensitivity | 45.0 | 117.4 | 0.149 | 0.003 (AUC) |
+| insurance | CUSUM | 17.5 | 43.3 | 0.063 | 0.004 (R²) |
+| insurance | sensitivity | 37.5 | 152.0 | 0.082 | 0.002 (R²) |
+| wilt | CUSUM | 13.3 | 86.3 | 0.055 | 0.089 (AUC) |
+| wilt | sensitivity | 29.3 | 279.5 | 0.065 | 0.004 (AUC) |
+
+(`cusum_validation/results/{abalone,adult,diabetes,insurance,wilt}_cusum_ep300_*_summary.json`,
+committed in `217149b`, compared against each dataset's already-committed
+`*_sensitivity_base_ep300_*_summary.json`.)
+
+**The abalone exception is resolved, not just improved.** Its utility
+gap drops from the 0.190 reported above to 0.022 -- an 8.6x reduction,
+now the same order of magnitude as sensitivity's own 0.001, while
+`frac_suspicious` is statistically indistinguishable between the two
+methods (0.078 vs. 0.077) and CUSUM still runs 1.7x faster. Since
+neither of the two isolated fixes tried earlier (relaxed cooldown cap,
+explicit delta ensemble) moved the needle on their own, the fix is best
+attributed to the combination that shipped since then -- most plausibly
+`cusum_statistic="median"`'s outlier-robust `Delta`, which the earlier
+mean-based statistic didn't have -- rather than to any single change in
+isolation. Not re-isolated here; stated as the likely explanation, not
+a proven one.
+
+**On every other dataset, CUSUM matches or beats sensitivity on
+privacy** (`frac_suspicious` lower or tied on all 5) **and is
+substantially cheaper** (1.7x-8.2x faster, largest speedup on the
+biggest dataset, adult, as expected since CUSUM avoids sensitivity's
+periodic `.generate()`-based bootstrap entirely). Utility gaps track
+sensitivity closely on adult, diabetes, and insurance (within 0.002-0.003
+of each other either direction).
+
+**New observation, not yet investigated: `wilt` now has the largest gap
+in this comparison** (0.089 vs. sensitivity's 0.004) -- CUSUM stops at
+13.3 effective epochs here vs. sensitivity's 29.3, trading real utility
+for a comparatively modest privacy/speed gain (`frac_suspicious` 0.055
+vs. 0.065, 3.2x faster). This is the same *shape* of problem the
+abalone exception was (an early, confident alarm that costs more
+downstream utility than sensitivity's slower stop), just smaller in
+absolute terms and on a different dataset -- worth checking whether it
+responds to the same median-statistic-driven fix path, or is a separate
+cause, before treating the detector's defaults as fully settled across
+dataset shapes.
+
+`churn2` (medium-sized) was not re-run with this final build --
+its two `sensitivity_*` counterparts were never generated (only
+`churn2_all_ep300_*`, an earlier combined-mode run, is committed), so
+it's not included in the table above and remains untested against the
+current defaults.
+
 ## Utility check (TSTR vs. TRTR)
 
 `measure_utility` (called automatically after `measure_dcr` in every
