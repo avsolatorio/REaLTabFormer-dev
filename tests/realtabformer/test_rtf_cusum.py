@@ -144,6 +144,65 @@ def _make_monitor(**overrides):
     return CUSUMOverfittingMonitor(**kwargs)
 
 
+class PerRowBiasLM(torch.nn.Module):
+    """Like TinyLM elsewhere in this file, but the per-row confidence
+    bias is controllable per row_id (not one shared scalar) -- lets a
+    test simulate EITHER a population-wide co-shift (every row's bias
+    increases together) OR a handful of rows being individually
+    memorized (only those rows' bias increases, everyone else stays at
+    baseline), which a single global bias_scale can't distinguish.
+    """
+
+    def __init__(self, vocab_size):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.training = True
+        self.row_bias: dict = {}
+        self._current_indices: list = []
+
+    def eval(self):
+        self.training = False
+        return self
+
+    def train(self, mode=True):
+        self.training = mode
+        return self
+
+    def forward(self, input_ids, labels):
+        B, T = labels.shape
+        logits = torch.randn(B, T, self.vocab_size) * 0.1
+        for b in range(B):
+            bias = self.row_bias.get(self._current_indices[b], 0.0)
+            # compute_gated_row_scores uses the standard causal shift:
+            # logits[:, t, :] is scored against labels[:, t+1], not
+            # labels[:, t] -- boost the NEXT position's label, or the
+            # bias lands on a token that's never actually scored against
+            # this logit position.
+            for t in range(T - 1):
+                tok = int(labels[b, t + 1].item())
+                if tok >= 0:
+                    logits[b, t, tok] += bias
+
+        class Out:
+            pass
+
+        out = Out()
+        out.logits = logits
+        return out
+
+    def parameters(self):
+        return iter([torch.nn.Parameter(torch.zeros(1))])
+
+
+def _make_per_row_bias_get_rows(model, labels_by_id):
+    def _get_rows(indices):
+        model._current_indices = indices
+        labels = torch.cat([labels_by_id[i] for i in indices], dim=0)
+        return None, labels
+
+    return _get_rows
+
+
 def test_monitor_reset_after_false_alarm_clears_evidence_and_alarm():
     mon = _make_monitor(delta=[0.25, 0.5])
     mon.alarm_step = 42
@@ -656,73 +715,13 @@ def test_monitor_history_percentiles_distinguish_coshift_from_outlier_rows():
     row_labels[:, 0] = -100  # HF's own ignore-index convention, not -1.
     labels_by_id = {idx: row_labels[i : i + 1] for i, idx in enumerate(row_ids)}
 
-    def get_rows(indices):
-        labels = torch.cat([labels_by_id[i] for i in indices], dim=0)
-        return None, labels
-
-    class PerRowBiasLM(torch.nn.Module):
-        """Like TinyLM elsewhere in this file, but the per-row confidence
-        bias is controllable per row_id (not one shared scalar) -- lets a
-        test simulate EITHER a population-wide co-shift (every row's bias
-        increases together) OR a handful of rows being individually
-        memorized (only those rows' bias increases, everyone else stays
-        at baseline), which a single global bias_scale can't distinguish.
-        """
-
-        def __init__(self, vocab_size):
-            super().__init__()
-            self.vocab_size = vocab_size
-            self.training = True
-            self.row_bias: dict = {}
-            self._current_indices: list = []
-
-        def eval(self):
-            self.training = False
-            return self
-
-        def train(self, mode=True):
-            self.training = mode
-            return self
-
-        def forward(self, input_ids, labels):
-            B, T = labels.shape
-            logits = torch.randn(B, T, self.vocab_size) * 0.1
-            for b in range(B):
-                bias = self.row_bias.get(self._current_indices[b], 0.0)
-                # compute_gated_row_scores uses the standard causal shift:
-                # logits[:, t, :] is scored against labels[:, t+1], not
-                # labels[:, t] -- boost the NEXT position's label, or the
-                # bias lands on a token that's never actually scored
-                # against this logit position.
-                for t in range(T - 1):
-                    tok = int(labels[b, t + 1].item())
-                    if tok >= 0:
-                        logits[b, t, tok] += bias
-
-            class Out:
-                pass
-
-            out = Out()
-            out.logits = logits
-            return out
-
-        def parameters(self):
-            return iter([torch.nn.Parameter(torch.zeros(1))])
-
-    def make_get_rows(model):
-        def _get_rows(indices):
-            model._current_indices = indices
-            return get_rows(indices)
-
-        return _get_rows
-
     def run_to_calibrated(bias_after_warmup: dict):
         model = PerRowBiasLM(V)
         mon = _make_monitor(
             cooldown_steps=1, min_seen_pool=8, warmup_checks=3, check_every=1,
             total_checks_horizon=40,
         )
-        wrapped_get_rows = make_get_rows(model)
+        wrapped_get_rows = _make_per_row_bias_get_rows(model, labels_by_id)
         model._current_indices = row_ids
         logits = model(None, row_labels).logits
         mon.record_batch(row_ids, logits, row_labels, step=1)
@@ -766,6 +765,123 @@ def test_monitor_history_percentiles_distinguish_coshift_from_outlier_rows():
     # (18 of 20 rows never moved) -- much smaller than the co-shift
     # scenario's median, which reflects every row's shared shift.
     assert outlier_p50 < coshift_p50 / 2
+
+
+# ---------------------------------------------------------------------
+# Hard-cohort tracker: a second, independently-calibrated CUSUM-style
+# tracker restricted to a fixed cohort of the worst-baseline-score rows
+# instead of a fresh random sample -- see _anchor_hard_cohort/
+# _check_hard_cohort's own docstrings for the full rationale
+# (Feldman 2020 long-tail memorization theory; why the cohort must be
+# fixed, not re-ranked every check).
+# ---------------------------------------------------------------------
+def test_monitor_hard_cohort_off_by_default():
+    mon = _make_monitor()
+    assert mon.track_hard_cohort is False
+    assert mon.hard_cohort_ids is None
+    assert mon.hard_cohort_alarm_step is None
+
+
+def test_monitor_rejects_invalid_hard_cohort_frac():
+    with pytest.raises(ValueError, match="hard_cohort_frac must be in"):
+        _make_monitor(hard_cohort_frac=0.0)
+    with pytest.raises(ValueError, match="hard_cohort_frac must be in"):
+        _make_monitor(hard_cohort_frac=1.0)
+
+
+def test_anchor_hard_cohort_selects_worst_baseline_score_rows():
+    mon = _make_monitor(track_hard_cohort=True, hard_cohort_frac=0.25)
+    # 20 rows, scores 0..19 -- rows 0-4 (the 25% worst, i.e. lowest score)
+    # must be exactly what gets anchored.
+    mon.baseline_score = {i: float(i) for i in range(20)}
+    mon._anchor_hard_cohort()
+    assert mon.hard_cohort_ids == {0, 1, 2, 3, 4}
+
+
+def test_anchor_hard_cohort_handles_empty_baseline():
+    mon = _make_monitor(track_hard_cohort=True)
+    mon._anchor_hard_cohort()
+    assert mon.hard_cohort_ids == set()
+
+
+def test_monitor_hard_cohort_detects_targeted_shift_without_affecting_main_alarm():
+    # The core claim under test: boosting ONLY the anchored hard-cohort
+    # rows (a small minority of the full pool) should eventually fire
+    # the hard-cohort's OWN tracker, while the MAIN tracker -- which
+    # samples from the full pool, diluting a minority-only shift -- does
+    # not fire on the same evidence. Demonstrates both that the
+    # mechanism actually detects a targeted shift, and that it never
+    # gates the real stopping decision (maybe_check's return value).
+    torch.manual_seed(RANDOM_SEED)
+    V = 30
+    T = 3
+    row_ids = list(range(20))
+    row_labels = torch.randint(1, V, (len(row_ids), T + 1))
+    row_labels[:, 0] = -100
+    labels_by_id = {idx: row_labels[i : i + 1] for i, idx in enumerate(row_ids)}
+
+    model = PerRowBiasLM(V)
+    mon = _make_monitor(
+        cooldown_steps=1,
+        min_seen_pool=8,
+        warmup_checks=3,
+        check_every=1,
+        total_checks_horizon=60,
+        track_hard_cohort=True,
+        hard_cohort_frac=0.25,
+    )
+    wrapped_get_rows = _make_per_row_bias_get_rows(model, labels_by_id)
+    model._current_indices = row_ids
+    logits = model(None, row_labels).logits
+    mon.record_batch(row_ids, logits, row_labels, step=1)
+
+    step = 2
+    for _ in range(5):
+        mon.maybe_check(step, model, wrapped_get_rows)
+        step += 1
+    assert mon.mu0 is not None
+    # Anchored the moment main warmup completed.
+    assert mon.hard_cohort_ids is not None
+    assert len(mon.hard_cohort_ids) == 5  # 25% of 20
+
+    # Let the hard-cohort tracker's OWN warmup complete too, still under
+    # bias=0.0, before introducing any shift -- otherwise its calibration
+    # would be computed FROM the already-shifted regime (mu0_hard would
+    # absorb the shift as "normal"), defeating the whole point of
+    # calibrating separately from the main tracker.
+    for _ in range(5):
+        mon.maybe_check(step, model, wrapped_get_rows)
+        step += 1
+    assert mon.hard_cohort_mu0 is not None
+
+    # Boost ONLY the hard-cohort rows -- everyone else stays at baseline.
+    model.row_bias = {rid: 10.0 for rid in mon.hard_cohort_ids}
+
+    hard_fired_at = None
+    alarmed_at_hard_fire = None
+    for _ in range(40):
+        alarmed = mon.maybe_check(step, model, wrapped_get_rows)
+        if mon.hard_cohort_alarm_step is not None and hard_fired_at is None:
+            hard_fired_at = step
+            alarmed_at_hard_fire = alarmed
+            break
+        step += 1
+
+    assert hard_fired_at is not None, "expected the hard-cohort tracker to fire"
+    assert mon.hard_cohort_history, "expected at least one hard-cohort check logged"
+    # The core non-interference claim: on the exact step the hard-cohort
+    # tracker fires, maybe_check's own return value (what
+    # CUSUMEarlyStoppingCallback actually acts on to stop training) is
+    # untouched by it -- the main tracker's own evidence, diluted by the
+    # 15 of 20 rows that never moved, hasn't independently crossed ITS
+    # OWN threshold yet. (The main tracker CAN still fire later from the
+    # same underlying shift once enough diluted evidence accumulates --
+    # at this small a scale it covers the whole pool too, same as the
+    # hard-cohort tracker -- that's not what's being tested here; the
+    # hard-cohort tracker firing sooner, on less-diluted evidence, is
+    # exactly the sensitivity advantage it exists to provide.)
+    assert alarmed_at_hard_fire is False
+    assert mon.alarm_step is None or mon.alarm_step >= hard_fired_at
 
 
 def test_monitor_settle_checks_are_discarded_before_calibration():
@@ -909,6 +1025,35 @@ def test_fit_cusum_median_statistic_runs_and_can_sample():
     )
     assert model.cusum_monitor is not None
     assert model.cusum_monitor.cusum_statistic == "median"
+    assert trainer.args.remove_unused_columns is False
+
+    samples = model.sample(n_samples=5, device="cpu")
+    assert len(samples) <= 5
+    assert list(samples.columns) == list(df.columns)
+
+
+def test_fit_cusum_hard_cohort_tracking_runs_and_can_sample():
+    # cusum_track_hard_cohort=True end to end, on real training.
+    df = _tiny_df(n=100)
+    model = REaLTabFormer(
+        model_type="tabular", epochs=6, batch_size=16, random_state=RANDOM_SEED, train_size=1.0
+    )
+    trainer = model.fit(
+        df,
+        device="cpu",
+        overfitting_detection_method="cusum",
+        cusum_check_every=1,
+        cusum_cooldown_steps=2,
+        cusum_warmup_checks=3,
+        cusum_track_hard_cohort=True,
+        cusum_hard_cohort_frac=0.1,
+    )
+    assert model.cusum_monitor is not None
+    assert model.cusum_monitor.track_hard_cohort is True
+    # Diagnostic only -- never affects whether/when training stopped
+    # relative to the plain path (same overfitting_detection_method="cusum"
+    # config as test_fit_cusum_path_runs_and_can_sample, just with the
+    # hard-cohort tracker also running alongside it).
     assert trainer.args.remove_unused_columns is False
 
     samples = model.sample(n_samples=5, device="cpu")

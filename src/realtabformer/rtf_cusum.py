@@ -283,6 +283,8 @@ class CUSUMOverfittingMonitor:
         total_checks_horizon: Optional[int] = None,
         random_state: Optional[int] = None,
         cusum_statistic: str = "mean",
+        track_hard_cohort: bool = False,
+        hard_cohort_frac: float = 0.05,
     ) -> None:
         if check_every <= 0:
             raise ValueError("check_every must be a positive integer.")
@@ -294,6 +296,8 @@ class CUSUMOverfittingMonitor:
             raise ValueError(
                 f"cusum_statistic must be 'mean' or 'median', got {cusum_statistic!r}."
             )
+        if not (0 < hard_cohort_frac < 1):
+            raise ValueError("hard_cohort_frac must be in (0, 1).")
         if warmup_settle_checks is not None and warmup_settle_checks < 0:
             raise ValueError("warmup_settle_checks must be non-negative.")
         if max_calibration_epochs <= 0:
@@ -395,6 +399,32 @@ class CUSUMOverfittingMonitor:
         # separate from false_alarms since these weren't rejected, just
         # not persistent enough yet. See reset_after_pending_confirmation.
         self.pending_confirmations: List[Tuple[int, float]] = []
+
+        # Hard-cohort tracker: a SECOND, independently-calibrated instance
+        # of the exact same calibrate-then-accumulate machinery above,
+        # applied to a fixed, identity-tracked set of the worst-baseline-
+        # score rows instead of a fresh random resample -- see
+        # `_anchor_hard_cohort`/`_check_hard_cohort`'s own docstrings for
+        # the full rationale (memorization theory motivates watching the
+        # hardest/most-atypical rows specifically, since generalization
+        # helps them least) and why the cohort must be fixed rather than
+        # re-ranked every check. Diagnostic only when `track_hard_cohort`
+        # is set: `CUSUMEarlyStoppingCallback` never reads
+        # `hard_cohort_alarm_step`/`hard_cohort_S_by_delta` to decide
+        # whether to stop training -- purely observational state for a
+        # trajectory logger (or direct inspection) to pick up.
+        self.track_hard_cohort = track_hard_cohort
+        self.hard_cohort_frac = hard_cohort_frac
+        self.hard_cohort_ids: Optional[Set[int]] = None
+        self.hard_cohort_mu0: Optional[float] = None
+        self.hard_cohort_sigma0: Optional[float] = None
+        self._hard_cohort_warmup_deltas: List[float] = []
+        self.hard_cohort_S_by_delta: Dict[float, float] = {d: 0.0 for d in self.deltas}
+        self.hard_cohort_alarm_step: Optional[int] = None
+        self.hard_cohort_alarm_delta: Optional[float] = None
+        self.hard_cohort_history: List[Tuple[int, float, float, Dict[float, float]]] = (
+            []
+        )
 
     @property
     def delta(self) -> float:
@@ -543,6 +573,134 @@ class CUSUMOverfittingMonitor:
             if (step - self.last_seen_step[idx]) >= cooldown
         ]
 
+    def _anchor_hard_cohort(self) -> None:
+        """Snapshots the current ``baseline_score`` population and fixes
+        the worst ``hard_cohort_frac`` fraction (by baseline score -- the
+        hardest rows at first exposure) as a permanent, identity-tracked
+        cohort. Called ONCE, the moment the main tracker's own warmup
+        completes -- a natural anchor point, since by then a reasonably
+        representative slice of the dataset has already been seen -- and
+        never re-ranked afterward.
+
+        Why fixed rather than re-ranked by CURRENT score at every check:
+        re-ranking would be self-defeating. The instant a row's score
+        improves, it would drop out of "worst" and get replaced by
+        whatever's next-worst -- guaranteeing the tracked cohort's own
+        reported statistic looks muted regardless of how much real
+        improvement (memorized or not) is happening to the rows that
+        just graduated out. Anchoring to baseline score (itself already
+        a frozen, first-exposure snapshot, for the exact same reason)
+        keeps "the cohort" a stable, well-defined set whose OWN
+        improvement over time is exactly what's being asked about.
+
+        Why the hardest rows specifically, not a random or easiest
+        subset: per Feldman's long-tail memorization theory (Feldman
+        2020, "Does Learning Require Memorization?"), atypical/hard
+        examples are precisely the ones with the least benefit available
+        from generalization -- there's comparatively little other
+        training data similar enough to help. Watching the hardest
+        cohort's improvement is closer to a direct read on memorization
+        than watching a random or easiest sample, both of which have
+        much more legitimate, generalization-driven headroom to improve
+        through that isn't memorization at all.
+        """
+        if not self.baseline_score:
+            self.hard_cohort_ids = set()
+            return
+        n_cohort = max(1, int(len(self.baseline_score) * self.hard_cohort_frac))
+        ranked = sorted(self.baseline_score.items(), key=lambda kv: kv[1])
+        self.hard_cohort_ids = {row_id for row_id, _ in ranked[:n_cohort]}
+
+    def _check_hard_cohort(self, step: int, model: torch.nn.Module, get_rows) -> None:
+        """Mirrors ``maybe_check``'s own calibrate-then-accumulate logic,
+        applied to the fixed ``hard_cohort_ids`` population instead of a
+        fresh random sample -- deliberately duplicated rather than
+        sharing code with ``maybe_check``, to keep the main,
+        already-validated detection path completely untouched by this
+        opt-in diagnostic. Requires its OWN independent
+        ``hard_cohort_mu0``/``hard_cohort_sigma0`` warmup (not shared
+        with the main tracker's), since a pre-selected worst-scoring
+        cohort's baseline noise/regression-to-the-mean characteristics
+        differ from a random sample's -- calibrating separately absorbs
+        that difference into ``hard_cohort_mu0`` as "normal" for this
+        cohort, the same way the main tracker's own calibration absorbs
+        whatever counts as normal drift for a random sample.
+
+        Purely observational: writes ``hard_cohort_history``/
+        ``hard_cohort_alarm_step``, but nothing in
+        ``CUSUMEarlyStoppingCallback`` reads them to decide whether to
+        stop training. Costs one additional small forward pass per check
+        (the cohort, ~``hard_cohort_frac`` of the dataset, isn't
+        generally covered by the main tracker's own random sample) --
+        still training-time-cheap, no ``.generate()`` call, just meant to
+        be clear this isn't entirely free the way the percentile fields
+        on ``history`` are.
+        """
+        if self.hard_cohort_ids is None or not self.hard_cohort_ids:
+            return
+        pool = set(self._cooled_pool(step)) & self.hard_cohort_ids
+        # `min_seen_pool` (e.g. 32) is calibrated against the MAIN
+        # tracker's pool -- typically hundreds+ rows, so it's a small
+        # fraction of it. The hard cohort is a small, FIXED subset by
+        # construction (e.g. 5% of the dataset); requiring the same
+        # absolute count would demand nearly the ENTIRE cohort be cooled
+        # simultaneously, a far stricter bar than intended and rarely
+        # satisfied in practice. Require at least half the cohort cooled
+        # instead -- still a meaningful sample, achievable in practice.
+        min_required = max(1, len(self.hard_cohort_ids) // 2)
+        if len(pool) < min_required:
+            return
+
+        sample_idx = sorted(pool)
+        was_training = model.training
+        model.eval()
+        with torch.no_grad():
+            input_ids, labels = get_rows(sample_idx)
+            outputs = model(input_ids=input_ids, labels=labels)
+            current = compute_gated_row_scores(
+                outputs.logits, labels, self.floor_log_prob
+            )
+        if was_training:
+            model.train()
+
+        current_np = current.detach().to("cpu").numpy()
+        base_np = np.array([self.baseline_score[idx] for idx in sample_idx])
+        paired_diff = current_np - base_np
+
+        n = len(sample_idx)
+        Delta, var = _compute_check_statistic(paired_diff, self.cusum_statistic)
+
+        if self.hard_cohort_mu0 is None:
+            self._hard_cohort_warmup_deltas.append(Delta)
+            if len(self._hard_cohort_warmup_deltas) >= self.warmup_checks:
+                self.hard_cohort_mu0 = float(np.mean(self._hard_cohort_warmup_deltas))
+                self.hard_cohort_sigma0 = _robust_noise_std(
+                    self._hard_cohort_warmup_deltas
+                )
+            return
+
+        if np.isnan(var) or var <= 0:
+            return
+        se = float(np.sqrt(var / n + self.hard_cohort_sigma0**2))
+        if se <= 0:
+            return
+
+        z = (Delta - self.hard_cohort_mu0) / se
+        fired_delta = None
+        for d in self.deltas:
+            llr = d * z - d**2 / 2
+            s = max(0.0, self.hard_cohort_S_by_delta[d] + llr)
+            self.hard_cohort_S_by_delta[d] = s
+            if fired_delta is None and s >= self.cusum_h_by_delta[d]:
+                fired_delta = d
+        self.hard_cohort_history.append(
+            (step, Delta, z, dict(self.hard_cohort_S_by_delta))
+        )
+
+        if fired_delta is not None and self.hard_cohort_alarm_step is None:
+            self.hard_cohort_alarm_step = step
+            self.hard_cohort_alarm_delta = fired_delta
+
     def maybe_check(
         self,
         step: int,
@@ -603,6 +761,8 @@ class CUSUMOverfittingMonitor:
             if len(self._warmup_deltas) >= self.warmup_checks:
                 self.mu0 = float(np.mean(self._warmup_deltas))
                 self.sigma0 = _robust_noise_std(self._warmup_deltas)
+                if self.track_hard_cohort:
+                    self._anchor_hard_cohort()
             return False
 
         if np.isnan(var) or var <= 0:
@@ -624,6 +784,9 @@ class CUSUMOverfittingMonitor:
             if fired_delta is None and s >= self.cusum_h_by_delta[d]:
                 fired_delta = d
         self.history.append((step, Delta, z, dict(self.cusum_S_by_delta), p5, p50, p95))
+
+        if self.track_hard_cohort and self.hard_cohort_ids is not None:
+            self._check_hard_cohort(step, model, get_rows)
 
         if fired_delta is not None and self.alarm_step is None:
             self.alarm_step = step

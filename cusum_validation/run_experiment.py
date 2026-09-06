@@ -373,6 +373,34 @@ def attach_trajectory_logger(trajectory_path: Path):
                 p95=p95,
                 p95_minus_p50=p95 - p50,
             )
+            # Hard-cohort tracker (see CUSUMOverfittingMonitor.
+            # _check_hard_cohort) can only ever run on the SAME step a
+            # main "post_calibration" check ran (it's called from inside
+            # maybe_check right after the main tracker's own logic), so
+            # folding it into this same record -- rather than a separate
+            # JSONL line -- keeps every field for one step in one place.
+            if self.hard_cohort_history and self.hard_cohort_history[-1][0] == step:
+                (
+                    _,
+                    hard_delta,
+                    hard_z,
+                    hard_s_by_delta,
+                ) = self.hard_cohort_history[-1]
+                record.update(
+                    hard_cohort_delta=hard_delta,
+                    hard_cohort_z=hard_z,
+                    hard_cohort_S=hard_s_by_delta.get(self.delta),
+                    hard_cohort_S_by_delta=hard_s_by_delta,
+                    hard_cohort_mu0=self.hard_cohort_mu0,
+                    hard_cohort_sigma0=self.hard_cohort_sigma0,
+                    hard_cohort_alarm_step=self.hard_cohort_alarm_step,
+                    hard_cohort_alarm_delta=self.hard_cohort_alarm_delta,
+                    hard_cohort_size=(
+                        len(self.hard_cohort_ids)
+                        if self.hard_cohort_ids is not None
+                        else None
+                    ),
+                )
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
         elif self._settle_checks_remaining != settle_before:
@@ -888,6 +916,8 @@ def run_cusum(
         cusum_check_every=args.cusum_check_every,
         cusum_delta=args.cusum_delta,
         cusum_statistic=args.cusum_statistic,
+        cusum_track_hard_cohort=args.cusum_track_hard_cohort,
+        cusum_hard_cohort_frac=args.cusum_hard_cohort_frac,
         cusum_confirm_with_sensitivity=args.cusum_confirm_with_sensitivity,
         cusum_confirm_num_bootstrap=(
             args.cusum_confirm_num_bootstrap
@@ -938,6 +968,13 @@ def run_cusum(
         device=args.device,
         numeric_quantile_encoding=args.numeric_quantile_encoding,
         cusum_statistic=args.cusum_statistic,
+        cusum_track_hard_cohort=args.cusum_track_hard_cohort,
+        cusum_hard_cohort_frac=args.cusum_hard_cohort_frac,
+        hard_cohort_alarm_step=mon.hard_cohort_alarm_step,
+        hard_cohort_alarm_delta=mon.hard_cohort_alarm_delta,
+        hard_cohort_size=(
+            len(mon.hard_cohort_ids) if mon.hard_cohort_ids is not None else None
+        ),
         cusum_confirm_with_sensitivity=args.cusum_confirm_with_sensitivity,
         cusum_confirm_patience=args.cusum_confirm_patience,
         cusum_check_every=args.cusum_check_every,
@@ -1381,6 +1418,29 @@ def main():
         "entirely unique values -- see realtabformer.rtf_cusum."
         "_compute_check_statistic's own docstring for the exact formula and "
         "caveats.",
+    )
+    parser.add_argument(
+        "--cusum-track-hard-cohort",
+        action="store_true",
+        default=False,
+        help="Run a SECOND, independently-calibrated CUSUM-style tracker "
+        "restricted to a fixed cohort of the --cusum-hard-cohort-frac "
+        "worst-baseline-score rows, instead of a fresh random sample each "
+        "check. Motivated by long-tail memorization theory (Feldman 2020): "
+        "atypical/hard rows benefit least from generalization, so their "
+        "improvement is a more direct memorization signal than a random or "
+        "easiest sample's. Purely diagnostic -- logged as "
+        "hard_cohort_alarm_step/hard_cohort_history in the trajectory file, "
+        "never gates the actual stopping decision. See "
+        "realtabformer.rtf_cusum.CUSUMOverfittingMonitor._anchor_hard_cohort/"
+        "_check_hard_cohort's own docstrings for the full design.",
+    )
+    parser.add_argument(
+        "--cusum-hard-cohort-frac",
+        type=float,
+        default=0.05,
+        help="Fraction of rows (by worst baseline score) fixed as the hard "
+        "cohort. Only used with --cusum-track-hard-cohort.",
     )
     parser.add_argument(
         "--cusum-confirm-with-sensitivity",

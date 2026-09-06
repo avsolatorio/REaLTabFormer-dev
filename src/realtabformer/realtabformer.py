@@ -507,6 +507,8 @@ class REaLTabFormer:
         cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
         cusum_statistic: str = "mean",
+        cusum_track_hard_cohort: bool = False,
+        cusum_hard_cohort_frac: float = 0.05,
         cusum_confirm_with_sensitivity: bool = False,
         cusum_confirm_frac: float = 0.165,
         cusum_confirm_frac_max_data: int = 10000,
@@ -645,6 +647,22 @@ class REaLTabFormer:
               numeric columns are almost entirely unique values -- see
               `_compute_check_statistic`'s own docstring for the exact formula and
               its caveats.
+            cusum_track_hard_cohort: Only used when
+              `overfitting_detection_method="cusum"`. When True, runs a SECOND,
+              independently-calibrated CUSUM-style tracker restricted to a fixed
+              cohort of the `cusum_hard_cohort_frac` worst-baseline-score rows
+              (the hardest at first exposure), instead of a fresh random sample --
+              motivated by long-tail memorization theory (Feldman 2020): atypical/
+              hard rows benefit least from generalization, so their improvement is
+              a more direct memorization signal than a random or easiest sample's.
+              Purely diagnostic -- `CUSUMEarlyStoppingCallback` never reads
+              `hard_cohort_alarm_step` to decide whether to stop training. See
+              `CUSUMOverfittingMonitor._anchor_hard_cohort`/`_check_hard_cohort`'s
+              own docstrings for the full design (why the cohort must be fixed,
+              not re-ranked every check).
+            cusum_hard_cohort_frac: Only used when `cusum_track_hard_cohort=True`.
+              Fraction of rows (by worst baseline score) to fix as the hard
+              cohort. Default 0.05.
             cusum_confirm_with_sensitivity: Only used when
               `overfitting_detection_method="cusum"`. When True, a fired
               alarm triggers a sensitivity-style confirmation (one
@@ -715,6 +733,8 @@ class REaLTabFormer:
                     cusum_delta=cusum_delta,
                     cusum_target_far=cusum_target_far,
                     cusum_statistic=cusum_statistic,
+                    cusum_track_hard_cohort=cusum_track_hard_cohort,
+                    cusum_hard_cohort_frac=cusum_hard_cohort_frac,
                     cusum_confirm_with_sensitivity=cusum_confirm_with_sensitivity,
                     cusum_confirm_frac=cusum_confirm_frac,
                     cusum_confirm_frac_max_data=cusum_confirm_frac_max_data,
@@ -2067,6 +2087,8 @@ class REaLTabFormer:
         cusum_delta: Union[float, Sequence[float]] = 0.5,
         cusum_target_far: float = 0.01,
         cusum_statistic: str = "mean",
+        cusum_track_hard_cohort: bool = False,
+        cusum_hard_cohort_frac: float = 0.05,
         cusum_seen_pool_size: int = 256,
         cusum_min_seen_pool: int = 32,
         cusum_confirm_with_sensitivity: bool = False,
@@ -2138,6 +2160,15 @@ class REaLTabFormer:
               across the checked pool. See `_compute_check_statistic`'s
               own docstring for the exact formula, the motivating
               investigation, and its caveats.
+            cusum_track_hard_cohort: When True, runs a second,
+              independently-calibrated CUSUM-style tracker restricted to a
+              fixed cohort of the worst-baseline-score rows, rather than a
+              fresh random sample -- diagnostic only, never gates stopping.
+              See `CUSUMOverfittingMonitor._anchor_hard_cohort`/
+              `_check_hard_cohort`'s own docstrings for the full design.
+            cusum_hard_cohort_frac: Fraction of rows (by worst baseline
+              score) fixed as the hard cohort. Only used when
+              `cusum_track_hard_cohort=True`. Default 0.05.
             cusum_seen_pool_size: Max number of cooled rows sampled per
               check.
             cusum_min_seen_pool: Minimum cooled-pool size required
@@ -2308,6 +2339,8 @@ class REaLTabFormer:
             target_quantile=1 - cusum_target_far,
             random_state=self.random_state,
             cusum_statistic=cusum_statistic,
+            track_hard_cohort=cusum_track_hard_cohort,
+            hard_cohort_frac=cusum_hard_cohort_frac,
         )
         trainer.cusum_monitor = monitor
         self.cusum_monitor = monitor
