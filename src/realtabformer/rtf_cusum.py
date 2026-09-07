@@ -425,6 +425,13 @@ class CUSUMOverfittingMonitor:
         self.hard_cohort_history: List[Tuple[int, float, float, Dict[float, float]]] = (
             []
         )
+        # Raw (step, Delta, pool_size) for every eligible hard-cohort check
+        # taken BEFORE hard_cohort_mu0/sigma0 finish calibrating -- purely
+        # for understanding the cohort's behavior early, since
+        # hard_cohort_history only starts once calibration completes and
+        # these warmup-phase Deltas would otherwise be silently discarded
+        # into `_hard_cohort_warmup_deltas` with no visible trace.
+        self.hard_cohort_warmup_history: List[Tuple[int, float, int]] = []
 
     @property
     def delta(self) -> float:
@@ -635,6 +642,18 @@ class CUSUMOverfittingMonitor:
         still training-time-cheap, no ``.generate()`` call, just meant to
         be clear this isn't entirely free the way the percentile fields
         on ``history`` are.
+
+        Called from ``maybe_check`` independently of whether THAT check's
+        own random-sample ``var``/``se`` turn out degenerate -- this
+        function's own ``Delta``/``var`` (below) come from a completely
+        separate, fixed set of rows, so there's no reason a bad main-sample
+        check should also suppress this one. Every eligible pre-calibration
+        ``Delta`` is also recorded to ``hard_cohort_warmup_history`` (with
+        the observed pool size), not just discarded while waiting for
+        ``hard_cohort_mu0``/``sigma0`` to finish calibrating -- since this
+        is purely for understanding the cohort's behavior, there's no
+        reason to withhold the raw signal just because the alarm machinery
+        built on top of it isn't ready yet.
         """
         if self.hard_cohort_ids is None or not self.hard_cohort_ids:
             return
@@ -672,6 +691,7 @@ class CUSUMOverfittingMonitor:
 
         if self.hard_cohort_mu0 is None:
             self._hard_cohort_warmup_deltas.append(Delta)
+            self.hard_cohort_warmup_history.append((step, Delta, len(pool)))
             if len(self._hard_cohort_warmup_deltas) >= self.warmup_checks:
                 self.hard_cohort_mu0 = float(np.mean(self._hard_cohort_warmup_deltas))
                 self.hard_cohort_sigma0 = _robust_noise_std(
@@ -765,6 +785,17 @@ class CUSUMOverfittingMonitor:
                     self._anchor_hard_cohort()
             return False
 
+        # Run independently of whether THIS check's random-sample Delta/var
+        # below turns out degenerate -- the hard cohort's own Delta/var
+        # (computed inside _check_hard_cohort) come from a completely
+        # separate, fixed set of rows, so a degenerate main-sample variance
+        # has no bearing on whether the cohort check is valid. Previously
+        # this call sat after the var/se early-returns below, so a
+        # degenerate main check silently skipped the cohort check too, for
+        # a reason that had nothing to do with the cohort at all.
+        if self.track_hard_cohort and self.hard_cohort_ids is not None:
+            self._check_hard_cohort(step, model, get_rows)
+
         if np.isnan(var) or var <= 0:
             return False
 
@@ -784,9 +815,6 @@ class CUSUMOverfittingMonitor:
             if fired_delta is None and s >= self.cusum_h_by_delta[d]:
                 fired_delta = d
         self.history.append((step, Delta, z, dict(self.cusum_S_by_delta), p5, p50, p95))
-
-        if self.track_hard_cohort and self.hard_cohort_ids is not None:
-            self._check_hard_cohort(step, model, get_rows)
 
         if fired_delta is not None and self.alarm_step is None:
             self.alarm_step = step

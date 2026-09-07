@@ -342,6 +342,39 @@ def attach_trajectory_logger(trajectory_path: Path):
         settle_before = self._settle_checks_remaining
         warmup_before = len(self._warmup_deltas)
         fired = orig_maybe_check(self, step, model, get_rows)
+
+        # Hard-cohort tracker (see CUSUMOverfittingMonitor._check_hard_cohort)
+        # now runs independently of whether the main check's own random
+        # sample was well-behaved on this step -- it can update
+        # hard_cohort_history (post-calibration) or hard_cohort_warmup_history
+        # (pre-calibration) on a step where self.history did NOT get a new
+        # entry at all. Computed once here, up front, then folded into
+        # whichever branch below actually fires for this step -- or logged
+        # on its own if none of them do.
+        hard_cohort_fields = {}
+        if self.hard_cohort_history and self.hard_cohort_history[-1][0] == step:
+            (
+                _,
+                hard_delta,
+                hard_z,
+                hard_s_by_delta,
+            ) = self.hard_cohort_history[-1]
+            hard_cohort_fields = dict(
+                hard_cohort_delta=hard_delta,
+                hard_cohort_z=hard_z,
+                hard_cohort_S=hard_s_by_delta.get(self.delta),
+                hard_cohort_S_by_delta=hard_s_by_delta,
+                hard_cohort_mu0=self.hard_cohort_mu0,
+                hard_cohort_sigma0=self.hard_cohort_sigma0,
+                hard_cohort_alarm_step=self.hard_cohort_alarm_step,
+                hard_cohort_alarm_delta=self.hard_cohort_alarm_delta,
+                hard_cohort_size=(
+                    len(self.hard_cohort_ids)
+                    if self.hard_cohort_ids is not None
+                    else None
+                ),
+            )
+
         if self.history and self.history[-1][0] == step:
             # `stat_delta` is the paired-improvement statistic (called
             # `Delta` in the module docstring/code) -- unrelated to the
@@ -372,35 +405,36 @@ def attach_trajectory_logger(trajectory_path: Path):
                 p50=p50,
                 p95=p95,
                 p95_minus_p50=p95 - p50,
+                **hard_cohort_fields,
             )
-            # Hard-cohort tracker (see CUSUMOverfittingMonitor.
-            # _check_hard_cohort) can only ever run on the SAME step a
-            # main "post_calibration" check ran (it's called from inside
-            # maybe_check right after the main tracker's own logic), so
-            # folding it into this same record -- rather than a separate
-            # JSONL line -- keeps every field for one step in one place.
-            if self.hard_cohort_history and self.hard_cohort_history[-1][0] == step:
-                (
-                    _,
-                    hard_delta,
-                    hard_z,
-                    hard_s_by_delta,
-                ) = self.hard_cohort_history[-1]
-                record.update(
-                    hard_cohort_delta=hard_delta,
-                    hard_cohort_z=hard_z,
-                    hard_cohort_S=hard_s_by_delta.get(self.delta),
-                    hard_cohort_S_by_delta=hard_s_by_delta,
-                    hard_cohort_mu0=self.hard_cohort_mu0,
-                    hard_cohort_sigma0=self.hard_cohort_sigma0,
-                    hard_cohort_alarm_step=self.hard_cohort_alarm_step,
-                    hard_cohort_alarm_delta=self.hard_cohort_alarm_delta,
-                    hard_cohort_size=(
-                        len(self.hard_cohort_ids)
-                        if self.hard_cohort_ids is not None
-                        else None
-                    ),
-                )
+            with open(trajectory_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        elif hard_cohort_fields:
+            # Hard cohort produced a post-calibration entry this step, but
+            # the main check itself didn't (degenerate var/se on the main
+            # random sample) -- log it on its own rather than silently
+            # dropping it now that the two are decoupled.
+            record = dict(
+                phase="hard_cohort_post_calibration", step=step, **hard_cohort_fields
+            )
+            with open(trajectory_path, "a") as f:
+                f.write(json.dumps(record) + "\n")
+        elif (
+            self.hard_cohort_warmup_history
+            and self.hard_cohort_warmup_history[-1][0] == step
+        ):
+            # A hard-cohort warmup-phase Delta was collected (before its
+            # own mu0/sigma0 finish calibrating) -- logged raw, same
+            # spirit as the main tracker's own "warmup" phase below, so
+            # the cohort's behavior is visible from the moment it's
+            # eligible to check at all, not just once it can alarm.
+            _, hard_warmup_delta, hard_pool_size = self.hard_cohort_warmup_history[-1]
+            record = dict(
+                phase="hard_cohort_warmup",
+                step=step,
+                delta=hard_warmup_delta,
+                pool_size=hard_pool_size,
+            )
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
         elif self._settle_checks_remaining != settle_before:

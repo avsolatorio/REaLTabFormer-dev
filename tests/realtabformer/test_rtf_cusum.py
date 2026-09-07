@@ -853,6 +853,15 @@ def test_monitor_hard_cohort_detects_targeted_shift_without_affecting_main_alarm
         mon.maybe_check(step, model, wrapped_get_rows)
         step += 1
     assert mon.hard_cohort_mu0 is not None
+    # The raw pre-calibration Deltas that fed hard_cohort_mu0 must be
+    # visible on hard_cohort_warmup_history, not just silently discarded --
+    # exactly `warmup_checks` entries (3), each a real (step, Delta,
+    # pool_size) tuple with a non-empty eligible pool.
+    assert len(mon.hard_cohort_warmup_history) == 3
+    for warmup_step, warmup_delta, warmup_pool_size in mon.hard_cohort_warmup_history:
+        assert isinstance(warmup_step, int)
+        assert isinstance(warmup_delta, float)
+        assert warmup_pool_size >= len(mon.hard_cohort_ids) // 2
 
     # Boost ONLY the hard-cohort rows -- everyone else stays at baseline.
     model.row_bias = {rid: 10.0 for rid in mon.hard_cohort_ids}
