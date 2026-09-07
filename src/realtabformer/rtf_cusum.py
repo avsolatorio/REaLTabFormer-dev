@@ -432,6 +432,9 @@ class CUSUMOverfittingMonitor:
         # these warmup-phase Deltas would otherwise be silently discarded
         # into `_hard_cohort_warmup_deltas` with no visible trace.
         self.hard_cohort_warmup_history: List[Tuple[int, float, int]] = []
+        # Updated on EVERY _check_hard_cohort call, pass or fail -- see
+        # that method's own comment. None until the first call.
+        self.hard_cohort_last_pool_size: Optional[int] = None
 
     @property
     def delta(self) -> float:
@@ -658,6 +661,13 @@ class CUSUMOverfittingMonitor:
         if self.hard_cohort_ids is None or not self.hard_cohort_ids:
             return
         pool = set(self._cooled_pool(step)) & self.hard_cohort_ids
+        # Recorded on EVERY call, pass or fail -- unlike hard_cohort_history/
+        # hard_cohort_warmup_history (only written once eligibility clears),
+        # this is the raw "how close is the cohort to eligible right now"
+        # signal, needed to tell "the cohort's own dynamics are fine, it's
+        # just rare for min_required rows to be simultaneously cooled" apart
+        # from "something is actually wrong" without guessing.
+        self.hard_cohort_last_pool_size = len(pool)
         # `min_seen_pool` (e.g. 32) is calibrated against the MAIN
         # tracker's pool -- typically hundreds+ rows, so it's a small
         # fraction of it. The hard cohort is a small, FIXED subset by

@@ -405,6 +405,13 @@ def attach_trajectory_logger(trajectory_path: Path):
                 p50=p50,
                 p95=p95,
                 p95_minus_p50=p95 - p50,
+                # Recorded on every check once the cohort is anchored,
+                # whether or not it clears the eligibility bar that step --
+                # lets a real run directly show whether eligibility is
+                # rarely-but-sometimes met (cohort dynamics are fine, just
+                # infrequent) versus never met at all (worth investigating
+                # further) instead of only ever seeing pass/fail as silence.
+                hard_cohort_pool_size_now=self.hard_cohort_last_pool_size,
                 **hard_cohort_fields,
             )
             with open(trajectory_path, "a") as f:
