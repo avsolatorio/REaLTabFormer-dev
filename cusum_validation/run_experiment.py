@@ -908,6 +908,10 @@ def run_cusum(
         checkpoints_dir=str(results_dir / f"{run_id}_ckpt_cusum"),
         numeric_quantile_encoding=args.numeric_quantile_encoding,
     )
+    if args.gradient_accumulation_steps is not None:
+        model.training_args_kwargs["gradient_accumulation_steps"] = (
+            args.gradient_accumulation_steps
+        )
     t0 = time.time()
     trainer = model.fit(
         train_df,
@@ -965,6 +969,7 @@ def run_cusum(
     existing["cusum_training"] = dict(
         epochs_ceiling=args.epochs,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=trainer.args.gradient_accumulation_steps,
         device=args.device,
         numeric_quantile_encoding=args.numeric_quantile_encoding,
         cusum_statistic=args.cusum_statistic,
@@ -1060,6 +1065,10 @@ def run_full(
         checkpoints_dir=str(results_dir / f"{run_id}_ckpt_full"),
         numeric_quantile_encoding=args.numeric_quantile_encoding,
     )
+    if args.gradient_accumulation_steps is not None:
+        model.training_args_kwargs["gradient_accumulation_steps"] = (
+            args.gradient_accumulation_steps
+        )
     t0 = time.time()
     trainer = model.fit(
         train_df, device=args.device, overfitting_detection_method="none"
@@ -1076,6 +1085,7 @@ def run_full(
     existing["full_training"] = dict(
         epochs_ceiling=args.epochs,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=trainer.args.gradient_accumulation_steps,
         device=args.device,
         numeric_quantile_encoding=args.numeric_quantile_encoding,
         global_step=trainer.state.global_step,
@@ -1163,6 +1173,10 @@ def run_sensitivity(
         checkpoints_dir=str(results_dir / f"{run_id}_ckpt_sensitivity"),
         numeric_quantile_encoding=args.numeric_quantile_encoding,
     )
+    if args.gradient_accumulation_steps is not None:
+        model.training_args_kwargs["gradient_accumulation_steps"] = (
+            args.gradient_accumulation_steps
+        )
     t0 = time.time()
     trainer = model.fit(
         train_df,
@@ -1202,6 +1216,7 @@ def run_sensitivity(
     existing["sensitivity_training"] = dict(
         epochs_ceiling=args.epochs,
         batch_size=args.batch_size,
+        gradient_accumulation_steps=trainer.args.gradient_accumulation_steps,
         device=args.device,
         numeric_quantile_encoding=args.numeric_quantile_encoding,
         n_critic=args.sensitivity_n_critic,
@@ -1375,6 +1390,19 @@ def main():
     )
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument(
+        "--gradient-accumulation-steps",
+        type=int,
+        default=None,
+        help="Override REaLTabFormer's TrainingArguments "
+        "gradient_accumulation_steps (library default: 4, i.e. "
+        "effective_batch = batch_size * 4 with zero GPU-parallelism benefit "
+        "-- it only delays the optimizer step, so on a small dataset it can "
+        "silently collapse steps_per_epoch enough to underfit at a fixed "
+        "epoch ceiling). Left unset by default so every previously-committed "
+        "run's exact step counts stay reproducible; pass 1 to make "
+        "--batch-size the real effective batch.",
+    )
     parser.add_argument(
         "--device",
         default="cuda" if torch.cuda.is_available() else "cpu",
