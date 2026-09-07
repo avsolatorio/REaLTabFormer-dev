@@ -1,0 +1,53 @@
+{
+  "cusum_training": {
+    "epochs_ceiling": 300,
+    "batch_size": 32,
+    "gradient_accumulation_steps": 4,
+    "device": "cuda",
+    "numeric_quantile_encoding": false,
+    "cusum_statistic": "median",
+    "cusum_track_hard_cohort": true,
+    "cusum_hard_cohort_frac": 0.05,
+    "hard_cohort_alarm_step": null,
+    "hard_cohort_alarm_delta": null,
+    "hard_cohort_size": 193,
+    "cusum_confirm_with_sensitivity": true,
+    "cusum_confirm_patience": 2,
+    "cusum_check_every": 20,
+    "cusum_deltas": [
+      0.25,
+      0.5,
+      1.0
+    ],
+    "alarm_step": 640,
+    "alarm_delta": 1.0,
+    "global_step": 640,
+    "steps_per_epoch": 30,
+    "effective_epochs": 21.333333333333332,
+    "elapsed_s": 143.04074120521545,
+    "mu0": 0.6742305159568787,
+    "sigma0": 0.05408205333355011,
+    "cusum_h": 8.842940651369034,
+    "cusum_h_by_delta": {
+      "0.25": 8.842940651369034,
+      "0.5": 9.826371584485825,
+      "1.0": 10.683748595537399
+    },
+    "cooldown_steps_final": 15,
+    "alarm_checkpoint_dir": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/cusum_validation/results/wilt_ablate_confirm_p2_ckpt_cusum/cusum_alarm"
+  },
+  "cusum_stop_at_alarm": {
+    "label": "cusum_stop_at_alarm",
+    "n_samples_generated": 5139,
+    "dcr_synth_mean": 0.479480429600885,
+    "dcr_synth_min": 0.06932280967862875,
+    "dcr_test_mean": 0.5094122719049272,
+    "frac_suspicious": 0.05991735537190083
+  },
+  "cusum_stop_at_alarm_utility": {
+    "metric": "auc",
+    "trtr": 0.9599648855314529,
+    "tstr": 0.944394390925682,
+    "gap": 0.015570494605770868
+  }
+}
