@@ -350,7 +350,10 @@ def attach_trajectory_logger(trajectory_path: Path):
         # (pre-calibration) on a step where self.history did NOT get a new
         # entry at all. Computed once here, up front, then folded into
         # whichever branch below actually fires for this step -- or logged
-        # on its own if none of them do.
+        # on its own if none of them do. At most one of hard_cohort_fields/
+        # hard_cohort_warmup_fields is ever non-empty on a given step: the
+        # two histories are mutually exclusive over time (warmup_history
+        # only grows before hard_cohort_mu0 calibrates, history only after).
         hard_cohort_fields = {}
         if self.hard_cohort_history and self.hard_cohort_history[-1][0] == step:
             (
@@ -373,6 +376,19 @@ def attach_trajectory_logger(trajectory_path: Path):
                     if self.hard_cohort_ids is not None
                     else None
                 ),
+            )
+
+        hard_cohort_warmup_fields = {}
+        if (
+            self.hard_cohort_warmup_history
+            and self.hard_cohort_warmup_history[-1][0] == step
+        ):
+            _, hard_warmup_delta, hard_warmup_pool_size = (
+                self.hard_cohort_warmup_history[-1]
+            )
+            hard_cohort_warmup_fields = dict(
+                hard_cohort_warmup_delta=hard_warmup_delta,
+                hard_cohort_warmup_pool_size=hard_warmup_pool_size,
             )
 
         if self.history and self.history[-1][0] == step:
@@ -413,6 +429,7 @@ def attach_trajectory_logger(trajectory_path: Path):
                 # further) instead of only ever seeing pass/fail as silence.
                 hard_cohort_pool_size_now=self.hard_cohort_last_pool_size,
                 **hard_cohort_fields,
+                **hard_cohort_warmup_fields,
             )
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
@@ -426,21 +443,12 @@ def attach_trajectory_logger(trajectory_path: Path):
             )
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
-        elif (
-            self.hard_cohort_warmup_history
-            and self.hard_cohort_warmup_history[-1][0] == step
-        ):
-            # A hard-cohort warmup-phase Delta was collected (before its
-            # own mu0/sigma0 finish calibrating) -- logged raw, same
-            # spirit as the main tracker's own "warmup" phase below, so
-            # the cohort's behavior is visible from the moment it's
-            # eligible to check at all, not just once it can alarm.
-            _, hard_warmup_delta, hard_pool_size = self.hard_cohort_warmup_history[-1]
+        elif hard_cohort_warmup_fields:
+            # Same situation, but the hard cohort is still in ITS OWN
+            # pre-calibration warmup rather than already producing alarm-
+            # capable entries.
             record = dict(
-                phase="hard_cohort_warmup",
-                step=step,
-                delta=hard_warmup_delta,
-                pool_size=hard_pool_size,
+                phase="hard_cohort_warmup", step=step, **hard_cohort_warmup_fields
             )
             with open(trajectory_path, "a") as f:
                 f.write(json.dumps(record) + "\n")
