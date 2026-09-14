@@ -2,6 +2,8 @@
 for tabular and relational data.
 """
 
+from __future__ import annotations
+
 import inspect
 import json
 import logging
