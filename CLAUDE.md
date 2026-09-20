@@ -20,6 +20,20 @@ Read, in order:
    design). Denser and less structured than the lab notebook; read
    selectively.
 
+## Lab notebook timestamps
+
+Every new `notes/lab_notebook.md` entry header carries a **UTC date and
+time**, e.g. `## 2026-09-20 03:30 UTC — <title>`, and its body names the
+git commit the result was produced against (`git rev-parse --short HEAD`).
+Take the time from `./devtools/nettime.sh`, **not** from `date` or any
+other local-clock source: this box's clock is not reliably NTP-synced
+(measured 3.5 min slow, `timedatectl` reporting "synchronized: no"), and
+several entries land on the same day, so ordering relative to code
+changes matters. If the script fails (no network), write the time
+followed by `(local clock, unverified)` rather than omitting or guessing
+it. Entries written before 2026-09-20 have a date only; the notebook is
+append-only, so they are left as they are.
+
 ## Git workflow
 
 - **Never push without the user explicitly asking**, even if a commit
