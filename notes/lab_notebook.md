@@ -645,3 +645,33 @@ generation quality -- running now as matrix `oovcost` (b0 vs 3% vs 10%, 4
 datasets x 3 seeds); (2) behaviour on numeric OOV values, on other datasets,
 and on v2/any-order (the collator is v1 only); (3) only three distinct held-out
 levels were tested. Decision to change the default is left until (1) is in.
+
+---
+
+## 2026-09-20 07:39 UTC — `top_k=0` default for tabular sampling implemented and validated (owner approved implementing it; not merged into `feat/support-seed-input`)
+
+Code: `06f37a7` on `exp/topk0-default`, stacked on `exp/fast-constrained-decoding`
+(`bf249ff`), itself off `exp/utility-optimization`.
+
+**Question:** Can the H1 finding (2026-09-20 07:29 UTC entry) be shipped as a
+default without changing anything it has no evidence for?
+
+**What was done:** `TabularSampler.default_top_k = 0` (new class attribute on
+the base sampler, default `None` = leave HF alone); `_generate` applies it
+only when the caller passed no `top_k` (or `None`) and is actually sampling.
+`RelationalSampler` keeps HF's default. Tests: a spy on `model.generate`
+(default -> `top_k=0`; explicit 25 -> 25; `None` -> 0; greedy -> no `top_k`;
+relational default is `None`), and a behavioural test on a 200-level first
+column of a near-uniform 1-epoch model (default sampling yields >50 distinct
+levels; `top_k=50` yields <=50). Mutation-checked: with `default_top_k=None`
+the behavioural test fails.
+
+**Result:** Full suite 171 passed, 2 failed -- the same two failures that
+pre-date this work (`test_default_init`, `test_TabularSampler`). No
+regressions.
+
+**Implication:** Ready for review. Effect sizes are from one synthetic
+dataset with 3 seeds (see the H1 entry); the change is neutral on the
+bundled low-cardinality datasets (M1). It alters default sampling output for
+any model with a column wider than 50 tokens, including `numeric_nparts>=2`.
+Merging into `feat/support-seed-input` is left to the owner.

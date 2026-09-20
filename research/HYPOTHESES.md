@@ -40,7 +40,7 @@ the current status of each idea and points at the raw data.
 | ID | Idea | Status |
 |----|------|--------|
 | H0 | Harness sanity + seed noise floor (base, 3 seeds) | done (M1): headroom large (disc AUC ~0.69); abalone seed noise larger than predicted |
-| H1 | `top_k=50` HF default silently truncates sampling | CONFIRMED on hicard (tvd_mean 0.142 -> 0.104, 3/3 seeds, no privacy change); no effect on bundled data. Proposed: default top_k=0 |
+| H1 | `top_k=50` HF default silently truncates sampling | CONFIRMED on hicard (tvd_mean 0.142 -> 0.104, 3/3 seeds, no privacy change); no effect on bundled data. Implemented + tested on `exp/topk0-default` (06f37a7), not merged |
 | H2 | Sampling temperature / nucleus | done (M1): T=0.9 and top_p=0.95 clearly worse; T=1.1 mild hint of gain, needs a finer test |
 | H3 | Default GPT2 (768d x 6L) is oversized for small tables | running (M2a) |
 | H4 | Default LR (5e-5, no warmup) under-trains; higher LR + warmup helps | running (M2a) |
