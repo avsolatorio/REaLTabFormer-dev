@@ -39,15 +39,15 @@ the current status of each idea and points at the raw data.
 
 | ID | Idea | Status |
 |----|------|--------|
-| H0 | Harness sanity + seed noise floor (base, 3 seeds) | planned |
-| H1 | `top_k=50` HF default silently truncates sampling | planned |
-| H2 | Sampling temperature / nucleus | planned |
-| H3 | Default GPT2 (768d x 6L) is oversized for small tables | planned |
-| H4 | Default LR (5e-5, no warmup) under-trains; higher LR + warmup helps | planned |
-| H5 | Re-check quantile encoding win with multiple seeds | planned |
+| H0 | Harness sanity + seed noise floor (base, 3 seeds) | done (M1): headroom large (disc AUC ~0.69); abalone seed noise larger than predicted |
+| H1 | `top_k=50` HF default silently truncates sampling | bundled data: no effect (as predicted); hicard test pending (`m1h`) |
+| H2 | Sampling temperature / nucleus | done (M1): T=0.9 and top_p=0.95 clearly worse; T=1.1 mild hint of gain, needs a finer test |
+| H3 | Default GPT2 (768d x 6L) is oversized for small tables | running (M2a) |
+| H4 | Default LR (5e-5, no warmup) under-trains; higher LR + warmup helps | running (M2a) |
+| H5 | Re-check quantile encoding win with multiple seeds | done (M1): no overall gain; helps skewed marginals, worsens `frac_suspicious` on all 4 datasets -- not recommended by default; artifact-vs-copying question open |
 | H6 | Fewer tokens per numeric column (`numeric_nparts=2`) | planned |
-| H7 | `gradient_accumulation_steps=4` default hurts small data | planned |
-| H8 | OOV: random substitution vs UNK vs UNK + input dropout | planned |
+| H7 | `gradient_accumulation_steps=4` default hurts small data | running (M2a) |
+| H8 | OOV: random substitution vs UNK vs UNK + input dropout | running (`exp/oov-unk-dropout`); prelim: UNK + dropout tracks the marginal, random does not |
 
 ## Hypotheses
 
@@ -136,6 +136,19 @@ the current status of each idea and points at the raw data.
   the true conditional and the marginal; separately check unconditional
   quality cost of dropout with the standard harness. Both code paths
   (`get_token_id` and `_vectorized_column_token_ids`) must change together.
+
+### H9 (new, from M1) -- constrained decoding cost
+- **Why:** sampling took ~1 min per 1,024 rows in M1 under load; the per-row
+  `prefix_allowed_tokens_fn` callback is a suspect.
+- **Result (profile, not a matrix):** vectorised logits mask 0.22s vs callback
+  76.5s for 1,024 rows, identical tokens for the same seed (measured on a busy
+  shared box, so the factor overstates an idle-box gain). Implemented and
+  tested, incl. any-order, on `exp/fast-constrained-decoding`.
+
+### H10 (new, from M1) -- is quantile encoding's higher `frac_suspicious` real copying or a value-grid artifact?
+- **Prediction:** an artifact of snapping to the 1,000-point training grid; a
+  DCR computed on rank-transformed values, and a nearest-neighbour check that
+  ignores the snapped columns, should show no excess.
 
 ## Ideas parked (not yet hypotheses)
 - Numeric OOV: snap to the nearest in-vocab digit token rather than a random one.

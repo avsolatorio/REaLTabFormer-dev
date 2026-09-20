@@ -466,3 +466,75 @@ Verified the four items below directly.
 **Implication:** Every comparison from here on uses >=3 seeds and reports
 privacy alongside utility. Items 1 and 3 become hypotheses H1 and (new)
 mask-rate; item 4 refines the H8 test design. See `research/HYPOTHESES.md`.
+
+---
+
+## 2026-09-20 04:22 UTC — M1: baseline noise floor, sampling variants (H1, H2) and quantile encoding (H5) on 4 datasets x 3 seeds
+
+Code/data: commit `b7d559e` (raw JSON in `research/results/m1/`). The jobs
+actually ran from `68f7122` plus uncommitted edits to `research/configs.py`
+(the M1 arm definitions) and, mid-run, to `research/bench.py` (HGB
+categorical cap and GPU assignment -- neither changes any metric for the
+four datasets below). `research/results/m1h` and `m2a` partial results are in
+the same commit; they are not analysed here.
+
+**Question:** Against a real noise floor, (H0) how far is default synthetic
+data from real, and how big is seed noise? (H1) Does HF's default `top_k=50`
+matter? (H2) Do temperature / nucleus sampling give a free win? (H5) Does
+quantile encoding still win with several seeds *when privacy is scored too*?
+
+**What was done:** diabetes, insurance, abalone, adult5k x seeds 0,1,2 x
+{`base`, `qenc`}; `base` scored under 5 sampling variants on one trained
+model. Sensitivity stopping + best-checkpoint loading, teacher-forced target.
+12 paired (dataset, seed) units per arm. hicard (the H1 test that can
+actually show an effect) is NOT in this entry: all 6 of its jobs failed in my
+metric code (HistGradientBoosting rejects >255-level categoricals) after
+training and sampling had finished; rerun as `m1h`, pending. Because ~50
+paired comparisons were made, single results near 2 s.e. are treated as
+hints; only effects that are large (~3+ s.e.) or that point the same way on
+every dataset are called findings.
+
+**Result:**
+- **H0 noise floor.** Default synthetic data is 1.5-3x the real-vs-real
+  floor on marginal distance (`marg_mean` 0.062-0.098 vs floor 0.023-0.065
+  by dataset) and is easily told apart from real: discriminator AUC
+  0.68-0.70 on all four datasets (floor 0.50). Large headroom. Seed noise is
+  bigger than I predicted on abalone: SD across seeds 0.033 on `marg_mean`
+  and 0.036 on TSTR (adult5k: 0.005 and 0.005). Sensitivity stopping lands
+  at epoch 28-33 on average (SD 3-7.6 epochs).
+- **H1 (`top_k=0` vs default 50), bundled datasets:** no detectable effect,
+  as predicted. `marg_mean` +0.0003 +-0.0034 (6 better/6 worse), TSTR -0.005
+  +-0.007. One hint: `frac_suspicious` +0.010 +-0.004 (2.5 s.e., 3/8) --
+  not established. The real test is hicard, still pending.
+- **H2 temperature/nucleus.** T=0.9: clearly worse -- `marg_mean` +0.014
+  +-0.003 (1 better/11 worse), discriminator distance from 0.5 +0.031 +-0.006
+  (1/11), `frac_suspicious` +0.020 +-0.004 (0/11); TSTR -0.003 +-0.009, so the
+  small utility gain I predicted for T<1 did not appear. `top_p=0.95`:
+  clearly worse -- `tail_err` +0.060 +-0.017 (0/12), discriminator distance
+  +0.049 +-0.008 (0/12): nucleus truncation cuts real tails. T=1.1: small,
+  same-direction improvements (`marg_mean` -0.007 +-0.004, 8/4; discriminator
+  distance -0.013 +-0.006, 8/4; `frac_suspicious` -0.007 +-0.003, 7/5), TSTR
+  -0.008 +-0.007. About 2 s.e. each -- a hint that the trained model is
+  slightly over-confident, not a finding.
+- **H5 quantile encoding vs default (both `default` sampling).** No
+  detectable overall gain: `marg_mean` -0.009 +-0.006 (6/6), TSTR -0.002
+  +-0.009. Per dataset it helps the marginals where predicted -- insurance
+  -0.023, abalone -0.013 -- and hurts adult5k (+0.009). `assoc_diff` is worse
+  (+0.0034 +-0.0015, 3 better/9 worse). **`frac_suspicious` is worse on all
+  four datasets** (+0.011 to +0.035; mean +0.019 +-0.005, 10 of 12 units
+  worse). `exact_dup` is 0 for every arm, so this is closeness, not copied
+  rows. Wall-clock: `qenc` fit ~510 s faster on average (+-158), but jobs
+  ran at different machine loads, so this is not attributable to the encoding.
+
+**Implication:** (1) Do not use `top_p`; do not use T<1. (2) DECISION_LOG's
+"quantile encoding is the one clean win" does not survive multi-seed,
+privacy-scored testing on these four datasets: it improves marginals on
+skewed columns but raises the suspicious-closeness rate on every dataset, and
+under the standing rule (quality gain with worse privacy is not a win) it is
+not recommended by default on this evidence. Open question, untested: the
+extra closeness may be an artifact -- quantile decoding snaps values to a
+1,000-point training grid, which lowers a value-space DCR without any
+memorisation -- rather than genuine copying. (3) T slightly above 1 is worth a
+proper test (finer grid, more seeds). (4) Finish H1 on hicard before
+concluding anything about `top_k`. Hypotheses updated in
+`research/HYPOTHESES.md`.

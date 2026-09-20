@@ -170,7 +170,9 @@ def _encode(frames: dict, target: str, ref: pd.DataFrame, include_target: bool =
         if cat:
             X[cat] = enc.transform(X[cat].astype(str))
         out[k] = X
-    mask = [c in cat for c in feats]
+    # HistGradientBoosting rejects categorical features with >255 levels;
+    # such columns stay ordinal-coded and are treated as numeric.
+    mask = [c in cat and ref[c].nunique() <= 255 for c in feats]
     return out, mask
 
 
@@ -375,19 +377,31 @@ def run_matrix(args) -> None:
                                  tmp=str(EXP / "tmp" / f"{args.name}_{d}_{c}_{s}"),
                                  save_synth=args.save_synth))
     print(f"{len(jobs)} jobs to run, {args.workers} workers", flush=True)
-    gpus = args.gpus
+    # One free-GPU token per worker slot, dealt round-robin over `--gpus`:
+    # a worker takes a token for the duration of its job. (Indexing by job
+    # number instead -- the earlier scheme -- put every slow job of a
+    # [slow, fast, slow, fast, ...] job list on the same GPU.)
+    import queue
+
+    slots: "queue.Queue[int]" = queue.Queue()
+    for w in range(args.workers):
+        slots.put(args.gpus[w % len(args.gpus)])
 
     def work(i_job):
         i, job = i_job
+        gpu = slots.get()
         jp = out / f".job_{i}.json"
         jp.write_text(json.dumps(job))
-        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpus[i % len(gpus)]),
+        env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu),
                    OMP_NUM_THREADS="8", TOKENIZERS_PARALLELISM="false")
         t0 = time.time()
         log = out / "logs"
         log.mkdir(exist_ok=True)
         with open(log / f"{Path(job['out_json']).stem}.log", "w") as lf:
-            subprocess.run([sys.executable, __file__, "child", str(jp)], env=env, stdout=lf, stderr=subprocess.STDOUT)
+            try:
+                subprocess.run([sys.executable, __file__, "child", str(jp)], env=env, stdout=lf, stderr=subprocess.STDOUT)
+            finally:
+                slots.put(gpu)
         jp.unlink(missing_ok=True)
         r = json.loads(Path(job["out_json"]).read_text())
         print(f"[{time.time() - t0:6.0f}s] {Path(job['out_json']).stem} {'FAILED' if 'error' in r else 'ok'}", flush=True)
