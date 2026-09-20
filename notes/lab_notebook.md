@@ -538,3 +538,110 @@ memorisation -- rather than genuine copying. (3) T slightly above 1 is worth a
 proper test (finer grid, more seeds). (4) Finish H1 on hicard before
 concluding anything about `top_k`. Hypotheses updated in
 `research/HYPOTHESES.md`.
+
+---
+
+## 2026-09-20 07:29 UTC — H1 confirmed on hicard: HF's default `top_k=50` measurably degrades a 300-level categorical column
+
+Code/data: `research/results/m1h/` at commit `b33e8de` (harness as of M1 plus
+the >255-level HGB fix). Seeds 0,1,2; hicard is the synthetic table (4,000
+rows, Zipf-distributed 300-level `city`, `income` driven by city, `segment`
+derived from income) built because no bundled dataset has a column wide enough
+for `top_k=50` to bite.
+
+**Question:** Does the default `top_k=50` truncation degrade columns with >50
+admissible tokens (H1, deferred from the M1 entry)?
+
+**What was done:** The M1 arms rerun on hicard (jobs had failed in M1 in my
+metric code and were rerun as `m1h`): `base` under 5 sampling variants and
+`qenc` under 2, 3 seeds, all scored on one trained model per seed.
+
+**Result:** `top_k=0` vs the default, paired by seed (mean of 3 seeds; +- is the
+SD across seeds, n=3):
+- Categorical fidelity `tvd_mean` 0.1416 -> 0.1042 (-0.037 +-0.008), better in
+  all 3 seeds (0.158->0.120, 0.126->0.081, 0.141->0.112).
+- `assoc_diff` 0.0415 -> 0.0166 (-0.025 +-0.004); `marg_mean` 0.1147 -> 0.0937;
+  discriminator AUC 0.651 -> 0.597 (real-vs-real 0.503).
+- Privacy unchanged: `frac_suspicious` 0.0633 -> 0.0621 (-0.001 +-0.018),
+  `exact_dup` 0. TSTR is uninformative here (0.9996 in every arm: `segment` is a
+  deterministic function of `income`).
+- Within `top_k=0`, temperature 1 is best on `tvd_mean` (0.104) vs T=0.9 (0.132),
+  T=1.1 (0.119), `top_p=0.95` (0.108). So the M1 hint that T=1.1 helps is NOT
+  corroborated on categorical fidelity (T=1.1 is 0.015 worse than T=1 here;
+  its lower `frac_suspicious`, 0.047 vs 0.062, has SD ~0.02).
+- `qenc` on hicard: no distinguishable gain (`tvd_mean` -0.006 +-0.026), and
+  `frac_suspicious` again in the worse direction (+0.020 +-0.013).
+- Not measured: per-column numbers for `city` (which cities appear, how many
+  distinct levels) -- the synthetic tables were not saved, so the mechanism
+  (tail levels cut and renormalised) is inferred from the design, not
+  observed directly.
+
+**Implication:** The default `top_k=50` silently degrades high-cardinality
+categorical columns; it is invisible on low-cardinality data (M1: no
+detectable effect either way). Recommend the sampler pass `top_k=0` unless the
+caller sets one. That is a behaviour change to a default, so it is proposed
+here, not yet made. Caveats: one synthetic dataset, 3 seeds; the size of the
+effect on real high-cardinality data is unmeasured.
+
+---
+
+## 2026-09-20 07:29 UTC — H8 OOV handling: deterministic UNK + input-side UNK dropout beats random substitution on 5/5 seeds; unconditional-quality cost check still running
+
+Code: library change `b8597a8` (`oov_strategy`, `unk_dropout`, collator) on
+`exp/oov-unk-dropout`, merged with the fast-decoding branch (`f864173`);
+raw results `research/results/oov/` at commit `f90b338` on that branch.
+Single-process experiment script `research/oov_bench.py`.
+
+**Question:** When a `seed_input` carries a category value never seen in
+training, which handling of that value behaves best: the current random
+substitution, deterministic [UNK], or [UNK] made meaningful by training with
+input-side [UNK] dropout? (Owner delegated the OOV decision to exploration on
+2026-09-20; nothing has been merged into `feat/support-seed-input`.)
+
+**What was done:** adult5k, column `occupation` (moved to first position so a
+v1 seed can be a prefix). Per seed, one level with 3-10% frequency is held OUT
+of the training data entirely, so it is truly OOV (seeds 0,2,3 drew
+Transport-moving, seed 1 Machine-op-inspct, seed 4 Tech-support -- only three
+distinct levels, not five). Trained with dropout in {0, 0.03, 0.10}; each model
+seeded with {occupation: <held-out level>} under both policies (`random` =
+current, `unk`) by toggling `oov_strategy` at encoding time, 6 x 300 rows per
+arm. Measured: mean per-column KS/TVD of the OTHER columns against (a) the
+true conditional (the held-out rows, 174-279 of them) and (b) the training
+marginal; references: an unconditional sample (= "ignore the seed") and, as a
+control, conditioning on known levels. Seed 2 failed once on a CUDA
+out-of-memory error (shared GPU) and was rerun; its failed file is kept under
+`failed_oom/`.
+
+**Result (mean over 5 seeds; lower is closer):**
+
+| arm | distance to marginal | distance to true conditional |
+|---|---|---|
+| `random`, no dropout (current) | 0.119 (range 0.067-0.168) | 0.172 |
+| `unk`, no dropout (UNK untrained) | 0.075 | 0.137 |
+| `unk` + 3% dropout | 0.047 | 0.134 |
+| `unk` + 10% dropout | 0.041 | 0.124 |
+| ignore the seed (unconditional sample) | 0.039 | 0.129 |
+
+- `random` is *worse than ignoring the seed* on the true conditional in 5 of 5
+  seeds (0.172 vs 0.129), and its distance from the marginal swings with which
+  arbitrary level it happens to pick (0.067 to 0.168).
+- `unk` + dropout is closer than `random` to both references in 5 of 5 seeds
+  (3%: -0.072 / -0.038 on average; 10%: -0.078 / -0.048). It lands at the
+  unconditional floor (0.041-0.047 vs 0.039): an unknown value behaves like
+  "no information". At 10% it is better than ignoring the seed on the true
+  conditional in 4 of 5 seeds, but the mean gain (0.124 vs 0.129) is small; I do
+  not claim that.
+- Plain `unk` without dropout helps on average but is erratic (seed 3: 0.098
+  from the marginal, worse than seeds with dropout).
+- Conditioning on KNOWN levels still helps by the same amount in every arm
+  (0.080-0.084), so dropout did not visibly weaken real conditioning.
+
+**Implication:** Random substitution should not stay the default: it silently
+gives worse-than-no-conditioning output. The fix that works is deterministic
+[UNK] plus input dropout at training time; [UNK] alone is not enough.
+Recommendation: `oov_strategy="unk"` with `unk_dropout` of about 0.03-0.10 as
+the default. Not yet known: (1) whether dropout costs ordinary (unseeded)
+generation quality -- running now as matrix `oovcost` (b0 vs 3% vs 10%, 4
+datasets x 3 seeds); (2) behaviour on numeric OOV values, on other datasets,
+and on v2/any-order (the collator is v1 only); (3) only three distinct held-out
+levels were tested. Decision to change the default is left until (1) is in.
