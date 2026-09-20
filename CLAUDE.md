@@ -81,6 +81,21 @@ box, not wherever the interactive session is running — after a run,
 analyzable from any machine. See `cusum_validation/README.md` for the
 full design and the current state of that investigation.
 
+## `research/` benchmark harness
+
+`research/bench.py` is a multi-seed harness that scores every run on fidelity,
+downstream utility and privacy together (`research/HYPOTHESES.md` is the
+pre-registered idea/status registry; raw per-job JSON is under
+`research/results/`; `research/summarize.py` gives paired deltas with standard
+errors). Use it for any claim about quality: single-seed, quality-only
+comparisons were shown to mislead in this project. Two rules learned the hard
+way: never edit `src/` or `research/bench.py`/`configs.py` in a worktree while a
+matrix launched from it is still starting jobs (each job re-imports them), and
+when matching processes with `pkill -f`, use a pattern that cannot match your own
+shell command. Library defaults changed on 2026-09-20 (see the provenance note
+in `research/HYPOTHESES.md`) -- an old config name may not mean what its old
+results meant.
+
 ## Ultra/cloud code review on this branch
 
 `main...HEAD` is far too large for `/code-review ultra`'s size cap

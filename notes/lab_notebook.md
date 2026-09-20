@@ -779,3 +779,59 @@ confirmed on the two held-out datasets (wilt, churn2) that were kept back for
 exactly this; (3) the memorisation caution above needs a direct check beyond DCR
 (e.g. nearest-neighbour rank against held-out rows). Learning rate and
 gradient accumulation stay at their defaults on this evidence.
+
+---
+
+## 2026-09-20 18:28 UTC — Adopted on `feat/support-seed-input`: vectorised constrained decoding, `top_k=0` for tabular sampling, `oov_strategy="unk"` + `unk_dropout=0.03`, and a fix for how seeded OOV values are returned
+
+Code: merge `933e95c` (pushed), containing `b4d452d`/`bf249ff` (vectorised
+decoding + any-order test), `06f37a7` (`top_k=0`), `120e4e5` (OOV defaults +
+restore). Full suite on the merged result: 178 passed, 2 failed -- the same two
+failures that pre-date this work (`test_default_init`, `test_TabularSampler`).
+Owner approved the merge, the full test run, and the push explicitly.
+
+**Question:** What changed on the integration branch, on what evidence, and what
+does that do to the meaning of earlier results?
+
+**What was done / Result:**
+1. **Vectorised constrained decoding** (all tabular sampling, incl. any-order):
+   0.22 s vs 76.5 s for 1,024 rows in an interleaved profile on a busy box; and
+   identical results end to end (see the 15:43 UTC entry: 12 complete pipelines
+   reproduce M1's baseline to 4 decimals). Relational sampling untouched.
+2. **`TabularSampler.default_top_k = 0`** (was HF's implicit 50). Evidence:
+   hicard 3/3 seeds, categorical error 0.142 -> 0.104, no privacy change; no
+   detectable effect on the bundled low-cardinality data.
+3. **`oov_strategy="unk"` + `unk_dropout=0.03` for tabular models.** Evidence:
+   5 seeds, a held-out level; random substitution worse than ignoring the seed
+   on 5/5, `unk`+dropout closer on 5/5 and at the unconditional floor; 3%
+   dropout costs nothing detectable on unseeded generation (12 units).
+4. **A bug the experiments did not show, found while making OOV a default:**
+   with `unk`, a seeded value the model had never seen was decoded into the
+   returned table as a literal `[UNK]` (categorical) or a corrupted `'[UNK]9'`
+   string that turned a numeric column into `object`. (The old random
+   substitution returned a plausible but wrong value instead.) `TabularSampler`
+   now returns the caller's own value for those cells: per row for
+   `sample_tabular_with_seed`; for the shuffled `sample_tabular` only when the
+   caller gave one distinct value for the column, else missing. Tested for
+   categorical, same-width numeric (dtype preserved), in-vocab (unchanged) and
+   multi-row seeds; mutation-checked. Separately found and NOT fixed: a numeric
+   seed wider than the training format (e.g. 9999 for a two-digit column) raises
+   `KeyError: '0___NUMERIC___b_02'` under either strategy -- a pre-existing
+   width problem, unrelated to [UNK].
+
+**Provenance warning -- earlier numbers used different defaults.** Every M1/M2
+result above was produced with `unk_dropout=0`, `oov_strategy="random"` and HF's
+`top_k=50`. After this merge `{}` means the new defaults, so re-running an old
+config no longer reproduces its number. `research/configs.py` keeps the old
+meaning explicit: `b0` = `{unk_dropout: 0, oov_strategy: "random"}`, a `topk50`
+sampling variant, and a note on the `default` variant. `base`, `qenc`, `small`,
+`tiny`, `lr*`, `ga1` are NOT redefined -- to reproduce M1/M2 exactly, pass those
+init/sample settings explicitly. (v2 is unchanged: no [UNK] dropout there, and
+saved models keep `random` because the flag lives in the vocab.)
+
+**Implication:** Model size (M2) remains a finding, not a default: M3 is still
+running to separate size from training length and to confirm on held-out data.
+Known limits of what was adopted: OOV was tested on one column of one dataset
+with three distinct held-out levels; the [UNK]-dropout collator is v1 only; with
+`train_size < 1` eval loss is computed with dropout too (documented in the
+collator).
