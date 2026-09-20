@@ -952,3 +952,42 @@ privacy proxy is not measurably better while the fidelity cost is large. (3) M5
 held-out datasets x 3 seeds, 36 fits) is running to settle size vs selection rule.
 Not yet a recommendation; the checkpoint rule may be the cheapest large win in the
 whole program, but it rests on 6 runs from 2 datasets so far.
+
+---
+
+## 2026-09-20 21:59 UTC — c1 (fixed-epoch learning curves): EMA weights are a free gain (H16 confirmed); constraint-aware loss trains ~2x faster to the same ceiling; label smoothing minor; batch 32 = batch 8 x 4 on quality
+
+Code/data: `research/curves.py`, `research/results/c1` at `141973b`. Protocol: plain training (no stopping rule)
+to 100 epochs, checkpoint every 10, on diabetes / insurance / abalone x seeds 0-2 (9 paired units), small GPT2
+(128d/4h/3L, lr 3e-4, 5% warmup), legacy settings, no teacher forcing. Reference arm `wk`. The EMA copies are
+evaluated on the SAME trajectory as the raw weights (horizons ~1 and ~4 epochs).
+Why fixed epochs rather than the sensitivity regime: the default sensitivity path silently dropped
+`compute_loss_func` (fixed on `exp/constrained-loss`), and stopping noise would otherwise sit on every comparison.
+
+**Question:** H16 (does weight averaging improve the model at a given step?), H17 (does computing the loss under the
+per-column token mask sampling uses speed up learning?), H12 (label smoothing), H13 (does batch 32 x accum 1 match
+batch 8 x accum 4 on quality?).
+
+**Result (paired on 9 units; mean +-s.e.; wins/losses; lower better except TSTR):**
+- **H16 EMA (horizon ~1 epoch) vs raw weights, same step.** epoch 30: `marg_mean` -0.0179 +-0.0033 (8/1),
+  discriminator distance -0.0495 +-0.0080 (9/0), held-out NLL -0.160 (9/0), `assoc_diff` +0.0022 +-0.0012 (2 better/7 worse);
+  epoch 50: `marg_mean` -0.0177 +-0.0033 (9/0), NLL -0.140 (9/0); epoch 100: no difference (converged). The EMA copy reaches
+  the raw weights' FINAL marginal error at a median of epoch 30 vs 100 (in 89% of runs); best `marg_mean` along the curve
+  0.0229 vs 0.0255. `dcr_share` within +-0.008 at every epoch. Horizon ~4 epochs: same gain from epoch 30 on but much worse
+  at epoch 10 (TSTR -0.227 +-0.083, 0/9): the average lags while weights are still moving fast. Costs no extra training.
+- **H17 constraint-aware loss vs standard.** epoch 10: `assoc_diff` -0.0297 +-0.0023 (9/0), discriminator distance -0.155
+  +-0.014 (9/0), TSTR +0.145 +-0.044 (7/2), NLL -0.92 (9/0); epoch 30: discriminator distance -0.034 (9/0), `marg_mean`
+  -0.008 (6/3); epoch 50: `marg_mean` -0.013 +-0.003 (9/0) but discriminator distance +0.021 (3/6), held-out NLL +2.1 (0/9).
+  Reaches the reference's final `marg_mean` at a median of epoch 50 vs 100; best along curve 0.0240 vs 0.0255. The ceiling
+  is not raised and it overfits sooner. Adding label smoothing (0.05) to it hurts TSTR from epoch 30 (-0.065 to -0.082, 1/8): dropped.
+- **H12 HF label smoothing 0.05 alone.** small, consistent mid-curve gains (epoch 10 discriminator distance -0.034, 9/0;
+  epoch 50 `marg_mean` -0.006, 8/1; `dcr_share` +0.024 +-0.010 at epoch 50); none at epoch 100. Not a lever.
+- **H13 batch 32 x accum 1 vs batch 8 x accum 4** (same effective batch): no difference in any metric at any epoch
+  (`marg_mean` within +-0.001). The speed side needs the throughput benchmark (`research/bench_train_speed.py`), not yet run.
+
+**Implication:** Two independent, cheap ways to reach a given fidelity in fewer epochs: EMA (~3x, free) and the
+constrained loss (~2x, opt-in, needs a stopping rule because it overfits sooner); neither raises the ceiling. They are
+untested in combination and untested in the real sensitivity regime, where the checkpoint the recipe loads (see the 21:01 UTC
+correction) matters more than the training length. Next: c2 (the remaining Program-2 ideas, each arm with its EMA copy),
+and the real-regime M6 for the loss. Caveats: 3 small datasets; marginal error is the metric that moves, associations and
+TSTR mostly do not; EMA at very early epochs is harmful for long horizons.
