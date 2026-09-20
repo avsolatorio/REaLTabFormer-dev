@@ -722,6 +722,8 @@ training for every model (adds a collator), so it stays a proposal.
 
 ## 2026-09-20 15:45 UTC — M2: a much smaller model gives a large fidelity gain at flat utility and flat privacy metrics; higher learning rate is worse; grad-accum 1 gives no quality gain
 
+**Partly superseded -- see the 2026-09-20 21:01 UTC entry below: the default model's LOADED checkpoint was epoch 5-16, not its stopping epoch, so the size comparison below was against an under-trained baseline. Original content unchanged.**
+
 Code/data: `research/results/{m2a,m2b,m2c}/` at `dc326e8` (paired against M1's
 `base/default`, same 12 dataset x seed units). Provenance: the 41 `m2a` jobs
 ran on the old per-row-callback sampler; `m2b`/`m2c` (19 jobs) on the
@@ -840,6 +842,8 @@ collator).
 
 ## 2026-09-20 19:48 UTC — M3: the M2 effect is "a small model trained to convergence", not size alone; it replicates on held-out wilt/churn2; direct memorisation check (M4) now running
 
+**Partly superseded -- see the 2026-09-20 21:01 UTC entry below: the default model's LOADED checkpoint was epoch 5-16, not its stopping epoch, so the size comparison below was against an under-trained baseline. Original content unchanged.**
+
 Code/data: `research/results/m3` (48 jobs) and `m3h` (18 jobs) at `c3876f5`. Provenance:
 both ran with the OLD library settings (`unk_dropout=0`, `oov_strategy="random"`,
 HF `top_k=50`) on the vectorised decoder, i.e. comparable with M1/M2; in `m3h`
@@ -896,3 +900,55 @@ row rather than an equal-size held-out set; calibrated: a copy of the training
 rows scores 1.000, fresh real rows ~0.5); (2) 6 datasets, all small (768-10,000
 rows). If M4 is clean the natural form is an opt-in preset (`tabular_config` +
 epochs guidance), not a change to the default model.
+
+---
+
+## 2026-09-20 21:01 UTC — CORRECTION: the default recipe loads an epoch 5-16 checkpoint, far earlier than where it stops; against a fair checkpoint most of M2/M3's "small model" discriminator advantage disappears (6 runs; M5 running to settle it)
+
+Code/data: `research/loaded_epoch.py`, `research/ckpt_compare.py`,
+`research/results/loaded/` (6 fits: diabetes and insurance x seeds 0-2), pushed on
+`exp/utility-optimization`. Legacy settings (`unk_dropout=0`, `oov_strategy="random"`,
+`top_k=50`), teacher-forced target, as M1-M3.
+
+**Question:** M1-M3 recorded where training STOPPED (~epoch 30 for the default
+model). M3's interpretation was that the default model "is stopped by the
+sensitivity rule near epoch 30 while its data is still easy to tell from real
+(AUC ~0.69)". But the recommended recipe also passes
+`load_from_best_mean_sensitivity=True`, which does not load the stopping weights.
+Which checkpoint does it load, and how good is it?
+
+**What was done:** Read the critic loop: that option loads the checkpoint whose
+critic sensitivity is CLOSEST TO THE MEAN of the bootstrap null (`mean_best`), out of
+the checkpoints saved every 5 epochs. One fit leaves four checkpoints on disk; I
+loaded each into the same fitted pipeline and scored it with the bench protocol.
+
+**Result (6 runs; each row is the mean over runs; paired s.e. vs `mean_best`):**
+
+| checkpoint | mean epoch | `marg_mean` | discriminator AUC | TSTR | `dcr_share` |
+|---|---|---|---|---|---|
+| `mean_best` (what the recipe loads) | 9.5 | 0.090 | 0.691 | 0.812 | 0.517 |
+| `best_disc` (latest under threshold) | 20.8 | 0.077 | 0.579 | 0.830 | 0.543 |
+| `last_epoch` (weights at stopping) | 31.2 | 0.062 | 0.499 | 0.829 | 0.545 |
+
+- The recipe loaded epochs 5.3, 5.3, 15.8, 10.3, 10.3, 10.3 while training stopped at
+  epochs 31.6, 26.3, 31.6, 36.1, 30.9, 30.9.
+- `last_epoch` vs `mean_best`, paired: `marg_mean` -0.029 +-0.008 (5 better/1 worse),
+  discriminator distance from 0.5 -0.156 +-0.029 (6/0), TSTR +0.017 +-0.011,
+  `assoc_diff` +0.008 +-0.003 (1 better/5 worse), `dcr_share` +0.028 +-0.026 (1/5).
+- So the discriminator gap I attributed to the default model in M2/M3 (AUC ~0.69) is
+  essentially the effect of the checkpoint the recipe loads; the same trajectory at
+  its own stopping epoch is at AUC ~0.50.
+
+**Implication:** (1) M2/M3's headline "small model reaches AUC ~0.53 vs the default's
+0.69" compared a small model that trained to convergence against a default model
+handicapped by its own checkpoint rule; the size effect on the DISCRIMINATOR is
+therefore overstated, and the remaining size effect (marginals, associations) must be
+re-measured against a fair baseline. The same rule also chose the small model's
+checkpoint in M2/M3, so those arms are not clean either. (2) The recommended recipe
+(`load_from_best_mean_sensitivity=True`, per DECISION_LOG) trades a lot of fidelity
+for a lower `dcr_share` (0.517 vs 0.545, within noise at 154-268 test rows) -- the
+privacy proxy is not measurably better while the fidelity cost is large. (3) M5
+(`research/m5.py`: default vs small model x all four checkpoint rules, 4 dev + 2
+held-out datasets x 3 seeds, 36 fits) is running to settle size vs selection rule.
+Not yet a recommendation; the checkpoint rule may be the cheapest large win in the
+whole program, but it rests on 6 runs from 2 datasets so far.
