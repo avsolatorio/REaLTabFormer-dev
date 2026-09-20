@@ -202,3 +202,159 @@ the import succeeds on Python 3.9.6 and the full `test_realtabformer2.py`
 suite still passes (28/28) — no code in the file inspects annotations
 at runtime (no `get_type_hints`/`.annotation` usage), so this is a pure
 compatibility fix with no behavior change.
+
+---
+
+## 2026-09-19 — Full method-by-method diff of REaLTabFormer (v1) vs. REaLTabFormer2 (v2): what's genuinely shared vs. genuinely different vs. accidentally drifted
+
+**Question:** Before refactoring `realtabformer2.py` to reuse `realtabformer.py`'s
+code where relevant (motivated by `get_experiment_id`'s bug — see the
+2026-09-11 audit entry — being a direct consequence of duplication
+instead of reuse), what exactly differs between the two files' ~24
+parallel methods, and which differences are load-bearing vs. accidental?
+
+**What was done:** Extracted and diffed every method that exists under
+the same name in both `src/realtabformer/realtabformer.py` and
+`src/realtabformer/realtabformer2.py` (`_normalize_gpt2_state_dict`,
+`_validate_get_device`, `_build_training_args`, `__init__`,
+`_invalid_model_type`, `_init_tabular`, `_init_relational`,
+`_extract_column_info`, `_generate_vocab`, `_check_model`,
+`_split_train_eval_dataset`, `fit`, `_train_with_sensitivity`,
+`_train_with_objective`, `get_full_save_dir`, `get_experiment_id`,
+`_set_up_relational_coder_configs`, `_fit_relational`, `_fit_tabular`,
+`_build_tabular_trainer`, `sample`, `predict`, `save`,
+`load_from_dir`), line by line, via `diff` on the extracted source
+ranges — not by re-reading from memory or assuming similarity.
+
+**Result:**
+- **10 methods are byte-for-byte identical**: `_normalize_gpt2_state_dict`,
+  `_validate_get_device`, `_invalid_model_type`, `_extract_column_info`,
+  `_generate_vocab`, `_check_model`, `_split_train_eval_dataset`,
+  `get_full_save_dir`, `sample`, `predict`.
+- **Cosmetic-only differences** (zero behavior change): `_build_training_args`
+  (docstring wording only — v2's own docstring literally says "duplicated
+  here rather than imported, matching this file's existing pattern");
+  `Optional[Callable]` (v1) vs. `Callable | None` (v2) showing up in
+  several signatures (pure PEP 604 syntax choice).
+- **Legitimate, intentional differences that must be preserved**: every
+  difference in `_init_tabular`, `_init_relational`,
+  `_set_up_relational_coder_configs`, `_fit_relational`, `save`,
+  `load_from_dir` traces to v2's backbone-generality feature
+  (`GPT2Config`/`GPT2LMHeadModel` hardcoding in v1 vs. `AutoConfig`/
+  `AutoModelForCausalLM`/`CONFIG_MAPPING`-based generic reconstruction
+  in v2, plus the renamed `parent_gpt2_*` → `parent_encoder_*`
+  attributes). Every difference in `__init__`, `_fit_tabular`,
+  `_build_tabular_trainer` traces to `any_order`/`shared_numeric_vocab`,
+  confirmed v2-only (zero references to either in `realtabformer.py`
+  at all). `fit()`'s ~25-parameter gap is the entire CUSUM parameter
+  surface, absent because v2 has no CUSUM support whatsoever (no
+  `_train_with_cusum`/`_build_cusum_confirm_fn`/
+  `_build_cusum_diagnostic_fn` exist in the file) — and `_build_tabular_trainer`/
+  `_fit_tabular` in v2 have no `trainer_cls`/`add_row_idx` plumbing either,
+  so CUSUM couldn't be wired into v2 without that groundwork first.
+- **4 confirmed accidental bugs from independent reimplementation** (2
+  already known, 2 newly found by this diff pass):
+  1. `get_experiment_id` (known, 2026-09-11 audit) — v1 checks
+     `epoch is not None` first, unconditionally; v2 checks
+     `self.experiment_id is not None` first and raises if `epoch` is
+     also set. Confirmed at the source: v1's ordering is the one that
+     avoids crashing on a resumed `fit()`'s periodic checkpoint save.
+  2. `make_dataset`/`make_dataset_with_column_types` missing
+     `seed=self.random_state` (known, 2026-09-11 audit) — confirmed
+     directly in `_fit_tabular`'s diff: v1's single `make_dataset(...)`
+     call has `seed=self.random_state`; neither of v2's two calls do.
+  3. **New**: `_train_with_objective` wipes existing checkpoints
+     *unconditionally* in v2. v1 has `if not resume_from_checkpoint:`
+     guarding the wipe, with a comment explaining exactly why
+     ("deleting them first would make `resume_from_checkpoint` always
+     find nothing and silently restart from epoch 0"). v2 lost the
+     guard entirely — `REaLTabFormer2().fit(resume_from_checkpoint=True,
+     ...)` on the objective-callback path deletes the very checkpoint
+     it's about to resume from, then silently restarts from epoch 0.
+  4. **New**: v2's `_train_with_sensitivity` is missing the
+     `shared_preprocessor` optimization (fit once, reuse across every
+     periodic check instead of refitting each time — a benchmarked
+     ~2.2x speedup on the preprocessing step at Adult-like scale) and
+     the `sensitivity_cache_dir`/`sensitivity_bootstrap_n_jobs` params
+     (disk caching + configurable bootstrap parallelism). Not a
+     correctness bug — a silent performance/capability regression for
+     anyone using v2's sensitivity-training path.
+
+**Implication:** the case for refactoring is now empirically grounded,
+not just architectural intuition — 10 methods can be unified with zero
+risk today, `_build_training_args` and the `Callable | None` syntax
+choice with near-zero risk, and unifying `get_experiment_id` around
+v1's (correct) logic fixes a real bug as a side effect rather than
+requiring a separate patch. The backbone-generality and `any_order`/
+`shared_numeric_vocab` differences must NOT be merged away — they're
+the actual reason v2 exists. Bugs #3 and #4 are real but sit inside
+methods that are NOT safe to unify wholesale (both have substantial
+legitimate v1/v2-specific logic alongside the drifted piece) — they
+need targeted, standalone fixes rather than being resolved by the
+duplication-removal refactor itself.
+
+---
+
+## 2026-09-19 — Executed the safe first slice of the refactor: extracted 10 identical methods into a shared mixin, fixing `get_experiment_id` as a consequence
+
+**Question:** Having mapped exactly which methods are safe to share
+(the entry above), does actually extracting them work cleanly, and
+does it fix `get_experiment_id` as a side effect rather than requiring
+a separate patch?
+
+**What was done:** Created `src/realtabformer/rtf_shared.py` containing
+the 3 identical module-level functions (`_normalize_gpt2_state_dict`,
+`_validate_get_device`, `_build_training_args`) and a new
+`SharedModelMixin` class with the 8 identical instance methods
+(`_invalid_model_type`, `_extract_column_info`, `_generate_vocab`,
+`_check_model`, `_split_train_eval_dataset`, `get_full_save_dir`,
+`sample`, `predict`) plus `get_experiment_id` — using v1's version
+specifically, since v2's independently-reimplemented copy was the
+confirmed bug. Made both `REaLTabFormer` and `REaLTabFormer2` inherit
+from `SharedModelMixin`, removed the now-duplicate method bodies from
+both files (replaced with a one-line comment noting the inheritance),
+removed the resulting unused imports (verified via `pyflakes`, zero
+warnings across all three files afterward), and verified backbone
+generality / `any_order` / `shared_numeric_vocab` / CUSUM-support
+differences were untouched (they live in methods this refactor
+deliberately did not touch).
+
+**Result:** `REaLTabFormer.__mro__` and `REaLTabFormer2.__mro__` both
+confirm `SharedModelMixin` is now in the chain. Directly verified the
+bug fix: `REaLTabFormer2.get_experiment_id(epoch=5)` with
+`experiment_id` already set now returns `"full_model_epoch_005"`
+instead of raising — the epoch-branch wins first, matching v1's
+(correct) precedence, with no separate patch needed. Full test suite
+before vs. after the refactor, both runs on the same machine/Python
+3.9.6:
+- `test_realtabformer.py`: 7 passed, 1 failed both before and after
+  (`test_default_init`, asserts `epochs == 100` against the real
+  constructor default of `1000` — confirmed via `git stash` to be
+  pre-existing, unrelated to this change, not yet investigated
+  further).
+- `test_realtabformer2.py`: 28 passed both before and after.
+- Full suite (`tests/realtabformer/`): 166 passed, 2 failed both
+  before and after (`test_default_init` above, plus
+  `test_rtf_sampler.py::test_TabularSampler` — a `ValueError: Input X
+  contains NaN` inside `TruncatedSVD.fit_transform` during the
+  sensitivity-threshold bootstrap, also confirmed via `git stash` to
+  be pre-existing and unrelated).
+- `black`/`isort` on all three touched/new files: zero new
+  disagreements beyond the same pre-existing installed-tool-version
+  drift already documented elsewhere in this branch's history (verified
+  by running both checks on the pre-refactor files too).
+
+**Implication:** zero regressions, one real bug fixed as a structural
+consequence of removing its root cause rather than patched in place.
+Surfaced two previously-undocumented-in-this-thread pre-existing test
+failures (`test_default_init`'s stale `epochs` expectation,
+`test_TabularSampler`'s NaN-in-bootstrap) — real, but out of scope for
+this refactor; worth a look later. Remaining candidates for a *second*
+slice, not done here: `_build_training_args`'s docstring-only diff and
+the `Optional[Callable]`/`Callable | None` syntax choice (both
+near-zero risk); the two newly-found bugs from the 2026-09-19 diff
+entry (`_train_with_objective`'s unconditional checkpoint wipe,
+`_train_with_sensitivity`'s missing `shared_preprocessor`/caching
+optimization) need standalone fixes, not extraction, since they sit
+inside methods with substantial legitimate v1/v2 differences alongside
+the drift.
