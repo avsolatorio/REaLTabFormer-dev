@@ -230,6 +230,29 @@ def _row_keys(df: pd.DataFrame) -> pd.Series:
     return pd.concat(parts, axis=1).agg("|".join, axis=1)
 
 
+def dcr_share(bench, synth_all, seed) -> float:
+    """Direct memorisation check: of `n_test` synthetic rows, the share whose
+    nearest real neighbour is in the TRAINING set rather than in the held-out
+    set, using equally sized reference sets (a random train subsample the size
+    of the test set) so 0.5 is the no-memorisation value -- synthetic data no
+    closer to what the model saw than to real data it never saw. Values well
+    above 0.5 mean the generator sits closer to its training rows than
+    unseen real rows do. (Ties count 0.5; features are standardised numerics +
+    one-hot categoricals, as in `SyntheticDataBench.preprocess_data`.)"""
+    from sklearn.neighbors import NearestNeighbors
+
+    cols = list(bench.train_df.columns)
+    n = len(bench.test_df)
+    tr = bench.train_df.sample(n=n, random_state=seed)
+    sy = synth_all[cols].sample(n=n, random_state=seed)
+    te = bench.test_df[cols]
+    proc = bench.preprocess_data(data=tr, other=[sy, te])
+    sy_p, te_p = proc["other"]
+    d_tr = NearestNeighbors(n_neighbors=1, metric="manhattan").fit(proc["data"]).kneighbors(sy_p)[0].ravel()
+    d_te = NearestNeighbors(n_neighbors=1, metric="manhattan").fit(te_p).kneighbors(sy_p)[0].ravel()
+    return float(np.mean((d_tr < d_te) + 0.5 * (d_tr == d_te)))
+
+
 def privacy_metrics(bench, synth_all, dcr_test) -> dict:
     bench.register_synthetic_data(synth_all)
     dcr_synth = bench.get_dcr(is_test=False)
@@ -241,6 +264,7 @@ def privacy_metrics(bench, synth_all, dcr_test) -> dict:
         dcr_ratio=float(dcr_synth.mean() / max(dcr_test.mean(), 1e-9)),
         frac_suspicious=float((dcr_synth < thr).mean()),
         exact_dup=float(dup.mean()),
+        dcr_share=dcr_share(bench, synth_all, bench.random_state),
     )
 
 
