@@ -27,9 +27,10 @@ METRICS = [  # (column, higher_is_better)
 ]
 
 
-def load(d: Path) -> pd.DataFrame:
+def load(dirs) -> pd.DataFrame:
     rows, failed = [], []
-    for f in sorted(d.glob("*.json")):
+    files = [f for d in dirs for f in sorted(Path(d).glob("*.json")) if not f.name.startswith(".")]
+    for f in files:
         r = json.loads(f.read_text())
         if "error" in r:
             failed.append(f.stem)
@@ -38,7 +39,9 @@ def load(d: Path) -> pd.DataFrame:
             if "error" in m:
                 failed.append(f"{f.stem}/{v}")
                 continue
+            orc = r.get("oracle", {})
             rows.append(dict(
+                orc_marg=orc.get("marg_mean"), orc_assoc=orc.get("assoc_diff"), orc_disc=orc.get("disc_auc"),
                 dataset=r["job"]["dataset"], config=r["job"]["config"], seed=r["job"]["seed"],
                 variant=v, arm=f"{r['job']['config']}/{v}",
                 stopped_epoch=r["stopped_epoch"], fit_s=r["fit_s"], **m))
@@ -53,11 +56,11 @@ def load(d: Path) -> pd.DataFrame:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("dir")
+    ap.add_argument("dir", nargs="+")
     ap.add_argument("--ref", default=None)
     ap.add_argument("--by-dataset", action="store_true")
     a = ap.parse_args()
-    df = load(Path(a.dir))
+    df = load(a.dir)
     if df.empty:
         print("no results")
         return
@@ -67,8 +70,18 @@ def main() -> None:
     pd.set_option("display.width", 250, "display.max_columns", 30)
 
     print(f"\n{df.groupby('arm').size().rename('n_units').to_string()}\n")
-    print("== arm means (over all dataset x seed units) ==")
-    print(df.groupby("arm")[cols].mean().reindex(arms).round(4).to_string())
+    units = df.groupby("arm").apply(lambda g: set(zip(g["dataset"], g["seed"])))
+    common = set.intersection(*units.tolist())
+    dropped = len(set.union(*units.tolist())) - len(common)
+    if dropped:
+        print(f"(means restricted to the {len(common)} dataset x seed units every arm has; {dropped} others excluded)\n")
+    dfc = df[[u in common for u in zip(df["dataset"], df["seed"])]]
+    print("== arm means (over units common to all arms) ==")
+    print(dfc.groupby("arm")[cols].mean().reindex(arms).round(4).to_string())
+
+    orc = df.drop_duplicates(["dataset", "seed"])[["dataset", "orc_marg", "orc_assoc", "orc_disc"]]
+    print("\n== noise floor: real held-out data vs train, same metrics (best any generator could do) ==")
+    print(orc.groupby("dataset").mean().round(4).to_string())
 
     key = ["dataset", "seed"]
     r = df[df["arm"] == ref].set_index(key)
