@@ -34,4 +34,10 @@ CONFIGS = {
     "lr3e4": {"train_args": {"learning_rate": 3e-4, "warmup_steps": 0.05}},
     "lr1e4": {"train_args": {"learning_rate": 1e-4, "warmup_steps": 0.05}},
     "ga1": {"train_args": {"gradient_accumulation_steps": 1}},
+
+    # ---- OOV cost check (H8): does input-side UNK dropout hurt ordinary
+    # generation? b0 is the reference trained in this same worktree.
+    "b0": {},
+    "unkd03": {"init": {"unk_dropout": 0.03, "oov_strategy": "unk"}},
+    "unkd10": {"init": {"unk_dropout": 0.10, "oov_strategy": "unk"}},
 }
