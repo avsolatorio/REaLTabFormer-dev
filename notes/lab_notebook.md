@@ -358,3 +358,55 @@ entry (`_train_with_objective`'s unconditional checkpoint wipe,
 optimization) need standalone fixes, not extraction, since they sit
 inside methods with substantial legitimate v1/v2 differences alongside
 the drift.
+
+---
+
+## 2026-09-19 — Fixed the two remaining bugs from the diff pass as standalone patches
+
+**Question:** Do the two remaining bugs found in the earlier diff pass
+(`_train_with_objective`'s unconditional checkpoint wipe,
+`_train_with_sensitivity`'s missing `shared_preprocessor`/caching
+optimization) actually hold up as real fixes to apply, given they sit
+inside methods with substantial legitimate v1/v2 differences alongside
+the drift (so they needed standalone patches, not extraction into the
+shared mixin)?
+
+**What was done:** For `_train_with_objective`: added back v1's
+`if not resume_from_checkpoint:` guard (with the same explanatory
+comment) around v2's checkpoint-wipe loop — `resume_from_checkpoint`
+was already a parameter, just not used for this. For
+`_train_with_sensitivity`: added `sensitivity_cache_dir`/
+`sensitivity_bootstrap_n_jobs` params to both `fit()` and
+`_train_with_sensitivity` itself (v2's `fit()` didn't even accept
+them before — the params existing only on `_train_with_sensitivity`
+wouldn't have been reachable), threaded them into the
+`compute_sensitivity_threshold` call as `cache_dir=`/`n_jobs=`, and
+added the `shared_preprocessor = SyntheticDataBench.
+_maybe_fit_shared_preprocessor(...)` call plus `preprocessor=
+shared_preprocessor` in both `compute_sensitivity_metric` call sites,
+matching v1 exactly.
+
+**Result:** Direct `diff` of both methods against v1's current versions
+afterward: `_train_with_sensitivity` differs by exactly one harmless
+comment-wording line ("cusum path" vs. "v1 sensitivity/cusum paths");
+`_train_with_objective` differs only by the already-known
+`Optional[Callable]`/`Callable | None` cosmetic choice and an extra
+explanatory comment left over from the earlier `get_experiment_id`
+removal. Verified the new params are actually reachable end to end
+(`inspect.signature(REaLTabFormer2.fit)` includes
+`sensitivity_cache_dir`, not just the internal method). `black`/`isort`
+diff line counts identical before and after (31/46 lines respectively,
+both pre-existing installed-tool-version drift, confirmed via direct
+comparison against the pre-fix file) — no new formatting issues.
+Full test suite: 166 passed, same 2 pre-existing failures as every
+other check this session, both times — zero regressions.
+
+**Implication:** both fixes verified correct and safe, not just
+"probably fine." All 4 bugs found in the 2026-09-19 diff-and-refactor
+work (this entry, the mixin-extraction entry, and the original diff
+entry) are now resolved. Remaining open items are the ones from the
+2026-09-11 audit not touched by this thread: the CUSUM row-index bug,
+the OOV substitution question (needs a decision), `fit()`'s own
+`experiment_id`-reuse design question, `save_full_every_epoch`'s
+default, `cusum`'s missed field_weights/digit_entropy forwarding, and
+`_fit_relational`/`grokfast_args`'s relational-mode gaps.
