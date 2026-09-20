@@ -214,6 +214,7 @@ def run_one(job):
     rtf.target_col = None
     rtf.trainer_kwargs = {}  # normally set by fit(), which this protocol bypasses on purpose
     loss_fn = make_loss(rtf, arm["eps"]) if arm["loss"] == "constrained" else None
+    ema_horizons = tuple(job.get("ema") or arm["ema"])  # --ema overrides the arm default
 
     t0 = time.time()
     trainer = rtf._fit_tabular(train_fit, device=device, compute_loss_func=loss_fn)
@@ -258,7 +259,7 @@ def run_one(job):
     class CB(TrainerCallback):
         def on_train_begin(self, args, state, control, model=None, **kw):
             spe = max(1, state.max_steps // max(1, int(state.num_train_epochs)))
-            self.emas = {h: EMAWeights(model, float(np.exp(-1.0 / (h * spe)))) for h in arm["ema"]}
+            self.emas = {h: EMAWeights(model, float(np.exp(-1.0 / (h * spe)))) for h in ema_horizons}
 
         def on_step_end(self, args, state, control, model=None, **kw):
             for e in self.emas.values():
@@ -306,7 +307,7 @@ def run_matrix(a):
                 oj = out / f"{d}__{arm}__s{s}.json"
                 if oj.exists() and "error" not in json.loads(oj.read_text()):
                     continue
-                jobs.append(dict(dataset=d, arm=arm, seed=s, epochs=a.epochs, every=a.every, out_json=str(oj),
+                jobs.append(dict(dataset=d, arm=arm, seed=s, epochs=a.epochs, every=a.every, ema=list(a.ema), out_json=str(oj),
                                  tmp=str(EXP / "tmp" / f"{a.name}_{d}_{arm}_{s}")))
     print(f"{len(jobs)} jobs, {a.workers} workers", flush=True)
     slots: "queue.Queue[int]" = queue.Queue()
@@ -346,6 +347,7 @@ if __name__ == "__main__":
     r.add_argument("--gpus", nargs="+", type=int, default=[0, 1])
     r.add_argument("--epochs", type=int, default=100)
     r.add_argument("--every", type=int, default=10)
+    r.add_argument("--ema", nargs="*", type=int, default=[], help="EMA horizons (epochs) to record for EVERY arm")
     c = sub.add_parser("child")
     c.add_argument("job")
     a = ap.parse_args()
