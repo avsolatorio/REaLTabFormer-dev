@@ -440,3 +440,130 @@ def test_sensitivity_training_saves_reloadable_checkpoint(tmp_path):
 
     samples = reloaded.sample(10, device="cpu")
     assert len(samples) == 10
+
+
+# --- ema_horizon: weight averaging ----------------------------------------
+
+
+def test_WeightEMA_math_swap_and_restore():
+    from realtabformer.rtf_ema import WeightEMA
+
+    torch.manual_seed(0)
+    model = torch.nn.Linear(3, 2)
+    ema = WeightEMA(model, decay=0.9)
+    raw0 = [p.detach().clone() for p in model.parameters()]
+    assert all(torch.equal(a, b) for a, b in zip(ema.shadow, raw0))
+
+    # One update against a hand-computed value.
+    with torch.no_grad():
+        for p in model.parameters():
+            p.add_(1.0)
+    ema.update(model)
+    for s, r0 in zip(ema.shadow, raw0):
+        assert torch.allclose(s, 0.9 * r0 + 0.1 * (r0 + 1.0), atol=1e-6)
+
+    raw1 = [p.detach().clone() for p in model.parameters()]
+    with ema.averaged(model):
+        assert all(torch.equal(p.data, s) for p, s in zip(model.parameters(), ema.shadow))
+        ema.swap_in(model)  # re-entering must not overwrite the saved raw weights
+    assert all(torch.equal(p.data, r) for p, r in zip(model.parameters(), raw1))
+    ema.swap_out(model)  # exiting when not entered is a no-op
+    assert all(torch.equal(p.data, r) for p, r in zip(model.parameters(), raw1))
+
+    ema.copy_to(model)
+    assert all(torch.equal(p.data, s) for p, s in zip(model.parameters(), ema.shadow))
+
+
+def test_WeightEMA_decay_for_horizon():
+    import math
+
+    from realtabformer.rtf_ema import WeightEMA
+
+    assert WeightEMA.decay_for_horizon(1.0, 10) == pytest.approx(math.exp(-0.1))
+    assert WeightEMA.decay_for_horizon(4.0, 25) == pytest.approx(math.exp(-0.01))
+    assert 0.0 < WeightEMA.decay_for_horizon(0.001, 1) < 1.0
+    with pytest.raises(ValueError):
+        WeightEMA(torch.nn.Linear(1, 1), decay=1.0)
+
+
+def _ema_df():
+    rng = np.random.default_rng(0)
+    return pd.DataFrame({"a": rng.choice(list("xyz"), 64), "b": rng.integers(0, 40, 64)})
+
+
+def test_ema_horizon_final_model_is_the_average_on_the_plain_path(tmp_path):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def fit(**kw):
+        torch.manual_seed(3)
+        m = REaLTabFormer(
+            model_type="tabular", epochs=3, batch_size=8, random_state=3,
+            checkpoints_dir=str(tmp_path / f"c{len(kw)}"),
+            tabular_config=GPT2Config(n_layer=1, n_embd=32, n_head=2), **kw,
+        )
+        m.fit(_ema_df(), device=device, n_critic=0)
+        return m
+
+    plain, avg = fit(), fit(ema_horizon=1.0)
+    shadow = avg._ema_state["ema"].shadow
+    assert all(torch.allclose(p.detach().cpu(), s.cpu()) for p, s in zip(avg.model.parameters(), shadow))
+    assert not all(
+        torch.allclose(a.detach().cpu(), b.detach().cpu(), atol=1e-6)
+        for a, b in zip(avg.model.parameters(), plain.model.parameters())
+    )  # and it is not just the raw weights
+    assert plain._ema_state == {}  # off by default: no state at all
+
+
+def test_ema_horizon_rejected_where_unsupported(tmp_path):
+    m = REaLTabFormer(model_type="tabular", epochs=1, ema_horizon=1.0, checkpoints_dir=str(tmp_path / "c"))
+    with pytest.raises(NotImplementedError):
+        m.fit(_ema_df(), device="cpu", overfitting_detection_method="cusum")
+    with pytest.raises(NotImplementedError):
+        m.fit(_ema_df(), device="cpu", objective_callback=lambda *a, **k: (0.0, True))
+
+
+def test_ema_weights_are_used_by_the_critic_and_restored_for_training(tmp_path, monkeypatch):
+    from realtabformer.rtf_analyze import SyntheticDataBench
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    monkeypatch.setattr(
+        SyntheticDataBench, "compute_sensitivity_threshold",
+        staticmethod(lambda *a, **k: np.array([0.1, 0.2, 0.3])),
+    )
+    monkeypatch.setattr(
+        SyntheticDataBench, "compute_sensitivity_metric", staticmethod(lambda *a, **k: 0.05)
+    )
+    df = _ema_df()
+    m = REaLTabFormer(
+        model_type="tabular", epochs=3, batch_size=8, random_state=1,
+        checkpoints_dir=str(tmp_path / "c"),
+        tabular_config=GPT2Config(n_layer=1, n_embd=32, n_head=2), ema_horizon=1.0,
+    )
+    seen = {"sample_is_avg": [], "build_is_raw": [], "avg_snapshots": []}
+
+    def fake_sample(self, n_samples=None, **kw):
+        ema = self._ema_state["ema"]
+        p0 = next(self.model.parameters())
+        seen["sample_is_avg"].append(bool(torch.equal(p0.data, ema.shadow[0])))
+        seen["avg_snapshots"].append(p0.detach().cpu().clone())
+        return df.sample(n=n_samples, replace=True, random_state=0)
+
+    real_build = REaLTabFormer._build_tabular_trainer
+
+    def spy_build(self, *a, **k):
+        t = real_build(self, *a, **k)
+        ema = self._ema_state.get("ema")
+        if ema is not None:  # from the second round on
+            p0 = next(self.model.parameters())
+            seen["build_is_raw"].append(not torch.equal(p0.data, ema.shadow[0]))
+        return t
+
+    monkeypatch.setattr(REaLTabFormer, "sample", fake_sample)
+    monkeypatch.setattr(REaLTabFormer, "_build_tabular_trainer", spy_build)
+    m.fit(df, device=device, n_critic=1, n_critic_stop=5, num_bootstrap=3)
+
+    assert seen["sample_is_avg"] and all(seen["sample_is_avg"])  # critic saw the average
+    assert seen["build_is_raw"] and all(seen["build_is_raw"])  # raw weights restored to train
+    # The model that fit() loaded back is one of the saved averaged snapshots.
+    final = next(m.model.parameters()).detach().cpu()
+    assert any(torch.equal(final, s) for s in seen["avg_snapshots"])
