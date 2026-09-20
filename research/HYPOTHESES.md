@@ -159,6 +159,74 @@ Results before that date were produced with `unk_dropout=0`,
 sampling default; other named configs are not redefined -- pass the old
 settings explicitly to reproduce an earlier matrix.
 
+## Program 2 (from 2026-09-20 19:58 UTC): representation, training efficiency, label-free overfitting detection
+
+Pre-registered before any of these were run. Workhorse for cheap matrices:
+`wk` = 128d/4h/3L GPT2, lr 3e-4 + 5% warmup, 300-epoch ceiling (M3's `tiny_lr3e4`;
+near-`tiny` quality at ~1/3 of the epochs). Every matrix carries its own reference
+arm, run under the same library version, so the changed library defaults
+(2026-09-20) cannot confound a comparison. Dev datasets: diabetes, insurance,
+abalone, adult5k; winners are confirmed on held-out wilt/churn2.
+
+### H11 -- Column order changes the autoregressive factorisation (data processing)
+- **Why:** the model factorises p(x1) p(x2|x1) ...; the order is the file's column
+  order and is otherwise arbitrary. A dependency-aware order should make the
+  conditionals easier to learn; the target is already teacher-forced first.
+- **Prediction:** small effects (|delta marg_mean| < 0.01); `hub_first` (columns
+  with the largest total mutual information first) and `entropy_asc` improve
+  `assoc_diff`; `random` is no better than `orig`; no privacy change.
+- **Test:** `wk` with column order in {orig, reverse, entropy_asc, entropy_desc,
+  hub_first, random}, dev x 3 seeds.
+
+### H12 -- Overconfidence: label smoothing / dropout / weight decay (regularisation)
+- **Why:** M1 hinted T=1.1 helps (over-confident model); label smoothing directly
+  flattens the training target. Default GPT2 dropout is 0.1; no weight decay.
+- **Prediction:** label smoothing 0.05 improves `marg_mean`/discriminator distance
+  by a small amount and lowers `frac_suspicious`; dropout 0 is worse, 0.2 neutral;
+  weight decay 0.01 neutral.
+- **Test:** `wk` + {ls0.05, ls0.10, drop0, drop0.2, wd0.01}.
+
+### H13 -- Efficiency: batch 32 x accum 1 equals batch 8 x accum 4, faster
+- **Why:** identical effective batch and update count, 4x fewer kernel launches on
+  a GPU these models under-fill; also bf16 / fused AdamW / torch.compile.
+- **Prediction:** same quality within noise; >=1.5x steps/s. Measured in an
+  interleaved micro-benchmark (matrix wall-clock is load-confounded on this box).
+
+### H14 -- Numeric representation with the new `top_k=0` default
+- **Why:** each quantile-encoded numeric column costs 4 tokens (precision 4,
+  nparts 1); fewer/wider tokens mean fewer compounding autoregressive steps. The
+  `numeric_nparts>=2` case was untestable before `top_k=0` (100-way chunks were
+  truncated to 50).
+- **Prediction:** qenc precision 3 or nparts 2 is neutral-to-better on fidelity and
+  clearly faster per row; `numeric_categorical_threshold=20` helps low-cardinality
+  numeric columns and is neutral elsewhere.
+
+### H15 -- A label-free overfitting signal: the self-referential likelihood gap (SRLG)
+- **Idea:** for the trained model q, compare the per-row negative log-likelihood of
+  (a) the training rows and (b) the model's OWN samples, both under q (constrained
+  to valid column tokens). If q generalises, the two NLL distributions agree; if q
+  memorises, training rows become more likely than typical samples. Needs no
+  held-out data and no bootstrap: one forward pass over the training rows plus one
+  generation (cheap since the vectorised decoder).
+- **Signals:** `srlg_mean` = mean NLL(samples) - mean NLL(train); `srlg_ks` = KS
+  distance between the two NLL distributions; `srlg_tail` = 5th-percentile
+  difference (memorised rows have very low NLL).
+- **Ground truth (only for evaluating the signal, never used by it):** true gap =
+  mean NLL(held-out test) - mean NLL(train); epoch of minimum held-out NLL;
+  `dcr_share` (memorisation onset); fidelity/discriminator optimum.
+- **Prediction:** SRLG rises with the true gap after the held-out NLL minimum
+  (within-run Spearman > 0.6 on most runs); `srlg_tail` and `srlg_ks` are more
+  sensitive than `srlg_mean`; the sign/level of `srlg_mean` at fixed epoch differs
+  between datasets, so a usable rule has to use the *change* from its own early
+  baseline, not a fixed threshold.
+- **Falsified if:** within-run correlation with the true gap is weak or the sign is
+  inconsistent across datasets even after baselining.
+
+### H16 -- Weight averaging (EMA) improves the stopped model
+- **Prediction:** an EMA of the weights (decay ~0.999) sampled at the stopping point
+  gives lower `marg_mean` and discriminator distance than the raw weights at the
+  same step, with no privacy change. (Cheap, standard for generative models.)
+
 ## Ideas parked (not yet hypotheses)
 - Numeric OOV: snap to the nearest in-vocab digit token rather than a random one.
 - Row-level augmentation via column-order permutation on v1 (any_order is v2-only).
