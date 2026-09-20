@@ -410,3 +410,59 @@ the OOV substitution question (needs a decision), `fit()`'s own
 `experiment_id`-reuse design question, `save_full_every_epoch`'s
 default, `cusum`'s missed field_weights/digit_entropy forwarding, and
 `_fit_relational`/`grokfast_args`'s relational-mode gaps.
+
+---
+
+## 2026-09-20 — Utility-optimization program started: harness built, plus four findings from reading/probing the code (no experiment results yet)
+
+**Question:** Where can the data-processing, generation and model-design
+choices be improved to raise synthetic-data utility without raising
+copying? First step: what evidence standard can the existing tooling
+support, and what does the code actually do at generation time?
+
+**What was done:** Read `data_utils/{process,transform,dataset,vocab}.py`,
+the model/trainer construction in `realtabformer.py`, and the generation
+and decode path in `rtf_sampler.py`. Built `research/bench.py` (multi-seed;
+scores fidelity, gradient-boosting TSTR utility, discriminator AUC and
+privacy together; scores several sampling variants on one trained model;
+includes a real-vs-real "oracle" noise floor), `research/summarize.py`
+(paired deltas on dataset x seed with standard errors) and
+`research/HYPOTHESES.md` (predictions pre-registered before running).
+Verified the four items below directly.
+
+**Result:**
+1. **HF's default `top_k=50` is applied to REaLTabFormer sampling.**
+   Probed with a 200-token toy model, 5,000 first-token draws: 50 distinct
+   tokens with default kwargs, 200 with `top_k=0`. The token-constraint mask
+   (`prefix_allowed_tokens_fn`) runs first, so any column with >50
+   admissible tokens has its tail cut and renormalised: categorical columns
+   with >50 levels, and numeric chunks when `numeric_nparts>=2` (100-way
+   chunks). None of the six bundled datasets has such a column (widest:
+   41 levels), so this bug is invisible on them; a synthetic 300-level Zipf
+   dataset (`hicard`) was added to test it. Not yet measured.
+2. **The default model is large for these tables.** `GPT2Config(n_layer=6)`
+   inherits GPT-2's 768-wide, 12-head shape: 43.5M parameters, fit for a
+   614-row training set (measured in the harness smoke run, diabetes).
+3. **`mask_rate` is static.** The training set is built once with
+   `Dataset.map`, so the [RMASK] positions are drawn once and are identical
+   in every epoch; labels are also built from the already-masked ids, so
+   the model is trained to predict [RMASK], which generation then suppresses.
+   Not the regularisation its docstring implies. Not yet measured.
+4. **Correction to the 2026-09-11/12 OOV entry.** That entry argued random
+   OOV substitution is non-deterministic because it draws from Python's
+   global `random`. That holds for the scalar `get_token_id` path only.
+   Seed inputs go through `make_dataset`, which uses the vectorised path with
+   a fresh `np.random.default_rng(self.random_state)` on every call, so on
+   the seed path the substitution is deterministic (always the same
+   arbitrary level for a given model) -- arbitrary, not random. The other
+   arguments in that entry (it defeats seed conditioning; it draws uniformly
+   over levels, so it over-weights rare levels relative to their true
+   frequency) are unaffected. Also: both encoders share the substitution,
+   so a revert must change `get_token_id` AND `_vectorized_column_token_ids`.
+   Also found while setting up: the repo `.gitignore` already ignores
+   `experiments/`, which would have silently kept the harness out of git;
+   the harness lives in `research/` instead.
+
+**Implication:** Every comparison from here on uses >=3 seeds and reports
+privacy alongside utility. Items 1 and 3 become hypotheses H1 and (new)
+mask-rate; item 4 refines the H8 test design. See `research/HYPOTHESES.md`.
