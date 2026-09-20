@@ -85,7 +85,7 @@ def _tiny_fitted_model(tmp_path):
     return model, device
 
 
-def _generate(sampler, model, device, seed, n=64):
+def _generate(sampler, model, device, seed, n=64, **extra):
     import numpy as np
 
     from realtabformer.data_utils import SpecialTokens
@@ -105,6 +105,7 @@ def _generate(sampler, model, device, seed, n=64):
         eos_token_id=t2i[SpecialTokens.EOS],
         suppress_tokens=None,
         forced_decoder_ids=None,
+        **extra,
     )
 
 
@@ -154,3 +155,88 @@ def test_ColumnMaskLogitsProcessor_masks_disallowed_tokens():
     late = proc(torch.zeros(2, 50, dtype=torch.long), scores)
     assert torch.isfinite(late[:, 1]).all()
     assert torch.isinf(late[:, [0, 2, 3, 4, 5]]).all()
+
+
+# --- Tabular sampling no longer truncates to HF's default top_k=50 --------
+
+
+def test_tabular_sampler_passes_top_k_zero_unless_told_otherwise(tmp_path):
+    from realtabformer.data_utils import SpecialTokens
+    from realtabformer.rtf_sampler import RelationalSampler
+
+    # Scope: only the tabular sampler changes; relational keeps HF's default.
+    assert TabularSampler.default_top_k == 0
+    assert RelationalSampler.default_top_k is None
+
+    model, device = _tiny_fitted_model(tmp_path)
+    sampler = TabularSampler.sampler_from_model(model, device=device)
+    seen = {}
+    real_generate = sampler.model.generate
+
+    def spy(**kwargs):
+        seen.clear()
+        seen.update(kwargs)
+        return real_generate(**kwargs)
+
+    sampler.model.generate = spy
+
+    _generate(sampler, model, device, seed=1, n=4)
+    assert seen["top_k"] == 0  # unset by the caller -> no truncation
+
+    _generate(sampler, model, device, seed=1, n=4, top_k=25)
+    assert seen["top_k"] == 25  # an explicit value is respected
+
+    _generate(sampler, model, device, seed=1, n=4, top_k=None)
+    assert seen["top_k"] == 0  # None means "not set", not "HF default"
+
+    # Greedy decoding must not get a sampling parameter (HF would warn).
+    t2i = model.vocab["token2id"]
+    sampler._generate(
+        device=torch.device(device),
+        as_numpy=True,
+        constrain_tokens_gen=True,
+        inputs=torch.tensor([[t2i[SpecialTokens.BOS]]], device=device),
+        do_sample=False,
+        max_length=model.tabular_max_length,
+        num_return_sequences=1,
+        bos_token_id=t2i[SpecialTokens.BOS],
+        pad_token_id=t2i[SpecialTokens.PAD],
+        eos_token_id=t2i[SpecialTokens.EOS],
+        suppress_tokens=None,
+        forced_decoder_ids=None,
+    )
+    assert "top_k" not in seen
+
+
+def test_default_sampling_reaches_columns_wider_than_hf_top_k(tmp_path):
+    # A 200-level column, first in the row so its per-row distribution is
+    # the same for every row (a near-uniform 1-epoch model): under HF's
+    # default top_k=50 at most 50 distinct levels could ever appear.
+    import numpy as np
+    import pandas as pd
+    from transformers import GPT2Config
+
+    from realtabformer import REaLTabFormer
+
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame(
+        {
+            "wide": [f"lvl_{i:03d}" for i in rng.integers(0, 200, 800)],
+            "tag": rng.choice(["a", "b"], 800),
+        }
+    )
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=1,
+        batch_size=16,
+        checkpoints_dir=str(tmp_path / "ckpt"),
+        tabular_config=GPT2Config(n_layer=1, n_embd=32, n_head=2),
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.fit(df, device=device, n_critic=0)
+
+    default = model.sample(n_samples=3000, gen_batch=1000, device=device)
+    capped = model.sample(n_samples=3000, gen_batch=1000, device=device, top_k=50)
+
+    assert default["wide"].nunique() > 50
+    assert capped["wide"].nunique() <= 50  # the old default's ceiling

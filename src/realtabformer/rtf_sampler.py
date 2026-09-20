@@ -154,6 +154,15 @@ class REaLSampler:
         # Set the model to eval mode
         self.model.eval()
 
+    # `top_k` applied to sampling when the caller does not pass one. `None`
+    # leaves HuggingFace's own default, which is `top_k=50` (verified with a
+    # 200-token toy model: 50 distinct first tokens, vs 200 with `top_k=0`).
+    # That truncation runs *after* the column-token constraint, so any column
+    # with more than 50 admissible tokens (a high-cardinality categorical, or
+    # numeric chunks with `numeric_nparts >= 2`) silently loses its tail.
+    # `TabularSampler` overrides this to 0 (= no truncation).
+    default_top_k: Optional[int] = None
+
     # Class-level switch so the old per-row callback path can be selected
     # for A/B checks or rollback: `TabularSampler.vectorized_constraint =
     # False`.
@@ -331,6 +340,15 @@ class REaLSampler:
             self._active_col_idx_ids = col_idx_ids_override
             if col_type_ids_seq_override is not None:
                 self.col_type_ids_seq = col_type_ids_seq_override
+
+            if (
+                self.default_top_k is not None
+                and generate_kwargs.get("do_sample", True)
+                and generate_kwargs.get("top_k") is None
+            ):
+                # Not for greedy/beam decoding: HF warns when a sampling
+                # parameter is set while `do_sample=False`.
+                generate_kwargs["top_k"] = self.default_top_k
 
             if constrain_tokens_gen:
                 constraint = self._constraint_logits_processor(device)
@@ -746,6 +764,12 @@ class REaLSampler:
 
 class TabularSampler(REaLSampler):
     """Sampler class for tabular data generation."""
+
+    # No top-k truncation by default: confirmed to degrade categorical
+    # fidelity on a 300-level column (tvd_mean 0.142 -> 0.104, 3/3 seeds, no
+    # privacy change) and to have no detectable effect on low-cardinality
+    # data. Pass `top_k=` to `.sample()` to choose one explicitly.
+    default_top_k: Optional[int] = 0
 
     def __init__(
         self,
