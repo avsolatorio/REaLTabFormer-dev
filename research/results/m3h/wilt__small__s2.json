@@ -1,0 +1,43 @@
+{
+ "job": {
+  "dataset": "wilt",
+  "config": "small",
+  "seed": 2,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/results/m3h/wilt__small__s2.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/tmp/m3h_wilt_small_2",
+  "save_synth": false
+ },
+ "n_train": 3871,
+ "fit_s": 1740.8335826396942,
+ "n_params": 3513088,
+ "stopped_epoch": 206.70833333333334,
+ "global_step": 24805,
+ "variants": {
+  "default": {
+   "sample_s": 2.1346588134765625,
+   "nan_row_frac": 0.0,
+   "ks_mean": 0.03657969516920693,
+   "tvd_mean": 0.007233273056057896,
+   "marg_mean": 0.03168862481701542,
+   "tail_err": 0.04456317078403797,
+   "assoc_diff": 0.014314517095717013,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.9888586956521739,
+   "util_gap": -9.057971014481137e-05,
+   "disc_auc": 0.5241807928531621,
+   "dcr_synth_mean": 0.5151030496906283,
+   "dcr_test_mean": 0.5247384490290884,
+   "dcr_ratio": 0.9816377104512004,
+   "frac_suspicious": 0.07024793388429752,
+   "exact_dup": 0.0
+  }
+ },
+ "oracle": {
+  "ks_mean": 0.029498111620419692,
+  "tvd_mean": 0.005437764602650396,
+  "marg_mean": 0.025488053784124807,
+  "tail_err": 0.11107850609506538,
+  "assoc_diff": 0.021631157990580248,
+  "disc_auc": 0.49365607473243506
+ }
+}

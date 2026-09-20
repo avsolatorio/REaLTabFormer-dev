@@ -42,7 +42,7 @@ the current status of each idea and points at the raw data.
 | H0 | Harness sanity + seed noise floor (base, 3 seeds) | done (M1): headroom large (disc AUC ~0.69); abalone seed noise larger than predicted |
 | H1 | `top_k=50` HF default silently truncates sampling | CONFIRMED on hicard (tvd_mean 0.142 -> 0.104, 3/3 seeds, no privacy change); no effect on bundled data. ADOPTED on feat/support-seed-input (933e95c) |
 | H2 | Sampling temperature / nucleus | done (M1): T=0.9 and top_p=0.95 clearly worse; T=1.1 mild hint of gain, needs a finer test |
-| H3 | Default GPT2 (768d x 6L) is oversized for small tables | STRONG signal (M2): tiny 128d/3L marg_mean 0.081 -> 0.029, disc AUC ~0.69 -> ~0.53, 12/0, flat TSTR + privacy proxies; confounded with training length (tiny hits the 300-epoch ceiling); M3 to disentangle + confirm on holdout |
+| H3 | Default GPT2 (768d x 6L) is oversized for small tables | Replicates on held-out wilt/churn2 (M3h). Not size alone: tiny capped at 30 epochs is far worse; it is 'small model trained to convergence' (~300 epochs, stopping rule never fires). lr 3e-4 gets most of it in ~110 epochs. Memorisation check M4 (`dcr_share`) running; if clean, propose an opt-in preset, not a new default |
 | H4 | Default LR (5e-5, no warmup) under-trains; higher LR + warmup helps | REFUTED (M2): 1e-4 and 3e-4 slightly worse |
 | H5 | Re-check quantile encoding win with multiple seeds | done (M1): no overall gain; helps skewed marginals, worsens `frac_suspicious` on all 4 datasets -- not recommended by default; artifact-vs-copying question open |
 | H6 | Fewer tokens per numeric column (`numeric_nparts=2`) | planned |
@@ -158,6 +158,96 @@ Results before that date were produced with `unk_dropout=0`,
 `configs.py` names the old training defaults explicitly and `topk50` the old
 sampling default; other named configs are not redefined -- pass the old
 settings explicitly to reproduce an earlier matrix.
+
+## Program 2 (from 2026-09-20 19:58 UTC): representation, training efficiency, label-free overfitting detection
+
+Pre-registered before any of these were run. Workhorse for cheap matrices:
+`wk` = 128d/4h/3L GPT2, lr 3e-4 + 5% warmup, 300-epoch ceiling (M3's `tiny_lr3e4`;
+near-`tiny` quality at ~1/3 of the epochs). Every matrix carries its own reference
+arm, run under the same library version, so the changed library defaults
+(2026-09-20) cannot confound a comparison. Dev datasets: diabetes, insurance,
+abalone, adult5k; winners are confirmed on held-out wilt/churn2.
+
+### H11 -- Column order changes the autoregressive factorisation (data processing)
+- **Why:** the model factorises p(x1) p(x2|x1) ...; the order is the file's column
+  order and is otherwise arbitrary. A dependency-aware order should make the
+  conditionals easier to learn; the target is already teacher-forced first.
+- **Prediction:** small effects (|delta marg_mean| < 0.01); `hub_first` (columns
+  with the largest total mutual information first) and `entropy_asc` improve
+  `assoc_diff`; `random` is no better than `orig`; no privacy change.
+- **Test:** `wk` with column order in {orig, reverse, entropy_asc, entropy_desc,
+  hub_first, random}, dev x 3 seeds.
+
+### H12 -- Overconfidence: label smoothing / dropout / weight decay (regularisation)
+- **Why:** M1 hinted T=1.1 helps (over-confident model); label smoothing directly
+  flattens the training target. Default GPT2 dropout is 0.1; no weight decay.
+- **Prediction:** label smoothing 0.05 improves `marg_mean`/discriminator distance
+  by a small amount and lowers `frac_suspicious`; dropout 0 is worse, 0.2 neutral;
+  weight decay 0.01 neutral.
+- **Test:** `wk` + {ls0.05, ls0.10, drop0, drop0.2, wd0.01}.
+
+### H13 -- Efficiency: batch 32 x accum 1 equals batch 8 x accum 4, faster
+- **Why:** identical effective batch and update count, 4x fewer kernel launches on
+  a GPU these models under-fill; also bf16 / fused AdamW / torch.compile.
+- **Prediction:** same quality within noise; >=1.5x steps/s. Measured in an
+  interleaved micro-benchmark (matrix wall-clock is load-confounded on this box).
+
+### H14 -- Numeric representation with the new `top_k=0` default
+- **Why:** each quantile-encoded numeric column costs 4 tokens (precision 4,
+  nparts 1); fewer/wider tokens mean fewer compounding autoregressive steps. The
+  `numeric_nparts>=2` case was untestable before `top_k=0` (100-way chunks were
+  truncated to 50).
+- **Prediction:** qenc precision 3 or nparts 2 is neutral-to-better on fidelity and
+  clearly faster per row; `numeric_categorical_threshold=20` helps low-cardinality
+  numeric columns and is neutral elsewhere.
+
+### H15 -- A label-free overfitting signal: the self-referential likelihood gap (SRLG)
+- **Idea:** for the trained model q, compare the per-row negative log-likelihood of
+  (a) the training rows and (b) the model's OWN samples, both under q (constrained
+  to valid column tokens). If q generalises, the two NLL distributions agree; if q
+  memorises, training rows become more likely than typical samples. Needs no
+  held-out data and no bootstrap: one forward pass over the training rows plus one
+  generation (cheap since the vectorised decoder).
+- **Signals:** `srlg_mean` = mean NLL(samples) - mean NLL(train); `srlg_ks` = KS
+  distance between the two NLL distributions; `srlg_tail` = 5th-percentile
+  difference (memorised rows have very low NLL).
+- **Ground truth (only for evaluating the signal, never used by it):** true gap =
+  mean NLL(held-out test) - mean NLL(train); epoch of minimum held-out NLL;
+  `dcr_share` (memorisation onset); fidelity/discriminator optimum.
+- **Prediction:** SRLG rises with the true gap after the held-out NLL minimum
+  (within-run Spearman > 0.6 on most runs); `srlg_tail` and `srlg_ks` are more
+  sensitive than `srlg_mean`; the sign/level of `srlg_mean` at fixed epoch differs
+  between datasets, so a usable rule has to use the *change* from its own early
+  baseline, not a fixed threshold.
+- **Falsified if:** within-run correlation with the true gap is weak or the sign is
+  inconsistent across datasets even after baselining.
+
+### H16 -- Weight averaging (EMA) improves the stopped model
+- **Prediction:** an EMA of the weights (decay ~0.999) sampled at the stopping point
+  gives lower `marg_mean` and discriminator distance than the raw weights at the
+  same step, with no privacy change. (Cheap, standard for generative models.)
+
+### H15b -- A fixed label-free stopping rule, tested out of sample (pre-registered 2026-09-20 21:52 UTC)
+- **Rule R\*:** stop at the first checkpoint where `srlg_ks` >= (its running minimum) + 0.25.
+  delta was chosen by scanning {0.05,0.1,0.2,0.3,0.5} on the 20 dev runs of `s1`
+  (diabetes, insurance, abalone, adult5k), so dev numbers for it are optimistic; the
+  held-out test below has no tuning. (`srlg_mean` / `srlg_tail` rules were worse and are
+  dropped.)
+- **What dev showed and what did not replicate:** the pre-registered H15 prediction
+  (monotone rise with the true gap, within-run Spearman > 0.6) was FALSE: default-model
+  correlations are negative (about -0.5 for `srlg_ks`), small-model ones mixed. A first
+  observation that `srlg_ks` bottoms out at the held-out-NLL minimum did not replicate on a
+  second dataset and is retracted. Held-out-NLL stopping stops at epoch 5 (default) and
+  ~40 (small) with discriminator distance ~0.20 / ~0.06: unsuitable for sample quality.
+- **Test:** `s1h` = same protocol on held-out wilt and churn2 x 3 seeds x {default, small}
+  (shorter run lengths: 60 / 150 epochs). Rules applied exactly as above, no re-tuning.
+- **Prediction / success criteria:** (i) R\* fires in >= 80% of runs; (ii) its stop epoch is
+  within a factor of 2 of the discriminator-optimal epoch in >= 75% of runs; (iii) mean
+  discriminator distance at R\*'s stop is lower than at "last epoch" and lower than at the
+  held-out-NLL minimum; (iv) mean `dcr_share` at R\*'s stop is >= 0.03 lower than at the last
+  epoch. **Falsified if** (iii) fails, or R\* fires in fewer than half the runs.
+- **What a pass would NOT show:** superiority over the tool's sensitivity rule -- that
+  needs the rule implemented in the real trainer and run against it (planned).
 
 ## Ideas parked (not yet hypotheses)
 - Numeric OOV: snap to the nearest in-vocab digit token rather than a random one.

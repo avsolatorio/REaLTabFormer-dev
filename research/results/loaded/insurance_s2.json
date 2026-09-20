@@ -1,0 +1,15 @@
+{
+ "dataset": "insurance",
+ "seed": 2,
+ "stop_epoch": 30.90909090909091,
+ "loaded_epoch": 10.303030303030303,
+ "loaded_step": 340,
+ "steps_per_epoch": 33,
+ "ks_mean": 0.11588785046728972,
+ "tvd_mean": 0.07850467289719626,
+ "marg_mean": 0.0945260347129506,
+ "tail_err": 0.03969548999742161,
+ "assoc_diff": 0.03139278733908352,
+ "disc_auc": 0.6989885579526597,
+ "dcr_share": 0.47761194029850745
+}
