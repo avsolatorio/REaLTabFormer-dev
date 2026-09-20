@@ -34,4 +34,15 @@ CONFIGS = {
     "lr3e4": {"train_args": {"learning_rate": 3e-4, "warmup_steps": 0.05}},
     "lr1e4": {"train_args": {"learning_rate": 1e-4, "warmup_steps": 0.05}},
     "ga1": {"train_args": {"gradient_accumulation_steps": 1}},
+
+    # ---- M3: is the M2 size effect about size or about training length?
+    # `tiny` (128d/4h/3L) almost always ran to the 300-epoch ceiling in M2, so
+    # size and epochs were confounded. Cap it at base's ~30 epochs, extend it,
+    # go smaller, and let it use a higher learning rate.
+    "b0": {},
+    "tiny_e30": {"epochs": 30, "gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3}},
+    "tiny_e600": {"epochs": 600, "gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3}},
+    "micro_e600": {"epochs": 600, "gpt2": {"n_embd": 64, "n_head": 2, "n_layer": 2}},
+    "tiny_lr3e4": {"gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3},
+                   "train_args": {"learning_rate": 3e-4, "warmup_steps": 0.05}},
 }
