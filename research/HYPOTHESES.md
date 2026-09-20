@@ -227,6 +227,28 @@ abalone, adult5k; winners are confirmed on held-out wilt/churn2.
   gives lower `marg_mean` and discriminator distance than the raw weights at the
   same step, with no privacy change. (Cheap, standard for generative models.)
 
+### H15b -- A fixed label-free stopping rule, tested out of sample (pre-registered 2026-09-20 21:52 UTC)
+- **Rule R\*:** stop at the first checkpoint where `srlg_ks` >= (its running minimum) + 0.25.
+  delta was chosen by scanning {0.05,0.1,0.2,0.3,0.5} on the 20 dev runs of `s1`
+  (diabetes, insurance, abalone, adult5k), so dev numbers for it are optimistic; the
+  held-out test below has no tuning. (`srlg_mean` / `srlg_tail` rules were worse and are
+  dropped.)
+- **What dev showed and what did not replicate:** the pre-registered H15 prediction
+  (monotone rise with the true gap, within-run Spearman > 0.6) was FALSE: default-model
+  correlations are negative (about -0.5 for `srlg_ks`), small-model ones mixed. A first
+  observation that `srlg_ks` bottoms out at the held-out-NLL minimum did not replicate on a
+  second dataset and is retracted. Held-out-NLL stopping stops at epoch 5 (default) and
+  ~40 (small) with discriminator distance ~0.20 / ~0.06: unsuitable for sample quality.
+- **Test:** `s1h` = same protocol on held-out wilt and churn2 x 3 seeds x {default, small}
+  (shorter run lengths: 60 / 150 epochs). Rules applied exactly as above, no re-tuning.
+- **Prediction / success criteria:** (i) R\* fires in >= 80% of runs; (ii) its stop epoch is
+  within a factor of 2 of the discriminator-optimal epoch in >= 75% of runs; (iii) mean
+  discriminator distance at R\*'s stop is lower than at "last epoch" and lower than at the
+  held-out-NLL minimum; (iv) mean `dcr_share` at R\*'s stop is >= 0.03 lower than at the last
+  epoch. **Falsified if** (iii) fails, or R\* fires in fewer than half the runs.
+- **What a pass would NOT show:** superiority over the tool's sensitivity rule -- that
+  needs the rule implemented in the real trainer and run against it (planned).
+
 ## Ideas parked (not yet hypotheses)
 - Numeric OOV: snap to the nearest in-vocab digit token rather than a random one.
 - Row-level augmentation via column-order permutation on v1 (any_order is v2-only).
