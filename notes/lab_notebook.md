@@ -410,3 +410,372 @@ the OOV substitution question (needs a decision), `fit()`'s own
 `experiment_id`-reuse design question, `save_full_every_epoch`'s
 default, `cusum`'s missed field_weights/digit_entropy forwarding, and
 `_fit_relational`/`grokfast_args`'s relational-mode gaps.
+
+---
+
+## 2026-09-20 — Utility-optimization program started: harness built, plus four findings from reading/probing the code (no experiment results yet)
+
+**Question:** Where can the data-processing, generation and model-design
+choices be improved to raise synthetic-data utility without raising
+copying? First step: what evidence standard can the existing tooling
+support, and what does the code actually do at generation time?
+
+**What was done:** Read `data_utils/{process,transform,dataset,vocab}.py`,
+the model/trainer construction in `realtabformer.py`, and the generation
+and decode path in `rtf_sampler.py`. Built `research/bench.py` (multi-seed;
+scores fidelity, gradient-boosting TSTR utility, discriminator AUC and
+privacy together; scores several sampling variants on one trained model;
+includes a real-vs-real "oracle" noise floor), `research/summarize.py`
+(paired deltas on dataset x seed with standard errors) and
+`research/HYPOTHESES.md` (predictions pre-registered before running).
+Verified the four items below directly.
+
+**Result:**
+1. **HF's default `top_k=50` is applied to REaLTabFormer sampling.**
+   Probed with a 200-token toy model, 5,000 first-token draws: 50 distinct
+   tokens with default kwargs, 200 with `top_k=0`. The token-constraint mask
+   (`prefix_allowed_tokens_fn`) runs first, so any column with >50
+   admissible tokens has its tail cut and renormalised: categorical columns
+   with >50 levels, and numeric chunks when `numeric_nparts>=2` (100-way
+   chunks). None of the six bundled datasets has such a column (widest:
+   41 levels), so this bug is invisible on them; a synthetic 300-level Zipf
+   dataset (`hicard`) was added to test it. Not yet measured.
+2. **The default model is large for these tables.** `GPT2Config(n_layer=6)`
+   inherits GPT-2's 768-wide, 12-head shape: 43.5M parameters, fit for a
+   614-row training set (measured in the harness smoke run, diabetes).
+3. **`mask_rate` is static.** The training set is built once with
+   `Dataset.map`, so the [RMASK] positions are drawn once and are identical
+   in every epoch; labels are also built from the already-masked ids, so
+   the model is trained to predict [RMASK], which generation then suppresses.
+   Not the regularisation its docstring implies. Not yet measured.
+4. **Correction to the 2026-09-11/12 OOV entry.** That entry argued random
+   OOV substitution is non-deterministic because it draws from Python's
+   global `random`. That holds for the scalar `get_token_id` path only.
+   Seed inputs go through `make_dataset`, which uses the vectorised path with
+   a fresh `np.random.default_rng(self.random_state)` on every call, so on
+   the seed path the substitution is deterministic (always the same
+   arbitrary level for a given model) -- arbitrary, not random. The other
+   arguments in that entry (it defeats seed conditioning; it draws uniformly
+   over levels, so it over-weights rare levels relative to their true
+   frequency) are unaffected. Also: both encoders share the substitution,
+   so a revert must change `get_token_id` AND `_vectorized_column_token_ids`.
+   Also found while setting up: the repo `.gitignore` already ignores
+   `experiments/`, which would have silently kept the harness out of git;
+   the harness lives in `research/` instead.
+
+**Implication:** Every comparison from here on uses >=3 seeds and reports
+privacy alongside utility. Items 1 and 3 become hypotheses H1 and (new)
+mask-rate; item 4 refines the H8 test design. See `research/HYPOTHESES.md`.
+
+---
+
+## 2026-09-20 04:22 UTC — M1: baseline noise floor, sampling variants (H1, H2) and quantile encoding (H5) on 4 datasets x 3 seeds
+
+Code/data: commit `b7d559e` (raw JSON in `research/results/m1/`). The jobs
+actually ran from `68f7122` plus uncommitted edits to `research/configs.py`
+(the M1 arm definitions) and, mid-run, to `research/bench.py` (HGB
+categorical cap and GPU assignment -- neither changes any metric for the
+four datasets below). `research/results/m1h` and `m2a` partial results are in
+the same commit; they are not analysed here.
+
+**Question:** Against a real noise floor, (H0) how far is default synthetic
+data from real, and how big is seed noise? (H1) Does HF's default `top_k=50`
+matter? (H2) Do temperature / nucleus sampling give a free win? (H5) Does
+quantile encoding still win with several seeds *when privacy is scored too*?
+
+**What was done:** diabetes, insurance, abalone, adult5k x seeds 0,1,2 x
+{`base`, `qenc`}; `base` scored under 5 sampling variants on one trained
+model. Sensitivity stopping + best-checkpoint loading, teacher-forced target.
+12 paired (dataset, seed) units per arm. hicard (the H1 test that can
+actually show an effect) is NOT in this entry: all 6 of its jobs failed in my
+metric code (HistGradientBoosting rejects >255-level categoricals) after
+training and sampling had finished; rerun as `m1h`, pending. Because ~50
+paired comparisons were made, single results near 2 s.e. are treated as
+hints; only effects that are large (~3+ s.e.) or that point the same way on
+every dataset are called findings.
+
+**Result:**
+- **H0 noise floor.** Default synthetic data is 1.5-3x the real-vs-real
+  floor on marginal distance (`marg_mean` 0.062-0.098 vs floor 0.023-0.065
+  by dataset) and is easily told apart from real: discriminator AUC
+  0.68-0.70 on all four datasets (floor 0.50). Large headroom. Seed noise is
+  bigger than I predicted on abalone: SD across seeds 0.033 on `marg_mean`
+  and 0.036 on TSTR (adult5k: 0.005 and 0.005). Sensitivity stopping lands
+  at epoch 28-33 on average (SD 3-7.6 epochs).
+- **H1 (`top_k=0` vs default 50), bundled datasets:** no detectable effect,
+  as predicted. `marg_mean` +0.0003 +-0.0034 (6 better/6 worse), TSTR -0.005
+  +-0.007. One hint: `frac_suspicious` +0.010 +-0.004 (2.5 s.e., 3/8) --
+  not established. The real test is hicard, still pending.
+- **H2 temperature/nucleus.** T=0.9: clearly worse -- `marg_mean` +0.014
+  +-0.003 (1 better/11 worse), discriminator distance from 0.5 +0.031 +-0.006
+  (1/11), `frac_suspicious` +0.020 +-0.004 (0/11); TSTR -0.003 +-0.009, so the
+  small utility gain I predicted for T<1 did not appear. `top_p=0.95`:
+  clearly worse -- `tail_err` +0.060 +-0.017 (0/12), discriminator distance
+  +0.049 +-0.008 (0/12): nucleus truncation cuts real tails. T=1.1: small,
+  same-direction improvements (`marg_mean` -0.007 +-0.004, 8/4; discriminator
+  distance -0.013 +-0.006, 8/4; `frac_suspicious` -0.007 +-0.003, 7/5), TSTR
+  -0.008 +-0.007. About 2 s.e. each -- a hint that the trained model is
+  slightly over-confident, not a finding.
+- **H5 quantile encoding vs default (both `default` sampling).** No
+  detectable overall gain: `marg_mean` -0.009 +-0.006 (6/6), TSTR -0.002
+  +-0.009. Per dataset it helps the marginals where predicted -- insurance
+  -0.023, abalone -0.013 -- and hurts adult5k (+0.009). `assoc_diff` is worse
+  (+0.0034 +-0.0015, 3 better/9 worse). **`frac_suspicious` is worse on all
+  four datasets** (+0.011 to +0.035; mean +0.019 +-0.005, 10 of 12 units
+  worse). `exact_dup` is 0 for every arm, so this is closeness, not copied
+  rows. Wall-clock: `qenc` fit ~510 s faster on average (+-158), but jobs
+  ran at different machine loads, so this is not attributable to the encoding.
+
+**Implication:** (1) Do not use `top_p`; do not use T<1. (2) DECISION_LOG's
+"quantile encoding is the one clean win" does not survive multi-seed,
+privacy-scored testing on these four datasets: it improves marginals on
+skewed columns but raises the suspicious-closeness rate on every dataset, and
+under the standing rule (quality gain with worse privacy is not a win) it is
+not recommended by default on this evidence. Open question, untested: the
+extra closeness may be an artifact -- quantile decoding snaps values to a
+1,000-point training grid, which lowers a value-space DCR without any
+memorisation -- rather than genuine copying. (3) T slightly above 1 is worth a
+proper test (finer grid, more seeds). (4) Finish H1 on hicard before
+concluding anything about `top_k`. Hypotheses updated in
+`research/HYPOTHESES.md`.
+
+---
+
+## 2026-09-20 07:29 UTC — H1 confirmed on hicard: HF's default `top_k=50` measurably degrades a 300-level categorical column
+
+Code/data: `research/results/m1h/` at commit `b33e8de` (harness as of M1 plus
+the >255-level HGB fix). Seeds 0,1,2; hicard is the synthetic table (4,000
+rows, Zipf-distributed 300-level `city`, `income` driven by city, `segment`
+derived from income) built because no bundled dataset has a column wide enough
+for `top_k=50` to bite.
+
+**Question:** Does the default `top_k=50` truncation degrade columns with >50
+admissible tokens (H1, deferred from the M1 entry)?
+
+**What was done:** The M1 arms rerun on hicard (jobs had failed in M1 in my
+metric code and were rerun as `m1h`): `base` under 5 sampling variants and
+`qenc` under 2, 3 seeds, all scored on one trained model per seed.
+
+**Result:** `top_k=0` vs the default, paired by seed (mean of 3 seeds; +- is the
+SD across seeds, n=3):
+- Categorical fidelity `tvd_mean` 0.1416 -> 0.1042 (-0.037 +-0.008), better in
+  all 3 seeds (0.158->0.120, 0.126->0.081, 0.141->0.112).
+- `assoc_diff` 0.0415 -> 0.0166 (-0.025 +-0.004); `marg_mean` 0.1147 -> 0.0937;
+  discriminator AUC 0.651 -> 0.597 (real-vs-real 0.503).
+- Privacy unchanged: `frac_suspicious` 0.0633 -> 0.0621 (-0.001 +-0.018),
+  `exact_dup` 0. TSTR is uninformative here (0.9996 in every arm: `segment` is a
+  deterministic function of `income`).
+- Within `top_k=0`, temperature 1 is best on `tvd_mean` (0.104) vs T=0.9 (0.132),
+  T=1.1 (0.119), `top_p=0.95` (0.108). So the M1 hint that T=1.1 helps is NOT
+  corroborated on categorical fidelity (T=1.1 is 0.015 worse than T=1 here;
+  its lower `frac_suspicious`, 0.047 vs 0.062, has SD ~0.02).
+- `qenc` on hicard: no distinguishable gain (`tvd_mean` -0.006 +-0.026), and
+  `frac_suspicious` again in the worse direction (+0.020 +-0.013).
+- Not measured: per-column numbers for `city` (which cities appear, how many
+  distinct levels) -- the synthetic tables were not saved, so the mechanism
+  (tail levels cut and renormalised) is inferred from the design, not
+  observed directly.
+
+**Implication:** The default `top_k=50` silently degrades high-cardinality
+categorical columns; it is invisible on low-cardinality data (M1: no
+detectable effect either way). Recommend the sampler pass `top_k=0` unless the
+caller sets one. That is a behaviour change to a default, so it is proposed
+here, not yet made. Caveats: one synthetic dataset, 3 seeds; the size of the
+effect on real high-cardinality data is unmeasured.
+
+---
+
+## 2026-09-20 07:29 UTC — H8 OOV handling: deterministic UNK + input-side UNK dropout beats random substitution on 5/5 seeds; unconditional-quality cost check still running
+
+Code: library change `b8597a8` (`oov_strategy`, `unk_dropout`, collator) on
+`exp/oov-unk-dropout`, merged with the fast-decoding branch (`f864173`);
+raw results `research/results/oov/` at commit `f90b338` on that branch.
+Single-process experiment script `research/oov_bench.py`.
+
+**Question:** When a `seed_input` carries a category value never seen in
+training, which handling of that value behaves best: the current random
+substitution, deterministic [UNK], or [UNK] made meaningful by training with
+input-side [UNK] dropout? (Owner delegated the OOV decision to exploration on
+2026-09-20; nothing has been merged into `feat/support-seed-input`.)
+
+**What was done:** adult5k, column `occupation` (moved to first position so a
+v1 seed can be a prefix). Per seed, one level with 3-10% frequency is held OUT
+of the training data entirely, so it is truly OOV (seeds 0,2,3 drew
+Transport-moving, seed 1 Machine-op-inspct, seed 4 Tech-support -- only three
+distinct levels, not five). Trained with dropout in {0, 0.03, 0.10}; each model
+seeded with {occupation: <held-out level>} under both policies (`random` =
+current, `unk`) by toggling `oov_strategy` at encoding time, 6 x 300 rows per
+arm. Measured: mean per-column KS/TVD of the OTHER columns against (a) the
+true conditional (the held-out rows, 174-279 of them) and (b) the training
+marginal; references: an unconditional sample (= "ignore the seed") and, as a
+control, conditioning on known levels. Seed 2 failed once on a CUDA
+out-of-memory error (shared GPU) and was rerun; its failed file is kept under
+`failed_oom/`.
+
+**Result (mean over 5 seeds; lower is closer):**
+
+| arm | distance to marginal | distance to true conditional |
+|---|---|---|
+| `random`, no dropout (current) | 0.119 (range 0.067-0.168) | 0.172 |
+| `unk`, no dropout (UNK untrained) | 0.075 | 0.137 |
+| `unk` + 3% dropout | 0.047 | 0.134 |
+| `unk` + 10% dropout | 0.041 | 0.124 |
+| ignore the seed (unconditional sample) | 0.039 | 0.129 |
+
+- `random` is *worse than ignoring the seed* on the true conditional in 5 of 5
+  seeds (0.172 vs 0.129), and its distance from the marginal swings with which
+  arbitrary level it happens to pick (0.067 to 0.168).
+- `unk` + dropout is closer than `random` to both references in 5 of 5 seeds
+  (3%: -0.072 / -0.038 on average; 10%: -0.078 / -0.048). It lands at the
+  unconditional floor (0.041-0.047 vs 0.039): an unknown value behaves like
+  "no information". At 10% it is better than ignoring the seed on the true
+  conditional in 4 of 5 seeds, but the mean gain (0.124 vs 0.129) is small; I do
+  not claim that.
+- Plain `unk` without dropout helps on average but is erratic (seed 3: 0.098
+  from the marginal, worse than seeds with dropout).
+- Conditioning on KNOWN levels still helps by the same amount in every arm
+  (0.080-0.084), so dropout did not visibly weaken real conditioning.
+
+**Implication:** Random substitution should not stay the default: it silently
+gives worse-than-no-conditioning output. The fix that works is deterministic
+[UNK] plus input dropout at training time; [UNK] alone is not enough.
+Recommendation: `oov_strategy="unk"` with `unk_dropout` of about 0.03-0.10 as
+the default. Not yet known: (1) whether dropout costs ordinary (unseeded)
+generation quality -- running now as matrix `oovcost` (b0 vs 3% vs 10%, 4
+datasets x 3 seeds); (2) behaviour on numeric OOV values, on other datasets,
+and on v2/any-order (the collator is v1 only); (3) only three distinct held-out
+levels were tested. Decision to change the default is left until (1) is in.
+
+---
+
+## 2026-09-20 07:39 UTC — `top_k=0` default for tabular sampling implemented and validated (owner approved implementing it; not merged into `feat/support-seed-input`)
+
+Code: `06f37a7` on `exp/topk0-default`, stacked on `exp/fast-constrained-decoding`
+(`bf249ff`), itself off `exp/utility-optimization`.
+
+**Question:** Can the H1 finding (2026-09-20 07:29 UTC entry) be shipped as a
+default without changing anything it has no evidence for?
+
+**What was done:** `TabularSampler.default_top_k = 0` (new class attribute on
+the base sampler, default `None` = leave HF alone); `_generate` applies it
+only when the caller passed no `top_k` (or `None`) and is actually sampling.
+`RelationalSampler` keeps HF's default. Tests: a spy on `model.generate`
+(default -> `top_k=0`; explicit 25 -> 25; `None` -> 0; greedy -> no `top_k`;
+relational default is `None`), and a behavioural test on a 200-level first
+column of a near-uniform 1-epoch model (default sampling yields >50 distinct
+levels; `top_k=50` yields <=50). Mutation-checked: with `default_top_k=None`
+the behavioural test fails.
+
+**Result:** Full suite 171 passed, 2 failed -- the same two failures that
+pre-date this work (`test_default_init`, `test_TabularSampler`). No
+regressions.
+
+**Implication:** Ready for review. Effect sizes are from one synthetic
+dataset with 3 seeds (see the H1 entry); the change is neutral on the
+bundled low-cardinality datasets (M1). It alters default sampling output for
+any model with a column wider than 50 tokens, including `numeric_nparts>=2`.
+Merging into `feat/support-seed-input` is left to the owner.
+
+---
+
+## 2026-09-20 15:43 UTC — H8 cost check: input-side UNK dropout does not measurably hurt unseeded generation at 3%; and the fast decoder reproduces M1's baseline to 4 decimals
+
+Code/data: `research/results/oovcost/` at `9935ab2` (branch
+`exp/oov-unk-dropout`, library change `b8597a8` merged with fast decoding
+`f864173`). 4 datasets x 3 seeds, sensitivity stopping, same regime as M1.
+
+**Question:** Does training with [UNK] dropout (needed to make OOV -> [UNK] work,
+see the 07:29 UTC H8 entry) cost ordinary, unseeded generation quality or
+privacy?
+
+**What was done:** arms `b0` (no dropout, reference), `unkd03`, `unkd10`;
+paired on (dataset, seed), 12 units per arm.
+
+**Result (arm - b0, mean +-s.e.; b0 in brackets):**
+- `unk_dropout=0.03`: `marg_mean` -0.0019 +-0.0025 [0.0808], `tail_err` -0.0010
+  +-0.0039, `assoc_diff` +0.0009 +-0.0008, TSTR -0.0022 +-0.0090, discriminator
+  distance -0.0085 +-0.0095 [0.187], `frac_suspicious` +0.0063 +-0.0044 [0.0477],
+  `exact_dup` 0. Stops 3.0 +-1.3 epochs later (30.7 -> 33.6). No detectable cost.
+- `unk_dropout=0.10`: `marg_mean` -0.0068 +-0.0059, `tail_err` -0.0123 +-0.0075
+  (9 better/3 worse), discriminator distance -0.0457 +-0.0152 (9/3, ~3 s.e.),
+  TSTR +0.0017 +-0.0058, but `frac_suspicious` +0.0142 +-0.0065 (3 better/9
+  worse, ~2.2 s.e.) and stops 9.4 +-1.5 epochs later (30.7 -> 40.1).
+- **Full-pipeline equivalence of the fast decoder:** `b0/default` here (trained
+  and sampled with the vectorised constraint) reproduces M1's `base/default`
+  (trained and sampled with the per-row callback) to four decimals on every
+  metric (e.g. `marg_mean` 0.0808, `assoc_diff` 0.0212, TSTR 0.7529,
+  `frac_suspicious` 0.0477) and in mean stopping epoch (30.6888). This is a
+  much stronger check than the unit tests: same seeds, 12 complete
+  train-stop-sample-score pipelines, identical results. Only wall-clock differs
+  (mean `fit_s` 851 -> 326, but the two ran at different machine loads, so that
+  ratio is not a controlled benchmark).
+
+**Implication:** At 3% the OOV fix costs nothing measurable and captures almost
+all of its benefit (distance to marginal 0.047 vs 0.041 at 10%, floor 0.039). At
+10% dropout acts as a regulariser that delays sensitivity stopping by ~9 epochs
+and comes with a hint (2.2 s.e., one of ~20 comparisons) of more suspiciously
+close rows; not recommended as a default. Recommendation to the owner:
+`oov_strategy="unk"` with `unk_dropout=0.03`. Not merged; the change alters
+training for every model (adds a collator), so it stays a proposal.
+
+---
+
+## 2026-09-20 15:45 UTC — M2: a much smaller model gives a large fidelity gain at flat utility and flat privacy metrics; higher learning rate is worse; grad-accum 1 gives no quality gain
+
+Code/data: `research/results/{m2a,m2b,m2c}/` at `dc326e8` (paired against M1's
+`base/default`, same 12 dataset x seed units). Provenance: the 41 `m2a` jobs
+ran on the old per-row-callback sampler; `m2b`/`m2c` (19 jobs) on the
+vectorised decoder -- shown identical in the entry above. Sampling uses HF's
+default `top_k=50` throughout (comparable with M1). GPT2 config differs only in
+the listed fields; LR arms use `warmup_steps=0.05` (the installed transformers
+rejects `warmup_ratio`, which the library would silently have dropped).
+
+**Question:** H3 (is the default 768-wide x 6-layer GPT2, 43.5M parameters, too
+big for these tables?), H4 (does a higher learning rate + warmup help?), H7 (does
+`gradient_accumulation_steps=1` help?).
+
+**What was done:** 5 arms x 4 datasets x 3 seeds under the standard sensitivity
+regime with a 300-epoch ceiling. `small` = 256d/8 heads/4 layers, `tiny` =
+128d/4/3, `lr3e4`, `lr1e4`, `ga1`.
+
+**Result (arm - base, mean +-s.e., wins/losses of 12; base in brackets):**
+- **H3 model size -- large, consistent effect.** `tiny`: `marg_mean` 0.0808 ->
+  0.0288 (-0.0520 +-0.0064, 12/0), `tail_err` -0.0355 +-0.0103 (12/0), discriminator
+  distance from 0.5 0.187 -> 0.032 (-0.155 +-0.019, 12/0; AUC ~0.53 vs ~0.69),
+  `assoc_diff` -0.0034 +-0.0017 (8/4). `small`: `marg_mean` -0.0325 +-0.0055
+  (12/0), discriminator distance -0.113 +-0.021 (11/1). Downstream TSTR
+  unchanged (`tiny` +0.009 +-0.009, `small` +0.005 +-0.006). Privacy metrics
+  flat: `frac_suspicious` `tiny` -0.002 +-0.004 (5/6), `small` +0.008 +-0.007;
+  `exact_dup` 0; DCR ratio ~1.00.
+- **The caveat that matters:** smaller models train far longer before the
+  sensitivity rule stops them -- `small` 114 epochs, `tiny` 293 on average
+  against a 300-epoch ceiling, i.e. `tiny` almost always ran to the ceiling
+  (base: 31). So (a) size and training length are confounded in this matrix;
+  (b) the tool's overfitting protection essentially never fired for `tiny`, yet
+  the DCR-based privacy metrics stayed flat; (c) `tiny`'s `marg_mean` (0.029) is
+  *below* the real-held-out-vs-train floor (mean 0.043): its output is closer to
+  the training data than unseen real data is -- not by itself evidence of
+  copying (exact duplicates 0, DCR ratio 1.007) but a reason for care; (d) it
+  costs wall-clock (`fit_s` roughly 4x, confounded by machine load).
+- **H4 learning rate -- prediction refuted.** `lr3e4`+warmup: `marg_mean` +0.0084
+  +-0.0076 (3 better/9 worse), `assoc_diff` +0.0029 +-0.0014, TSTR -0.0176 +-0.0107,
+  `frac_suspicious` +0.0109 +-0.0050; `lr1e4`: `marg_mean` +0.0144 +-0.0062 (3/9),
+  `assoc_diff` +0.0042 +-0.0016 (1/11). The default 5e-5 is not under-training
+  these models; higher LR is slightly worse and did not stop earlier.
+- **H7 `gradient_accumulation_steps=1` -- no quality gain.** `marg_mean` -0.0034
+  +-0.0059, `tail_err` -0.0133 +-0.0170 (neither detectable), `assoc_diff` +0.0021
+  +-0.0015 (2/10 worse), TSTR -0.0094 +-0.0104; `frac_suspicious` +0.0164 +-0.0070
+  (2 better/9 worse, ~2.3 s.e.). It stops ~6 epochs earlier (30.7 -> 24.7) since
+  it takes 4x more updates per epoch. This does not support the earlier
+  suggestion (status doc) that accumulation, via batch size, is why "small
+  batches seem to work better" for quality.
+
+**Implication:** Model size is the first lever in this program with a large,
+uniform effect (12/0 on the headline fidelity metrics), at flat downstream
+utility and flat privacy proxies. Not yet safe to recommend as a default:
+(1) size vs training-length must be separated (planned M3: `tiny` capped at 30
+epochs, `tiny` at 600, a smaller `micro`, `tiny` + higher LR); (2) it must be
+confirmed on the two held-out datasets (wilt, churn2) that were kept back for
+exactly this; (3) the memorisation caution above needs a direct check beyond DCR
+(e.g. nearest-neighbour rank against held-out rows). Learning rate and
+gradient accumulation stay at their defaults on this evidence.

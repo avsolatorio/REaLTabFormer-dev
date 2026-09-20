@@ -1,0 +1,6 @@
+tmp/
+cache/
+results/*/logs/
+results/*/*/
+__pycache__/
+*.log
