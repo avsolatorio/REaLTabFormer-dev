@@ -42,12 +42,12 @@ the current status of each idea and points at the raw data.
 | H0 | Harness sanity + seed noise floor (base, 3 seeds) | done (M1): headroom large (disc AUC ~0.69); abalone seed noise larger than predicted |
 | H1 | `top_k=50` HF default silently truncates sampling | CONFIRMED on hicard (tvd_mean 0.142 -> 0.104, 3/3 seeds, no privacy change); no effect on bundled data. Implemented + tested on `exp/topk0-default` (06f37a7), not merged |
 | H2 | Sampling temperature / nucleus | done (M1): T=0.9 and top_p=0.95 clearly worse; T=1.1 mild hint of gain, needs a finer test |
-| H3 | Default GPT2 (768d x 6L) is oversized for small tables | running (M2a) |
-| H4 | Default LR (5e-5, no warmup) under-trains; higher LR + warmup helps | running (M2a) |
+| H3 | Default GPT2 (768d x 6L) is oversized for small tables | STRONG signal (M2): tiny 128d/3L marg_mean 0.081 -> 0.029, disc AUC ~0.69 -> ~0.53, 12/0, flat TSTR + privacy proxies; confounded with training length (tiny hits the 300-epoch ceiling); M3 to disentangle + confirm on holdout |
+| H4 | Default LR (5e-5, no warmup) under-trains; higher LR + warmup helps | REFUTED (M2): 1e-4 and 3e-4 slightly worse |
 | H5 | Re-check quantile encoding win with multiple seeds | done (M1): no overall gain; helps skewed marginals, worsens `frac_suspicious` on all 4 datasets -- not recommended by default; artifact-vs-copying question open |
 | H6 | Fewer tokens per numeric column (`numeric_nparts=2`) | planned |
-| H7 | `gradient_accumulation_steps=4` default hurts small data | running (M2a) |
-| H8 | OOV: random substitution vs UNK vs UNK + input dropout | 5 seeds done: unk + dropout beats random 5/5, sits at the unconditional floor; random is worse than ignoring the seed 5/5. Unconditional-quality cost check running (`oovcost`) |
+| H7 | `gradient_accumulation_steps=4` default hurts small data | no quality gain from ga=1 (M2); stops ~6 epochs earlier; hint of more closeness |
+| H8 | OOV: random substitution vs UNK vs UNK + input dropout | 5 seeds done: unk + dropout beats random 5/5, sits at the unconditional floor; random is worse than ignoring the seed 5/5. Cost check done: 3% dropout no measurable cost; 10% delays stopping ~9 epochs. Recommend unk + 3% dropout (not merged) |
 
 ## Hypotheses
 

@@ -675,3 +675,107 @@ dataset with 3 seeds (see the H1 entry); the change is neutral on the
 bundled low-cardinality datasets (M1). It alters default sampling output for
 any model with a column wider than 50 tokens, including `numeric_nparts>=2`.
 Merging into `feat/support-seed-input` is left to the owner.
+
+---
+
+## 2026-09-20 15:43 UTC — H8 cost check: input-side UNK dropout does not measurably hurt unseeded generation at 3%; and the fast decoder reproduces M1's baseline to 4 decimals
+
+Code/data: `research/results/oovcost/` at `9935ab2` (branch
+`exp/oov-unk-dropout`, library change `b8597a8` merged with fast decoding
+`f864173`). 4 datasets x 3 seeds, sensitivity stopping, same regime as M1.
+
+**Question:** Does training with [UNK] dropout (needed to make OOV -> [UNK] work,
+see the 07:29 UTC H8 entry) cost ordinary, unseeded generation quality or
+privacy?
+
+**What was done:** arms `b0` (no dropout, reference), `unkd03`, `unkd10`;
+paired on (dataset, seed), 12 units per arm.
+
+**Result (arm - b0, mean +-s.e.; b0 in brackets):**
+- `unk_dropout=0.03`: `marg_mean` -0.0019 +-0.0025 [0.0808], `tail_err` -0.0010
+  +-0.0039, `assoc_diff` +0.0009 +-0.0008, TSTR -0.0022 +-0.0090, discriminator
+  distance -0.0085 +-0.0095 [0.187], `frac_suspicious` +0.0063 +-0.0044 [0.0477],
+  `exact_dup` 0. Stops 3.0 +-1.3 epochs later (30.7 -> 33.6). No detectable cost.
+- `unk_dropout=0.10`: `marg_mean` -0.0068 +-0.0059, `tail_err` -0.0123 +-0.0075
+  (9 better/3 worse), discriminator distance -0.0457 +-0.0152 (9/3, ~3 s.e.),
+  TSTR +0.0017 +-0.0058, but `frac_suspicious` +0.0142 +-0.0065 (3 better/9
+  worse, ~2.2 s.e.) and stops 9.4 +-1.5 epochs later (30.7 -> 40.1).
+- **Full-pipeline equivalence of the fast decoder:** `b0/default` here (trained
+  and sampled with the vectorised constraint) reproduces M1's `base/default`
+  (trained and sampled with the per-row callback) to four decimals on every
+  metric (e.g. `marg_mean` 0.0808, `assoc_diff` 0.0212, TSTR 0.7529,
+  `frac_suspicious` 0.0477) and in mean stopping epoch (30.6888). This is a
+  much stronger check than the unit tests: same seeds, 12 complete
+  train-stop-sample-score pipelines, identical results. Only wall-clock differs
+  (mean `fit_s` 851 -> 326, but the two ran at different machine loads, so that
+  ratio is not a controlled benchmark).
+
+**Implication:** At 3% the OOV fix costs nothing measurable and captures almost
+all of its benefit (distance to marginal 0.047 vs 0.041 at 10%, floor 0.039). At
+10% dropout acts as a regulariser that delays sensitivity stopping by ~9 epochs
+and comes with a hint (2.2 s.e., one of ~20 comparisons) of more suspiciously
+close rows; not recommended as a default. Recommendation to the owner:
+`oov_strategy="unk"` with `unk_dropout=0.03`. Not merged; the change alters
+training for every model (adds a collator), so it stays a proposal.
+
+---
+
+## 2026-09-20 15:45 UTC — M2: a much smaller model gives a large fidelity gain at flat utility and flat privacy metrics; higher learning rate is worse; grad-accum 1 gives no quality gain
+
+Code/data: `research/results/{m2a,m2b,m2c}/` at `dc326e8` (paired against M1's
+`base/default`, same 12 dataset x seed units). Provenance: the 41 `m2a` jobs
+ran on the old per-row-callback sampler; `m2b`/`m2c` (19 jobs) on the
+vectorised decoder -- shown identical in the entry above. Sampling uses HF's
+default `top_k=50` throughout (comparable with M1). GPT2 config differs only in
+the listed fields; LR arms use `warmup_steps=0.05` (the installed transformers
+rejects `warmup_ratio`, which the library would silently have dropped).
+
+**Question:** H3 (is the default 768-wide x 6-layer GPT2, 43.5M parameters, too
+big for these tables?), H4 (does a higher learning rate + warmup help?), H7 (does
+`gradient_accumulation_steps=1` help?).
+
+**What was done:** 5 arms x 4 datasets x 3 seeds under the standard sensitivity
+regime with a 300-epoch ceiling. `small` = 256d/8 heads/4 layers, `tiny` =
+128d/4/3, `lr3e4`, `lr1e4`, `ga1`.
+
+**Result (arm - base, mean +-s.e., wins/losses of 12; base in brackets):**
+- **H3 model size -- large, consistent effect.** `tiny`: `marg_mean` 0.0808 ->
+  0.0288 (-0.0520 +-0.0064, 12/0), `tail_err` -0.0355 +-0.0103 (12/0), discriminator
+  distance from 0.5 0.187 -> 0.032 (-0.155 +-0.019, 12/0; AUC ~0.53 vs ~0.69),
+  `assoc_diff` -0.0034 +-0.0017 (8/4). `small`: `marg_mean` -0.0325 +-0.0055
+  (12/0), discriminator distance -0.113 +-0.021 (11/1). Downstream TSTR
+  unchanged (`tiny` +0.009 +-0.009, `small` +0.005 +-0.006). Privacy metrics
+  flat: `frac_suspicious` `tiny` -0.002 +-0.004 (5/6), `small` +0.008 +-0.007;
+  `exact_dup` 0; DCR ratio ~1.00.
+- **The caveat that matters:** smaller models train far longer before the
+  sensitivity rule stops them -- `small` 114 epochs, `tiny` 293 on average
+  against a 300-epoch ceiling, i.e. `tiny` almost always ran to the ceiling
+  (base: 31). So (a) size and training length are confounded in this matrix;
+  (b) the tool's overfitting protection essentially never fired for `tiny`, yet
+  the DCR-based privacy metrics stayed flat; (c) `tiny`'s `marg_mean` (0.029) is
+  *below* the real-held-out-vs-train floor (mean 0.043): its output is closer to
+  the training data than unseen real data is -- not by itself evidence of
+  copying (exact duplicates 0, DCR ratio 1.007) but a reason for care; (d) it
+  costs wall-clock (`fit_s` roughly 4x, confounded by machine load).
+- **H4 learning rate -- prediction refuted.** `lr3e4`+warmup: `marg_mean` +0.0084
+  +-0.0076 (3 better/9 worse), `assoc_diff` +0.0029 +-0.0014, TSTR -0.0176 +-0.0107,
+  `frac_suspicious` +0.0109 +-0.0050; `lr1e4`: `marg_mean` +0.0144 +-0.0062 (3/9),
+  `assoc_diff` +0.0042 +-0.0016 (1/11). The default 5e-5 is not under-training
+  these models; higher LR is slightly worse and did not stop earlier.
+- **H7 `gradient_accumulation_steps=1` -- no quality gain.** `marg_mean` -0.0034
+  +-0.0059, `tail_err` -0.0133 +-0.0170 (neither detectable), `assoc_diff` +0.0021
+  +-0.0015 (2/10 worse), TSTR -0.0094 +-0.0104; `frac_suspicious` +0.0164 +-0.0070
+  (2 better/9 worse, ~2.3 s.e.). It stops ~6 epochs earlier (30.7 -> 24.7) since
+  it takes 4x more updates per epoch. This does not support the earlier
+  suggestion (status doc) that accumulation, via batch size, is why "small
+  batches seem to work better" for quality.
+
+**Implication:** Model size is the first lever in this program with a large,
+uniform effect (12/0 on the headline fidelity metrics), at flat downstream
+utility and flat privacy proxies. Not yet safe to recommend as a default:
+(1) size vs training-length must be separated (planned M3: `tiny` capped at 30
+epochs, `tiny` at 600, a smaller `micro`, `tiny` + higher LR); (2) it must be
+confirmed on the two held-out datasets (wilt, churn2) that were kept back for
+exactly this; (3) the memorisation caution above needs a direct check beyond DCR
+(e.g. nearest-neighbour rank against held-out rows). Learning rate and
+gradient accumulation stay at their defaults on this evidence.
