@@ -1,0 +1,1 @@
+{"dataset": "abalone", "arm": "default", "seed": 2, "epochs": 120, "every": 5, "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/results/s1/abalone__default__s2.json", "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/tmp/s1_abalone_default_2"}

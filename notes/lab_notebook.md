@@ -722,6 +722,8 @@ training for every model (adds a collator), so it stays a proposal.
 
 ## 2026-09-20 15:45 UTC — M2: a much smaller model gives a large fidelity gain at flat utility and flat privacy metrics; higher learning rate is worse; grad-accum 1 gives no quality gain
 
+**Partly superseded -- see the 2026-09-20 21:01 UTC entry below: the default model's LOADED checkpoint was epoch 5-16, not its stopping epoch, so the size comparison below was against an under-trained baseline. Original content unchanged.**
+
 Code/data: `research/results/{m2a,m2b,m2c}/` at `dc326e8` (paired against M1's
 `base/default`, same 12 dataset x seed units). Provenance: the 41 `m2a` jobs
 ran on the old per-row-callback sampler; `m2b`/`m2c` (19 jobs) on the
@@ -835,3 +837,157 @@ Known limits of what was adopted: OOV was tested on one column of one dataset
 with three distinct held-out levels; the [UNK]-dropout collator is v1 only; with
 `train_size < 1` eval loss is computed with dropout too (documented in the
 collator).
+
+---
+
+## 2026-09-20 19:48 UTC — M3: the M2 effect is "a small model trained to convergence", not size alone; it replicates on held-out wilt/churn2; direct memorisation check (M4) now running
+
+**Partly superseded -- see the 2026-09-20 21:01 UTC entry below: the default model's LOADED checkpoint was epoch 5-16, not its stopping epoch, so the size comparison below was against an under-trained baseline. Original content unchanged.**
+
+Code/data: `research/results/m3` (48 jobs) and `m3h` (18 jobs) at `c3876f5`. Provenance:
+both ran with the OLD library settings (`unk_dropout=0`, `oov_strategy="random"`,
+HF `top_k=50`) on the vectorised decoder, i.e. comparable with M1/M2; in `m3h`
+`b0` is the legacy default model. Paired against M1's `base/default` (dev, 12
+units) and against `b0` (held-out, 6 units).
+
+**Question:** Is the M2 fidelity gain about model size, or about how long the small
+model trains (it ran to the 300-epoch ceiling while the default stops near epoch
+30)? And does it hold on datasets kept back for exactly this?
+
+**What was done:** Dev, 4 datasets x 3 seeds: `tiny_e30` (128d/3L capped at ~30
+epochs, matching base), `tiny_e600`, `micro_e600` (64d/2L), `tiny_lr3e4`
+(lr 3e-4, 5% warmup). Held-out wilt and churn2 x 3 seeds: `b0`, `small`, `tiny`.
+
+**Result (dev; arm - base, mean +-s.e., wins/losses of 12; M2's `tiny` for reference):**
+- **Equal epochs, small model is far worse.** `tiny_e30`: TSTR 0.318 vs 0.753,
+  `assoc_diff` 0.109 vs 0.021, `tail_err` 0.162 vs 0.059, discriminator distance
+  0.394 vs 0.187 (AUC ~0.89), DCR ratio 1.90 -- under-trained, and far from the
+  training data (`frac_suspicious` 0.012), not private-by-quality. Only
+  `marg_mean` improves (0.055 vs 0.081, 11/1). So size alone does not explain M2.
+- **More training than `tiny` at 300 does not help.** `tiny_e600` (sensitivity
+  stopping fired at epoch 429 on average): `marg_mean` 0.0325 vs `tiny`'s 0.0288,
+  discriminator distance 0.037 vs 0.032; `frac_suspicious` +0.0116 +-0.0043 vs
+  base (1 better/9 worse, ~2.7 s.e.) -- a little more closeness with longer training.
+- **Too small loses ground.** `micro_e600` (hit the 600 ceiling): best `marg_mean`
+  (0.0240, -0.057 +-0.006, 12/0) but `assoc_diff` +0.0066 +-0.0029 (4/8),
+  TSTR -0.012 +-0.008, discriminator distance 0.125 (`tiny`: 0.032).
+- **A higher learning rate gets most of the way in a third of the epochs.**
+  `tiny_lr3e4`: 109 epochs (`tiny`: 293), `marg_mean` 0.0471 (-0.034 +-0.006, 12/0),
+  discriminator distance 0.068 (-0.119 +-0.021, 12/0), `assoc_diff` -0.0026 +-0.0014,
+  TSTR +0.006, `frac_suspicious` +0.0025 +-0.0032; mean `fit_s` 490 vs base 851
+  (load-confounded). Less good than `tiny` (0.029) but cheaper.
+- **Held-out confirmation (wilt, churn2; 6 units, vs `b0`).** `tiny`: `marg_mean`
+  0.0424 -> 0.0187 (-0.0237 +-0.0061, 6/0), `assoc_diff` 0.0165 -> 0.0096
+  (-0.0069 +-0.0023, 5/1), discriminator distance 0.103 -> 0.013 (-0.090 +-0.016,
+  6/0; AUC ~0.51), TSTR +0.007 +-0.004 (5/1), `frac_suspicious` -0.004 +-0.004,
+  `exact_dup` 0; ran to ~301 epochs, `fit_s` +2,488 +-354. `small`: `marg_mean`
+  -0.0075 +-0.0050 (5/1), discriminator distance -0.044 +-0.021 (5/1), rest
+  undetectable. `tail_err` unchanged for both. `tiny` reaches the real-vs-real
+  floor on `marg_mean` (churn2 0.017 vs floor 0.017; wilt 0.020 vs 0.025).
+
+**Implication:** The mechanism reads as follows: the default large model is stopped
+by the sensitivity rule near epoch 30 -- when its memorisation signal fires --
+while its data is still easy to tell from real (AUC ~0.69 dev, ~0.60 held-out); a
+small model learns slowly, needs hundreds of epochs, never trips that rule, and
+ends with much better fidelity at unchanged downstream utility and unchanged
+distance-based privacy proxies. This replicates out of sample. Costs: roughly
+3-4x wall-clock for `tiny` (less for the higher-LR variant). Still open, and the
+reason this is not yet a recommendation: (1) the stopping rule that protects the
+default model is not what limits the small one, so privacy rests on proxies
+(`frac_suspicious`, DCR ratio, exact duplicates) -- M4 adds a direct check,
+`dcr_share` (share of synthetic rows whose nearest real neighbour is a training
+row rather than an equal-size held-out set; calibrated: a copy of the training
+rows scores 1.000, fresh real rows ~0.5); (2) 6 datasets, all small (768-10,000
+rows). If M4 is clean the natural form is an opt-in preset (`tabular_config` +
+epochs guidance), not a change to the default model.
+
+---
+
+## 2026-09-20 21:01 UTC — CORRECTION: the default recipe loads an epoch 5-16 checkpoint, far earlier than where it stops; against a fair checkpoint most of M2/M3's "small model" discriminator advantage disappears (6 runs; M5 running to settle it)
+
+Code/data: `research/loaded_epoch.py`, `research/ckpt_compare.py`,
+`research/results/loaded/` (6 fits: diabetes and insurance x seeds 0-2), pushed on
+`exp/utility-optimization`. Legacy settings (`unk_dropout=0`, `oov_strategy="random"`,
+`top_k=50`), teacher-forced target, as M1-M3.
+
+**Question:** M1-M3 recorded where training STOPPED (~epoch 30 for the default
+model). M3's interpretation was that the default model "is stopped by the
+sensitivity rule near epoch 30 while its data is still easy to tell from real
+(AUC ~0.69)". But the recommended recipe also passes
+`load_from_best_mean_sensitivity=True`, which does not load the stopping weights.
+Which checkpoint does it load, and how good is it?
+
+**What was done:** Read the critic loop: that option loads the checkpoint whose
+critic sensitivity is CLOSEST TO THE MEAN of the bootstrap null (`mean_best`), out of
+the checkpoints saved every 5 epochs. One fit leaves four checkpoints on disk; I
+loaded each into the same fitted pipeline and scored it with the bench protocol.
+
+**Result (6 runs; each row is the mean over runs; paired s.e. vs `mean_best`):**
+
+| checkpoint | mean epoch | `marg_mean` | discriminator AUC | TSTR | `dcr_share` |
+|---|---|---|---|---|---|
+| `mean_best` (what the recipe loads) | 9.5 | 0.090 | 0.691 | 0.812 | 0.517 |
+| `best_disc` (latest under threshold) | 20.8 | 0.077 | 0.579 | 0.830 | 0.543 |
+| `last_epoch` (weights at stopping) | 31.2 | 0.062 | 0.499 | 0.829 | 0.545 |
+
+- The recipe loaded epochs 5.3, 5.3, 15.8, 10.3, 10.3, 10.3 while training stopped at
+  epochs 31.6, 26.3, 31.6, 36.1, 30.9, 30.9.
+- `last_epoch` vs `mean_best`, paired: `marg_mean` -0.029 +-0.008 (5 better/1 worse),
+  discriminator distance from 0.5 -0.156 +-0.029 (6/0), TSTR +0.017 +-0.011,
+  `assoc_diff` +0.008 +-0.003 (1 better/5 worse), `dcr_share` +0.028 +-0.026 (1/5).
+- So the discriminator gap I attributed to the default model in M2/M3 (AUC ~0.69) is
+  essentially the effect of the checkpoint the recipe loads; the same trajectory at
+  its own stopping epoch is at AUC ~0.50.
+
+**Implication:** (1) M2/M3's headline "small model reaches AUC ~0.53 vs the default's
+0.69" compared a small model that trained to convergence against a default model
+handicapped by its own checkpoint rule; the size effect on the DISCRIMINATOR is
+therefore overstated, and the remaining size effect (marginals, associations) must be
+re-measured against a fair baseline. The same rule also chose the small model's
+checkpoint in M2/M3, so those arms are not clean either. (2) The recommended recipe
+(`load_from_best_mean_sensitivity=True`, per DECISION_LOG) trades a lot of fidelity
+for a lower `dcr_share` (0.517 vs 0.545, within noise at 154-268 test rows) -- the
+privacy proxy is not measurably better while the fidelity cost is large. (3) M5
+(`research/m5.py`: default vs small model x all four checkpoint rules, 4 dev + 2
+held-out datasets x 3 seeds, 36 fits) is running to settle size vs selection rule.
+Not yet a recommendation; the checkpoint rule may be the cheapest large win in the
+whole program, but it rests on 6 runs from 2 datasets so far.
+
+---
+
+## 2026-09-20 21:59 UTC — c1 (fixed-epoch learning curves): EMA weights are a free gain (H16 confirmed); constraint-aware loss trains ~2x faster to the same ceiling; label smoothing minor; batch 32 = batch 8 x 4 on quality
+
+Code/data: `research/curves.py`, `research/results/c1` at `141973b`. Protocol: plain training (no stopping rule)
+to 100 epochs, checkpoint every 10, on diabetes / insurance / abalone x seeds 0-2 (9 paired units), small GPT2
+(128d/4h/3L, lr 3e-4, 5% warmup), legacy settings, no teacher forcing. Reference arm `wk`. The EMA copies are
+evaluated on the SAME trajectory as the raw weights (horizons ~1 and ~4 epochs).
+Why fixed epochs rather than the sensitivity regime: the default sensitivity path silently dropped
+`compute_loss_func` (fixed on `exp/constrained-loss`), and stopping noise would otherwise sit on every comparison.
+
+**Question:** H16 (does weight averaging improve the model at a given step?), H17 (does computing the loss under the
+per-column token mask sampling uses speed up learning?), H12 (label smoothing), H13 (does batch 32 x accum 1 match
+batch 8 x accum 4 on quality?).
+
+**Result (paired on 9 units; mean +-s.e.; wins/losses; lower better except TSTR):**
+- **H16 EMA (horizon ~1 epoch) vs raw weights, same step.** epoch 30: `marg_mean` -0.0179 +-0.0033 (8/1),
+  discriminator distance -0.0495 +-0.0080 (9/0), held-out NLL -0.160 (9/0), `assoc_diff` +0.0022 +-0.0012 (2 better/7 worse);
+  epoch 50: `marg_mean` -0.0177 +-0.0033 (9/0), NLL -0.140 (9/0); epoch 100: no difference (converged). The EMA copy reaches
+  the raw weights' FINAL marginal error at a median of epoch 30 vs 100 (in 89% of runs); best `marg_mean` along the curve
+  0.0229 vs 0.0255. `dcr_share` within +-0.008 at every epoch. Horizon ~4 epochs: same gain from epoch 30 on but much worse
+  at epoch 10 (TSTR -0.227 +-0.083, 0/9): the average lags while weights are still moving fast. Costs no extra training.
+- **H17 constraint-aware loss vs standard.** epoch 10: `assoc_diff` -0.0297 +-0.0023 (9/0), discriminator distance -0.155
+  +-0.014 (9/0), TSTR +0.145 +-0.044 (7/2), NLL -0.92 (9/0); epoch 30: discriminator distance -0.034 (9/0), `marg_mean`
+  -0.008 (6/3); epoch 50: `marg_mean` -0.013 +-0.003 (9/0) but discriminator distance +0.021 (3/6), held-out NLL +2.1 (0/9).
+  Reaches the reference's final `marg_mean` at a median of epoch 50 vs 100; best along curve 0.0240 vs 0.0255. The ceiling
+  is not raised and it overfits sooner. Adding label smoothing (0.05) to it hurts TSTR from epoch 30 (-0.065 to -0.082, 1/8): dropped.
+- **H12 HF label smoothing 0.05 alone.** small, consistent mid-curve gains (epoch 10 discriminator distance -0.034, 9/0;
+  epoch 50 `marg_mean` -0.006, 8/1; `dcr_share` +0.024 +-0.010 at epoch 50); none at epoch 100. Not a lever.
+- **H13 batch 32 x accum 1 vs batch 8 x accum 4** (same effective batch): no difference in any metric at any epoch
+  (`marg_mean` within +-0.001). The speed side needs the throughput benchmark (`research/bench_train_speed.py`), not yet run.
+
+**Implication:** Two independent, cheap ways to reach a given fidelity in fewer epochs: EMA (~3x, free) and the
+constrained loss (~2x, opt-in, needs a stopping rule because it overfits sooner); neither raises the ceiling. They are
+untested in combination and untested in the real sensitivity regime, where the checkpoint the recipe loads (see the 21:01 UTC
+correction) matters more than the training length. Next: c2 (the remaining Program-2 ideas, each arm with its EMA copy),
+and the real-regime M6 for the loss. Caveats: 3 small datasets; marginal error is the metric that moves, associations and
+TSTR mostly do not; EMA at very early epochs is harmful for long horizons.

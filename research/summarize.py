@@ -22,7 +22,7 @@ import pandas as pd
 METRICS = [  # (column, higher_is_better)
     ("marg_mean", False), ("tail_err", False), ("assoc_diff", False),
     ("tstr", True), ("abs_gap", False), ("disc_dev", False),
-    ("frac_suspicious", False), ("exact_dup", False), ("dcr_ratio", None),
+    ("frac_suspicious", False), ("exact_dup", False), ("dcr_ratio", None), ("dcr_share", None),
     ("stopped_epoch", None), ("fit_s", None),
 ]
 
