@@ -42,7 +42,7 @@ the current status of each idea and points at the raw data.
 | H0 | Harness sanity + seed noise floor (base, 3 seeds) | done (M1): headroom large (disc AUC ~0.69); abalone seed noise larger than predicted |
 | H1 | `top_k=50` HF default silently truncates sampling | CONFIRMED on hicard (tvd_mean 0.142 -> 0.104, 3/3 seeds, no privacy change); no effect on bundled data. ADOPTED on feat/support-seed-input (933e95c) |
 | H2 | Sampling temperature / nucleus | done (M1): T=0.9 and top_p=0.95 clearly worse; T=1.1 mild hint of gain, needs a finer test |
-| H3 | Default GPT2 (768d x 6L) is oversized for small tables | STRONG signal (M2): tiny 128d/3L marg_mean 0.081 -> 0.029, disc AUC ~0.69 -> ~0.53, 12/0, flat TSTR + privacy proxies; confounded with training length (tiny hits the 300-epoch ceiling); M3 to disentangle + confirm on holdout |
+| H3 | Default GPT2 (768d x 6L) is oversized for small tables | Replicates on held-out wilt/churn2 (M3h). Not size alone: tiny capped at 30 epochs is far worse; it is 'small model trained to convergence' (~300 epochs, stopping rule never fires). lr 3e-4 gets most of it in ~110 epochs. Memorisation check M4 (`dcr_share`) running; if clean, propose an opt-in preset, not a new default |
 | H4 | Default LR (5e-5, no warmup) under-trains; higher LR + warmup helps | REFUTED (M2): 1e-4 and 3e-4 slightly worse |
 | H5 | Re-check quantile encoding win with multiple seeds | done (M1): no overall gain; helps skewed marginals, worsens `frac_suspicious` on all 4 datasets -- not recommended by default; artifact-vs-copying question open |
 | H6 | Fewer tokens per numeric column (`numeric_nparts=2`) | planned |

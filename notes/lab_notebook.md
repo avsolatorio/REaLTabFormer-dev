@@ -835,3 +835,64 @@ Known limits of what was adopted: OOV was tested on one column of one dataset
 with three distinct held-out levels; the [UNK]-dropout collator is v1 only; with
 `train_size < 1` eval loss is computed with dropout too (documented in the
 collator).
+
+---
+
+## 2026-09-20 19:48 UTC — M3: the M2 effect is "a small model trained to convergence", not size alone; it replicates on held-out wilt/churn2; direct memorisation check (M4) now running
+
+Code/data: `research/results/m3` (48 jobs) and `m3h` (18 jobs) at `c3876f5`. Provenance:
+both ran with the OLD library settings (`unk_dropout=0`, `oov_strategy="random"`,
+HF `top_k=50`) on the vectorised decoder, i.e. comparable with M1/M2; in `m3h`
+`b0` is the legacy default model. Paired against M1's `base/default` (dev, 12
+units) and against `b0` (held-out, 6 units).
+
+**Question:** Is the M2 fidelity gain about model size, or about how long the small
+model trains (it ran to the 300-epoch ceiling while the default stops near epoch
+30)? And does it hold on datasets kept back for exactly this?
+
+**What was done:** Dev, 4 datasets x 3 seeds: `tiny_e30` (128d/3L capped at ~30
+epochs, matching base), `tiny_e600`, `micro_e600` (64d/2L), `tiny_lr3e4`
+(lr 3e-4, 5% warmup). Held-out wilt and churn2 x 3 seeds: `b0`, `small`, `tiny`.
+
+**Result (dev; arm - base, mean +-s.e., wins/losses of 12; M2's `tiny` for reference):**
+- **Equal epochs, small model is far worse.** `tiny_e30`: TSTR 0.318 vs 0.753,
+  `assoc_diff` 0.109 vs 0.021, `tail_err` 0.162 vs 0.059, discriminator distance
+  0.394 vs 0.187 (AUC ~0.89), DCR ratio 1.90 -- under-trained, and far from the
+  training data (`frac_suspicious` 0.012), not private-by-quality. Only
+  `marg_mean` improves (0.055 vs 0.081, 11/1). So size alone does not explain M2.
+- **More training than `tiny` at 300 does not help.** `tiny_e600` (sensitivity
+  stopping fired at epoch 429 on average): `marg_mean` 0.0325 vs `tiny`'s 0.0288,
+  discriminator distance 0.037 vs 0.032; `frac_suspicious` +0.0116 +-0.0043 vs
+  base (1 better/9 worse, ~2.7 s.e.) -- a little more closeness with longer training.
+- **Too small loses ground.** `micro_e600` (hit the 600 ceiling): best `marg_mean`
+  (0.0240, -0.057 +-0.006, 12/0) but `assoc_diff` +0.0066 +-0.0029 (4/8),
+  TSTR -0.012 +-0.008, discriminator distance 0.125 (`tiny`: 0.032).
+- **A higher learning rate gets most of the way in a third of the epochs.**
+  `tiny_lr3e4`: 109 epochs (`tiny`: 293), `marg_mean` 0.0471 (-0.034 +-0.006, 12/0),
+  discriminator distance 0.068 (-0.119 +-0.021, 12/0), `assoc_diff` -0.0026 +-0.0014,
+  TSTR +0.006, `frac_suspicious` +0.0025 +-0.0032; mean `fit_s` 490 vs base 851
+  (load-confounded). Less good than `tiny` (0.029) but cheaper.
+- **Held-out confirmation (wilt, churn2; 6 units, vs `b0`).** `tiny`: `marg_mean`
+  0.0424 -> 0.0187 (-0.0237 +-0.0061, 6/0), `assoc_diff` 0.0165 -> 0.0096
+  (-0.0069 +-0.0023, 5/1), discriminator distance 0.103 -> 0.013 (-0.090 +-0.016,
+  6/0; AUC ~0.51), TSTR +0.007 +-0.004 (5/1), `frac_suspicious` -0.004 +-0.004,
+  `exact_dup` 0; ran to ~301 epochs, `fit_s` +2,488 +-354. `small`: `marg_mean`
+  -0.0075 +-0.0050 (5/1), discriminator distance -0.044 +-0.021 (5/1), rest
+  undetectable. `tail_err` unchanged for both. `tiny` reaches the real-vs-real
+  floor on `marg_mean` (churn2 0.017 vs floor 0.017; wilt 0.020 vs 0.025).
+
+**Implication:** The mechanism reads as follows: the default large model is stopped
+by the sensitivity rule near epoch 30 -- when its memorisation signal fires --
+while its data is still easy to tell from real (AUC ~0.69 dev, ~0.60 held-out); a
+small model learns slowly, needs hundreds of epochs, never trips that rule, and
+ends with much better fidelity at unchanged downstream utility and unchanged
+distance-based privacy proxies. This replicates out of sample. Costs: roughly
+3-4x wall-clock for `tiny` (less for the higher-LR variant). Still open, and the
+reason this is not yet a recommendation: (1) the stopping rule that protects the
+default model is not what limits the small one, so privacy rests on proxies
+(`frac_suspicious`, DCR ratio, exact duplicates) -- M4 adds a direct check,
+`dcr_share` (share of synthetic rows whose nearest real neighbour is a training
+row rather than an equal-size held-out set; calibrated: a copy of the training
+rows scores 1.000, fresh real rows ~0.5); (2) 6 datasets, all small (768-10,000
+rows). If M4 is clean the natural form is an opt-in preset (`tabular_config` +
+epochs guidance), not a change to the default model.
