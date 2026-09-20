@@ -786,6 +786,35 @@ def test_make_dataset_end_to_end_with_seed_matches_manual_vectorized_call():
     assert dataset[0]["input_ids"][-1] == vocab["token2id"][du.SpecialTokens.EOS]
 
 
+def test_oov_strategy_unk_maps_unseen_values_to_unk_token():
+    # `vocab["oov_strategy"] == "unk"` must send every unseen value to the
+    # [UNK] token, in both the scalar and the batched encoder; the default
+    # keeps the historical random-token-of-that-column behaviour.
+    ddf, vocab = _make_perf_test_vocab(n_rows=40, n_cols=3, seed=7)
+    columns = list(ddf.columns)
+    processed_df = ddf.astype(str)
+    processed_df.columns = columns
+    processed_df.loc[:9, columns[0]] = "__never_seen__"
+    unk_id = vocab["token2id"][du.SpecialTokens.UNK]
+
+    unk_vocab = {**vocab, "oov_strategy": "unk"}
+    ds = du.make_dataset(processed_df, unk_vocab, mask_rate=0, seed=1)
+    first_col = [row["input_ids"][1] for row in ds]  # index 0 is BOS
+    assert first_col[:10] == [unk_id] * 10
+    assert unk_id not in first_col[10:]
+
+    scalar = du.get_input_ids(
+        {c: "__never_seen__" if c == columns[0] else processed_df[c].iloc[20] for c in columns},
+        unk_vocab, columns, mask_rate=0.0,
+    )
+    assert scalar["input_ids"][1] == unk_id
+
+    default_ds = du.make_dataset(processed_df, vocab, mask_rate=0, seed=1)
+    default_first = [row["input_ids"][1] for row in default_ds][:10]
+    assert unk_id not in default_first
+    assert set(default_first) <= set(vocab["column_token_ids"][columns[0]])
+
+
 # --- REaLTabFormerV2-only: build_pooled_vocab / make_dataset_with_column_types
 # (see /Users/avsolatorio/.claude/plans/snappy-swimming-hickey.md). v1's
 # build_vocab/make_dataset are untouched by any of this.

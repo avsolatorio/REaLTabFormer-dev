@@ -47,7 +47,7 @@ from .rtf_cusum import (
     CUSUMOverfittingMonitor,
     CUSUMTrainer,
 )
-from .rtf_datacollator import RelationalDataCollator
+from .rtf_datacollator import RelationalDataCollator, UnkDropoutCollator
 from .rtf_exceptions import SampleEmptyLimitError
 from .rtf_shared import (
     SharedModelMixin,
@@ -84,6 +84,8 @@ class REaLTabFormer(SharedModelMixin):
         numeric_quantile_encoding: bool = False,
         numeric_quantile_bins: int = 1000,
         grokfast_args: Optional[Dict[str, Any]] = None,
+        unk_dropout: float = 0.0,
+        oov_strategy: str = "random",
         **training_args_kwargs,
     ) -> None:
         """Set up a REaLTabFormer instance.
@@ -281,6 +283,10 @@ class REaLTabFormer(SharedModelMixin):
         self.numeric_categorical_threshold = numeric_categorical_threshold
         self.numeric_quantile_encoding = numeric_quantile_encoding
         self.numeric_quantile_bins = numeric_quantile_bins
+        assert oov_strategy in ("random", "unk"), oov_strategy
+        assert 0.0 <= unk_dropout < 1.0, unk_dropout
+        self.unk_dropout = unk_dropout
+        self.oov_strategy = oov_strategy
 
         # A unique identifier for the experiment set after the
         # model is trained.
@@ -1524,6 +1530,8 @@ class REaLTabFormer(SharedModelMixin):
             compute_chunk_significance=digit_entropy_weighting,
             chunk_significance_floor=digit_entropy_weight_floor,
         )
+        # Persisted with the vocab, so a loaded model keeps its OOV policy.
+        self.vocab["oov_strategy"] = self.oov_strategy
         self.tabular_col_size = df.shape[0]
         chunk_significance_weights = (
             self.vocab.get("chunk_significance_weights")
@@ -1669,13 +1677,26 @@ class REaLTabFormer(SharedModelMixin):
             ]
 
         assert self.dataset
+        data_collator = None  # Use the default_data_collator
+        if getattr(self, "unk_dropout", 0.0) > 0:
+            t2i = self.vocab["token2id"]
+            data_collator = UnkDropoutCollator(
+                unk_id=t2i[SpecialTokens.UNK],
+                rate=self.unk_dropout,
+                protected_ids=tuple(
+                    t2i[t]
+                    for t in (SpecialTokens.BOS, SpecialTokens.EOS, SpecialTokens.PAD,
+                              SpecialTokens.RMASK, SpecialTokens.UNK)
+                ),
+            )
+
         trainer_class = trainer_cls or ResumableTrainer
         trainer = trainer_class(
             target_epochs=target_epochs,
             save_epochs=None,
             model=self.model,
             args=_build_training_args(TrainingArguments, training_args_kwargs),
-            data_collator=None,  # Use the default_data_collator
+            data_collator=data_collator,
             callbacks=callbacks,
             compute_loss_func=compute_loss_func,
             grokfast_args=self.grokfast_args,

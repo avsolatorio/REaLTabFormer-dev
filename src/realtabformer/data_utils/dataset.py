@@ -40,6 +40,21 @@ def get_token_id(
     return token_id
 
 
+def _resolve_col_oov(vocab: Dict) -> Dict[str, List[int]]:
+    """Per-column OOV fallback token pools for encoding.
+
+    Default (`vocab["oov_strategy"]` absent or "random"): an unseen value
+    is replaced by a random token of that column (historical behaviour).
+    "unk": empty pools, so every unseen value deterministically maps to the
+    [UNK] token -- both `get_token_id` and `_vectorized_column_token_ids`
+    fall through to UNK when a column's pool is empty, so this one switch
+    covers the scalar and the batched encoders alike.
+    """
+    if vocab.get("oov_strategy", "random") == "unk":
+        return {k: [] for k in vocab["column_token_ids"]}
+    return vocab["column_token_ids"]
+
+
 def _field_weight(col_name: str, field_weights: Optional[Dict[str, float]]) -> float:
     if field_weights is None:
         return 1.0
@@ -387,7 +402,7 @@ def make_dataset_with_column_types(
 
     columns = list(df.columns)
     token2id = vocab["token2id"]
-    col_oov = vocab["column_token_ids"]
+    col_oov = _resolve_col_oov(vocab)
     column_type_ids = vocab["column_type_ids"]
     numeric_like_columns = {
         c for c in columns if is_numeric_col(c) or is_datetime_col(c)
@@ -464,7 +479,7 @@ def get_input_ids(
     )
 
     token2id = vocab["token2id"]
-    col_oov = vocab["column_token_ids"]
+    col_oov = _resolve_col_oov(vocab)
     bos_id = token2id[SpecialTokens.BOS]
     eos_id = token2id[SpecialTokens.EOS]
 

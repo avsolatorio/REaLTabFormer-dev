@@ -203,3 +203,37 @@ class AnyOrderColumnCollator:
             batch[k][:, 1:-1] = torch.gather(batch[k][:, 1:-1], 1, gather_index)
 
         return batch
+
+
+@dataclass
+class UnkDropoutCollator:
+    """Default collator + input-side [UNK] dropout, redrawn every batch.
+
+    Each non-special *input* token is replaced by `unk_id` with probability
+    `rate`; `labels` are left untouched, so the model still has to predict
+    the true token while seeing [UNK] in its context. This is what makes
+    the [UNK] embedding a *trained* "value unknown -- rely on the other
+    columns" signal instead of an untrained random vector, which is the
+    prerequisite for mapping out-of-vocabulary seed values to [UNK] at
+    inference. (`mask_rate`, by contrast, is applied once when the dataset
+    is built, so the same tokens are masked in every epoch.)
+
+    Note the Trainer reuses its collator for evaluation, so with
+    `train_size < 1` the eval loss is computed with dropout too.
+    """
+
+    unk_id: int
+    rate: float
+    protected_ids: tuple = ()
+
+    def __call__(self, features):
+        from transformers import default_data_collator
+
+        batch = default_data_collator(features)
+        ids = batch["input_ids"]
+        drop = torch.rand(ids.shape, device=ids.device) < self.rate
+        drop[:, 0] = False  # never touch the leading BOS
+        if self.protected_ids:
+            drop &= ~torch.isin(ids, torch.tensor(self.protected_ids, device=ids.device))
+        batch["input_ids"] = ids.masked_fill(drop, self.unk_id)
+        return batch
