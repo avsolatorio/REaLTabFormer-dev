@@ -1,4 +1,5 @@
 """This suite tests for the rtf_sampler.py module."""
+import pandas as pd
 import torch
 import fixtures as fx
 
@@ -240,3 +241,86 @@ def test_default_sampling_reaches_columns_wider_than_hf_top_k(tmp_path):
 
     assert default["wide"].nunique() > 50
     assert capped["wide"].nunique() <= 50  # the old default's ceiling
+
+
+# --- Seeding with a value never seen in training (oov_strategy="unk") ------
+
+
+def _oov_model(tmp_path, **kwargs):
+    import numpy as np
+    import pandas as pd
+    from transformers import GPT2Config
+
+    from realtabformer import REaLTabFormer
+
+    rng = np.random.default_rng(0)
+    # `b` (0..49, two digits) first so it can be a seed prefix; `a` second.
+    df = pd.DataFrame(
+        {
+            "b": rng.integers(0, 50, 300),
+            "a": rng.choice(list("xyz"), 300),
+            "c": rng.choice(["p", "q"], 300),
+        }
+    )
+    model = REaLTabFormer(
+        model_type="tabular",
+        epochs=1,
+        batch_size=16,
+        checkpoints_dir=str(tmp_path / "ckpt"),
+        tabular_config=GPT2Config(n_layer=1, n_embd=32, n_head=2),
+        **kwargs,
+    )
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.fit(df, device=device, n_critic=0)
+    return model, df, device
+
+
+def test_oov_defaults_and_vocab_flag(tmp_path):
+    from realtabformer import REaLTabFormer
+
+    m = REaLTabFormer(model_type="tabular")
+    assert m.oov_strategy == "unk" and m.unk_dropout == 0.03
+
+    model, _, _ = _oov_model(tmp_path)
+    assert model.vocab["oov_strategy"] == "unk"  # persisted with the vocab
+
+
+def test_seeded_oov_categorical_value_is_returned_not_unk(tmp_path):
+    model, df, device = _oov_model(tmp_path)
+    out = model.sample(
+        n_samples=8, gen_batch=8, device=device,
+        seed_input={"b": 7, "a": "NEVER_SEEN"},
+    )
+    assert (out["a"] == "NEVER_SEEN").all()  # the caller's value, not "[UNK]"
+    assert (out["b"] == 7).all()  # in-vocab seed value unaffected
+    assert out["c"].isin(["p", "q"]).all()  # the rest is generated normally
+
+
+def test_seeded_oov_numeric_value_keeps_numeric_dtype(tmp_path):
+    # 99: same two-digit width as training (0..49) but its leading digit was
+    # never seen, so that digit token is OOV. Used to come back as the string
+    # "[UNK]9" and turn the whole column into `object`.
+    model, df, device = _oov_model(tmp_path)
+    out = model.sample(n_samples=8, gen_batch=8, device=device, seed_input={"b": 99})
+    assert (out["b"] == 99).all()
+    assert out["b"].dtype == df["b"].dtype
+
+
+def test_sample_with_seed_restores_each_rows_own_oov_value(tmp_path):
+    model, df, device = _oov_model(tmp_path)
+    sampler = TabularSampler.sampler_from_model(model, device=device)
+    seeds = pd.DataFrame({"b": [7, 8], "a": ["x", "NEVER_SEEN"]})
+    out = sampler.sample_tabular_with_seed(seeds, gen_batch=3, device=device)
+    assert len(out) == 6
+    # Seed-row-major output: first 3 rows came from seed 0, last 3 from seed 1.
+    assert out["a"].tolist() == ["x"] * 3 + ["NEVER_SEEN"] * 3
+
+
+def test_random_strategy_still_available_and_old_vocab_keeps_it(tmp_path):
+    model, _, device = _oov_model(tmp_path, oov_strategy="random", unk_dropout=0.0)
+    assert model.vocab["oov_strategy"] == "random"
+    out = model.sample(
+        n_samples=4, gen_batch=4, device=device, seed_input={"b": 7, "a": "NEVER_SEEN"}
+    )
+    # Historical behaviour: silently a random valid level, never [UNK].
+    assert out["a"].isin(list("xyz")).all()

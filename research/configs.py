@@ -11,7 +11,8 @@ Each config is a dict of overrides on the tool's own defaults:
 """
 
 _SAMPLING = {
-    "default": {},  # HF defaults: top_k=50 (verified), temperature=1
+    "default": {},  # library default; was HF top_k=50 before 2026-09-20, now top_k=0
+    "topk50": {"top_k": 50},  # HF's old implicit default, for comparison with earlier results
     "topk0": {"top_k": 0},
     "topk0_t09": {"top_k": 0, "temperature": 0.9},
     "topk0_t11": {"top_k": 0, "temperature": 1.1},
@@ -39,10 +40,20 @@ CONFIGS = {
     # `tiny` (128d/4h/3L) almost always ran to the 300-epoch ceiling in M2, so
     # size and epochs were confounded. Cap it at base's ~30 epochs, extend it,
     # go smaller, and let it use a higher learning rate.
-    "b0": {},
+    # NOTE on meaning after 2026-09-20: the library defaults changed
+    # (unk_dropout 0.03 + oov_strategy "unk", TabularSampler top_k=0), so `{}`
+    # no longer reproduces the earlier matrices. `b0` keeps its historical
+    # meaning explicitly; a sampling variant of `{}` now means top_k=0 (use
+    # "topk50" for HF's old implicit default).
+    "b0": {"init": {"unk_dropout": 0.0, "oov_strategy": "random"}},
     "tiny_e30": {"epochs": 30, "gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3}},
     "tiny_e600": {"epochs": 600, "gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3}},
     "micro_e600": {"epochs": 600, "gpt2": {"n_embd": 64, "n_head": 2, "n_layer": 2}},
     "tiny_lr3e4": {"gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3},
                    "train_args": {"learning_rate": 3e-4, "warmup_steps": 0.05}},
+
+    # ---- OOV cost check (H8): does input-side UNK dropout hurt ordinary
+    # generation? (run before those became the defaults, against b0)
+    "unkd03": {"init": {"unk_dropout": 0.03, "oov_strategy": "unk"}},
+    "unkd10": {"init": {"unk_dropout": 0.10, "oov_strategy": "unk"}},
 }

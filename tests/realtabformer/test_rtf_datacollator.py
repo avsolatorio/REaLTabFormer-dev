@@ -155,3 +155,22 @@ def test_any_order_collator_consecutive_calls_draw_different_permutations():
     batch2 = collator(_make_features(50))
 
     assert not torch.equal(batch1["input_ids"], batch2["input_ids"])
+
+
+def test_unk_dropout_collator_only_touches_unprotected_inputs():
+    import torch
+
+    from realtabformer.rtf_datacollator import UnkDropoutCollator
+
+    collator = UnkDropoutCollator(unk_id=99, rate=0.5, protected_ids=(0, 1))
+    labels = [0, 5, 6, 7, 8, 1]
+    batch = collator([{"input_ids": list(labels), "labels": list(labels)} for _ in range(400)])
+    ids = batch["input_ids"]
+
+    assert (ids[:, 0] == 0).all() and (ids[:, -1] == 1).all()  # BOS/EOS kept
+    assert abs(float((ids[:, 1:5] == 99).float().mean()) - 0.5) < 0.05
+    assert (batch["labels"] == torch.tensor(labels)).all()  # labels untouched
+
+    # rate=0 is a no-op.
+    off = UnkDropoutCollator(unk_id=99, rate=0.0)([{"input_ids": labels, "labels": labels}])
+    assert off["input_ids"].tolist() == [labels]
