@@ -749,3 +749,77 @@ def test_numeric_quantile_encoding_end_to_end_dtype_and_distributional_fidelity(
     # the inverse-transform-sampling theory alone.
     ks_stat, _ = stats.ks_2samp(samples["price"].dropna(), df["price"])
     assert ks_stat < 0.2, f"KS statistic too high: {ks_stat}"
+
+
+def test_any_order_vectorized_constraint_matches_callback():
+    # Any-order sampling swaps in a per-call, seed-dependent column order
+    # (`_active_col_idx_ids`). The vectorised ColumnMaskLogitsProcessor is
+    # built from that same override, so for the same seed both paths must
+    # produce identical tokens and respect the *permuted* column order --
+    # including with a seed prefix that skips earlier columns.
+    import numpy as np
+    import torch
+
+    from realtabformer.data_utils import SpecialTokens
+    from realtabformer.rtf_sampler import TabularSampler
+
+    df = _tiny_df(n_rows=60, seed=23)
+    model = _fit_any_order_model(df)
+    sampler = TabularSampler.sampler_from_model(model, device="cpu")
+    t2i = model.vocab["token2id"]
+
+    seeds = {
+        "last_col_only": pd.DataFrame({"gender": ["m"]}),
+        "middle_col_gap": pd.DataFrame({"age": [float(df["age"].iloc[0])]}),
+        "two_cols_reordered": pd.DataFrame(
+            {"gender": ["f"], "price": [float(df["price"].iloc[1])]}
+        ),
+    }
+
+    def run(seed_input, vectorized):
+        generated, col_idx_ids, type_ids, _ = sampler._process_seed_input(seed_input)
+        TabularSampler.vectorized_constraint = vectorized
+        try:
+            torch.manual_seed(11)
+            out = sampler._generate(
+                device=torch.device("cpu"),
+                as_numpy=True,
+                constrain_tokens_gen=True,
+                col_idx_ids_override=col_idx_ids,
+                col_type_ids_seq_override=type_ids,
+                inputs=generated,
+                do_sample=True,
+                max_length=model.tabular_max_length,
+                num_return_sequences=24,
+                bos_token_id=t2i[SpecialTokens.BOS],
+                pad_token_id=t2i[SpecialTokens.PAD],
+                eos_token_id=t2i[SpecialTokens.EOS],
+                suppress_tokens=None,
+                forced_decoder_ids=None,
+            )
+        finally:
+            TabularSampler.vectorized_constraint = True
+        return out, col_idx_ids
+
+    for name, seed_input in seeds.items():
+        fast, order_ids = run(seed_input, vectorized=True)
+        slow, _ = run(seed_input, vectorized=False)
+        assert np.array_equal(fast, slow), f"{name}: paths diverge"
+        # Every position holds a token valid for the column the *permuted*
+        # order puts there (position 0 is BOS).
+        for step, allowed in order_ids.items():
+            assert np.isin(fast[:, step + 1], allowed).all(), f"{name}: step {step}"
+
+    # Same check end to end through the public API.
+    for name, seed_input in seeds.items():
+        got = {}
+        for vec in (True, False):
+            TabularSampler.vectorized_constraint = vec
+            try:
+                torch.manual_seed(5)
+                got[vec] = model.sample(
+                    n_samples=12, gen_batch=12, device="cpu", seed_input=seed_input
+                )
+            finally:
+                TabularSampler.vectorized_constraint = True
+        pd.testing.assert_frame_equal(got[True], got[False])
