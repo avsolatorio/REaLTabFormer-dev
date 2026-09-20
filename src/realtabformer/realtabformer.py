@@ -84,8 +84,8 @@ class REaLTabFormer(SharedModelMixin):
         numeric_quantile_encoding: bool = False,
         numeric_quantile_bins: int = 1000,
         grokfast_args: Optional[Dict[str, Any]] = None,
-        unk_dropout: float = 0.0,
-        oov_strategy: str = "random",
+        unk_dropout: float = 0.03,
+        oov_strategy: str = "unk",
         **training_args_kwargs,
     ) -> None:
         """Set up a REaLTabFormer instance.
@@ -130,6 +130,21 @@ class REaLTabFormer(SharedModelMixin):
                 fit time per column and frozen (not re-evaluated against a seed_input's smaller
                 slice of the data). `None` (default) preserves today's dtype-only routing. Tabular
                 only for now -- not threaded through relational fitting.
+            unk_dropout: Tabular models only. Probability that each non-special *input* token
+                is replaced by [UNK] at every training step (labels are left intact), so [UNK]
+                becomes a trained "value unknown -- rely on the other columns" signal. This is
+                what makes `oov_strategy="unk"` work: without it [UNK] is an untrained embedding
+                and seeding with an unseen value behaves erratically. Measured (5 seeds, held-out
+                category level): 0.03 costs nothing detectable on unseeded generation and captures
+                almost all of the benefit; 0.10 delays sensitivity stopping by ~9 epochs. `0`
+                turns it off. Ignored by relational models.
+            oov_strategy: How a `seed_input` value that was never seen in training is encoded.
+                `"unk"` (default) maps it deterministically to [UNK]; the model then generates the
+                other columns as if that column were not given, and the returned table holds the
+                value you passed. `"random"` is the historical behaviour: a random token of that
+                column, which silently conditions the output on an arbitrary unrelated value
+                (measured: worse than ignoring the seed on 5 of 5 seeds). The choice is stored
+                with the vocab, so models saved before this option existed keep `"random"`.
             numeric_quantile_encoding: Beta. If True, numeric columns are represented by their
                 quantile position under the column's own empirical distribution (`q = F(x)`,
                 uniform on `[0, 1)` for any continuous shape by the probability integral

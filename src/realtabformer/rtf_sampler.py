@@ -817,6 +817,68 @@ class TabularSampler(REaLSampler):
             column_blocks=getattr(rtf_model, "column_blocks", None),
         )
 
+    def _restore_unk_seed_values(
+        self,
+        synth_df: pd.DataFrame,
+        seed_input: Union[pd.DataFrame, Dict[str, Any]],
+        rows_per_seed: Optional[int] = None,
+    ) -> pd.DataFrame:
+        """Give a seeded column back the caller's own value where it was OOV.
+
+        An unseen seed value is encoded as [UNK] (`oov_strategy="unk"`), the
+        model then generates the other columns as if that column were not
+        given, and the [UNK] token is decoded into the returned table --
+        a literal "[UNK]" string in a categorical column, and a corrupted
+        string like "[UNK]9" (turning the column into `object`) in a numeric
+        one. The API contract for a seeded column is "this column holds the
+        value you passed", so put that value back:
+
+        - `rows_per_seed` given (`sample_tabular_with_seed`, whose output is
+          seed-row-major): each output row takes its own seed row's value.
+        - otherwise (`sample_tabular` shuffles its output, so rows can no
+          longer be tied to a seed row): only when the caller gave a single
+          distinct value for the column is that value unambiguous; with
+          several, the cell is left missing rather than guessed.
+
+        A no-op for in-vocab seeds (no [UNK] can appear: it is not among any
+        column's constrained tokens) and for models that don't use [UNK].
+        """
+        if isinstance(seed_input, dict):
+            seed_df = pd.DataFrame.from_dict({0: seed_input}, orient="index")
+        else:
+            seed_df = seed_input.reset_index(drop=True)
+
+        unk = SpecialTokens.UNK
+        for col in seed_df.columns:
+            if col not in synth_df.columns or synth_df[col].dtype != object:
+                continue
+            is_unk = synth_df[col].astype(str).str.contains(unk, regex=False).to_numpy()
+            if not is_unk.any():
+                continue
+
+            per_row = None
+            if rows_per_seed is not None and len(synth_df) == len(seed_df) * rows_per_seed:
+                per_row = np.repeat(seed_df[col].to_numpy(dtype=object), rows_per_seed)
+            else:
+                uniq = seed_df[col].dropna().unique()
+                per_row = np.array([uniq[0] if len(uniq) == 1 else pd.NA] * len(synth_df), dtype=object)
+
+            values = synth_df[col].to_numpy(dtype=object, copy=True)
+            values[is_unk] = per_row[is_unk]
+            restored = pd.Series(values, index=synth_df.index, name=col)
+            dtype = self.column_dtypes.get(col)
+            for target in (dtype, "Int64" if pd.api.types.is_integer_dtype(dtype) else None):
+                if target is None:
+                    continue
+                try:
+                    restored = restored.astype(target)
+                    break
+                except (TypeError, ValueError):
+                    continue
+            synth_df[col] = restored
+
+        return synth_df
+
     def _constraint_logits_processor(
         self, device: torch.device
     ) -> Optional[LogitsProcessor]:
@@ -1169,6 +1231,9 @@ class TabularSampler(REaLSampler):
         )
         synth_df = synth_df.reset_index(drop="index")
 
+        if seed_input is not None:
+            synth_df = self._restore_unk_seed_values(synth_df, seed_input)
+
         print(
             f"Generated {self.invalid_gen_samples} invalid samples out of total {self.total_gen_samples} samples generated. Sampling efficiency is: {100 * (1 - self.invalid_gen_samples / self.total_gen_samples):.4f}%"
         )
@@ -1256,7 +1321,9 @@ class TabularSampler(REaLSampler):
                         f"The model has generated {synth_sample.shape[0]} samples out of {expected_nout} expected samples!"
                     )
 
-                return synth_sample
+                return self._restore_unk_seed_values(
+                    synth_sample, seed_input, rows_per_seed=gen_batch
+                )
 
             except SampleEmptyError as exc:
                 logging.warning(
