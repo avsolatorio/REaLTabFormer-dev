@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "churn2",
+  "arm": "default_ema",
+  "seed": 1,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/results/m7/churn2__default_ema__s1.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/tmp/m7_churn2_default_ema_1"
+ },
+ "fit_s": 915.4880986213684,
+ "stop_epoch": 35.0,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 10.0,
+   "ks_mean": 0.02245,
+   "tvd_mean": 0.020041666666666662,
+   "marg_mean": 0.021136363636363634,
+   "tail_err": 0.006781272996948048,
+   "assoc_diff": 0.008134552939993598,
+   "trtr": 0.8751229523773327,
+   "tstr": 0.8547634069400631,
+   "util_gap": 0.02035954543726959,
+   "disc_auc": 0.5201765390624999,
+   "dcr_share": 0.4895
+  },
+  "best_disc_model": {
+   "epoch": 25.0,
+   "ks_mean": 0.018900000000000004,
+   "tvd_mean": 0.0174375,
+   "marg_mean": 0.018102272727272727,
+   "tail_err": 0.00752518304709187,
+   "assoc_diff": 0.014297870878792,
+   "trtr": 0.8751229523773327,
+   "tstr": 0.8595568393447607,
+   "util_gap": 0.015566113032572049,
+   "disc_auc": 0.50911228125,
+   "dcr_share": 0.5005
+  },
+  "not_best_disc_model": {
+   "epoch": 20.0,
+   "ks_mean": 0.020374999999999997,
+   "tvd_mean": 0.017583333333333333,
+   "marg_mean": 0.01885227272727273,
+   "tail_err": 0.008683791787260238,
+   "assoc_diff": 0.01158561980579431,
+   "trtr": 0.8751229523773327,
+   "tstr": 0.8609889399870777,
+   "util_gap": 0.014134012390255024,
+   "disc_auc": 0.5104349609375001,
+   "dcr_share": 0.5095
+  },
+  "last_epoch_model": {
+   "epoch": 35.0,
+   "ks_mean": 0.020775,
+   "tvd_mean": 0.013791666666666655,
+   "marg_mean": 0.016965909090909084,
+   "tail_err": 0.008032554460023279,
+   "assoc_diff": 0.01367655306660576,
+   "trtr": 0.8751229523773327,
+   "tstr": 0.8589426475618562,
+   "util_gap": 0.0161803048154765,
+   "disc_auc": 0.501788609375,
+   "dcr_share": 0.538
+  }
+ }
+}

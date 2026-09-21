@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "insurance",
+  "arm": "default_ema",
+  "seed": 0,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/results/m7/insurance__default_ema__s0.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/tmp/m7_insurance_default_ema_0"
+ },
+ "fit_s": 192.67339992523193,
+ "stop_epoch": 30.90909090909091,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 15.454545454545455,
+   "ks_mean": 0.034579439252336454,
+   "tvd_mean": 0.032242990654205626,
+   "marg_mean": 0.033244325767690264,
+   "tail_err": 0.02204167846458929,
+   "assoc_diff": 0.03172174698146441,
+   "trtr": 0.8705956390046192,
+   "tstr": 0.8633136855723768,
+   "util_gap": 0.007281953432242472,
+   "disc_auc": 0.5160485631932921,
+   "dcr_share": 0.5410447761194029
+  },
+  "best_disc_model": {
+   "epoch": 20.606060606060606,
+   "ks_mean": 0.027414330218068536,
+   "tvd_mean": 0.03598130841121494,
+   "marg_mean": 0.03230974632843791,
+   "tail_err": 0.02269564562163898,
+   "assoc_diff": 0.03497832176939584,
+   "trtr": 0.8705956390046192,
+   "tstr": 0.8676606641470292,
+   "util_gap": 0.002934974857589978,
+   "disc_auc": 0.4728583282382741,
+   "dcr_share": 0.5335820895522388
+  },
+  "not_best_disc_model": {
+   "epoch": 25.757575757575758,
+   "ks_mean": 0.029283489096573207,
+   "tvd_mean": 0.036448598130841114,
+   "marg_mean": 0.03337783711615487,
+   "tail_err": 0.02182992581788927,
+   "assoc_diff": 0.03136048125106534,
+   "trtr": 0.8705956390046192,
+   "tstr": 0.8497827510180982,
+   "util_gap": 0.020812887986521034,
+   "disc_auc": 0.44844396890558125,
+   "dcr_share": 0.6044776119402985
+  },
+  "last_epoch_model": {
+   "epoch": 30.90909090909091,
+   "ks_mean": 0.030218068535825548,
+   "tvd_mean": 0.030841121495327084,
+   "marg_mean": 0.03057409879839786,
+   "tail_err": 0.01135844992219124,
+   "assoc_diff": 0.03464702780114854,
+   "trtr": 0.8705956390046192,
+   "tstr": 0.8464365060515231,
+   "util_gap": 0.02415913295309613,
+   "disc_auc": 0.39903965411826364,
+   "dcr_share": 0.5746268656716418
+  }
+ }
+}
