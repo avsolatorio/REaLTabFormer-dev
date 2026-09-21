@@ -1,0 +1,44 @@
+{
+ "job": {
+  "dataset": "diabetes",
+  "config": "old_default",
+  "seed": 1,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/research/results/m9a/diabetes__old_default__s1.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/research/tmp/m9a_diabetes_old_default_1",
+  "save_synth": false
+ },
+ "n_train": 614,
+ "fit_s": 238.34708857536316,
+ "n_params": 43462656,
+ "stopped_epoch": 26.31578947368421,
+ "global_step": 500,
+ "variants": {
+  "default": {
+   "sample_s": 73.32000660896301,
+   "nan_row_frac": 0.0,
+   "ks_mean": 0.08265472312703584,
+   "tvd_mean": 0.18078175895765475,
+   "marg_mean": 0.09355772710821572,
+   "tail_err": 0.05527883128624586,
+   "assoc_diff": 0.03093131025368775,
+   "trtr": 0.8429752066115703,
+   "tstr": 0.8220385674931129,
+   "util_gap": 0.020936639118457445,
+   "disc_auc": 0.6384258718925399,
+   "dcr_synth_mean": 2.206386529607519,
+   "dcr_test_mean": 2.4872330510805107,
+   "dcr_ratio": 0.8870847581608866,
+   "frac_suspicious": 0.12987012987012986,
+   "exact_dup": 0.0,
+   "dcr_share": 0.5909090909090909
+  }
+ },
+ "oracle": {
+  "ks_mean": 0.06945883920639621,
+  "tvd_mean": 0.01023731968357372,
+  "marg_mean": 0.06287867037052705,
+  "tail_err": 0.044108193791826567,
+  "assoc_diff": 0.10755461248361432,
+  "disc_auc": 0.5381678582004314
+ }
+}

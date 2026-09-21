@@ -1,0 +1,44 @@
+{
+ "job": {
+  "dataset": "hicard",
+  "config": "new_recipe",
+  "seed": 2,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/research/results/m9a/hicard__new_recipe__s2.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev/research/tmp/m9a_hicard_new_recipe_2",
+  "save_synth": false
+ },
+ "n_train": 3200,
+ "fit_s": 106.14629650115967,
+ "n_params": 43600128,
+ "stopped_epoch": 25.0,
+ "global_step": 2500,
+ "variants": {
+  "default": {
+   "sample_s": 1.537200927734375,
+   "nan_row_frac": 0.0,
+   "ks_mean": 0.0221875,
+   "tvd_mean": 0.053125000000000006,
+   "marg_mean": 0.03765625,
+   "tail_err": 0.06645230319797396,
+   "assoc_diff": 0.013223423162050718,
+   "trtr": 0.9999854226342758,
+   "tstr": 0.9997667621484122,
+   "util_gap": 0.00021866048586360876,
+   "disc_auc": 0.48546499023437495,
+   "dcr_synth_mean": 0.4385371396174705,
+   "dcr_test_mean": 0.4936028929758867,
+   "dcr_ratio": 0.8884411859370802,
+   "frac_suspicious": 0.0625,
+   "exact_dup": 0.0,
+   "dcr_share": 0.43125
+  }
+ },
+ "oracle": {
+  "ks_mean": 0.03375,
+  "tvd_mean": 0.11140625,
+  "marg_mean": 0.072578125,
+  "tail_err": 0.01705841091944957,
+  "assoc_diff": 0.09044590645464486,
+  "disc_auc": 0.505727734375
+ }
+}
