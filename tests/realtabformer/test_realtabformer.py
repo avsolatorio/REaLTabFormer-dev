@@ -440,3 +440,140 @@ def test_sensitivity_training_saves_reloadable_checkpoint(tmp_path):
 
     samples = reloaded.sample(10, device="cpu")
     assert len(samples) == 10
+
+
+# --- constrained_loss and the sensitivity path's forwarding of loss arguments --
+
+
+def _stub_rtf(vocab_size, seq_len, allowed_per_step):
+    import types
+
+    return types.SimpleNamespace(
+        vocab={"token2id": {"[EOS]": 1}},
+        col_idx_ids={i: allowed_per_step(i) for i in range(seq_len - 1)},
+        tabular_max_length=seq_len,
+    )
+
+
+def test_constrained_loss_equals_standard_cross_entropy_when_nothing_is_masked():
+    import types
+
+    import torch
+    import torch.nn.functional as F
+
+    from realtabformer.rtf_loss import build_constrained_loss
+
+    torch.manual_seed(0)
+    B, L, V = 5, 7, 11
+    rtf = _stub_rtf(V, L, lambda i: list(range(V)))
+    logits = torch.randn(B, L, V)
+    labels = torch.randint(0, V, (B, L))
+    loss = build_constrained_loss(rtf)(types.SimpleNamespace(logits=logits), labels)
+    ref = F.cross_entropy(logits[:, :-1].reshape(-1, V), labels[:, 1:].reshape(-1))
+    assert torch.allclose(loss, ref, atol=1e-6)
+
+
+def test_constrained_loss_is_lower_with_a_mask_and_skips_ignored_labels():
+    import types
+
+    import torch
+    import torch.nn.functional as F
+
+    from realtabformer.rtf_loss import build_constrained_loss
+
+    torch.manual_seed(1)
+    B, L, V = 6, 6, 12
+    allowed = lambda i: [(3 * i + k) % V for k in range(3)]  # 3 valid tokens per step
+    rtf = _stub_rtf(V, L, allowed)
+    logits = torch.randn(B, L, V)
+    labels = torch.zeros(B, L, dtype=torch.long)
+    for i in range(L - 1):
+        labels[:, i + 1] = torch.tensor(allowed(i))[torch.randint(0, 3, (B,))]
+    out = types.SimpleNamespace(logits=logits)
+
+    loss = build_constrained_loss(rtf)(out, labels)
+    standard = F.cross_entropy(logits[:, :-1].reshape(-1, V), labels[:, 1:].reshape(-1))
+    assert loss < standard  # mass on other columns' tokens is removed
+
+    ignored = labels.clone()
+    ignored[:, 3:] = -100  # positions the model is not asked to predict
+    loss_ignored = build_constrained_loss(rtf)(out, ignored)
+    keep = build_constrained_loss(rtf)(
+        types.SimpleNamespace(logits=logits[:, :3]), labels[:, :3]
+    )
+    assert torch.isfinite(loss_ignored)
+    assert torch.allclose(loss_ignored, keep, atol=1e-5)
+
+
+def test_constrained_loss_option_is_wired_into_the_trainer(tmp_path):
+    import numpy as np
+    import pandas as pd
+    from transformers import GPT2Config
+
+    from realtabformer import REaLTabFormer
+
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"a": rng.choice(list("xyz"), 80), "b": rng.integers(0, 40, 80)})
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def trainer_for(**kw):
+        m = REaLTabFormer(
+            model_type="tabular", epochs=1, batch_size=8,
+            checkpoints_dir=str(tmp_path / "c"),
+            tabular_config=GPT2Config(n_layer=1, n_embd=32, n_head=2), **kw,
+        )
+        m.target_col, m.trainer_kwargs = None, {}
+        return m._fit_tabular(df, device=device)
+
+    assert trainer_for().compute_loss_func is None  # off by default
+    assert trainer_for(constrained_loss=True).compute_loss_func is not None
+
+    # End to end: it actually trains, on the no-critic path.
+    m = REaLTabFormer(
+        model_type="tabular", epochs=1, batch_size=8, checkpoints_dir=str(tmp_path / "e"),
+        tabular_config=GPT2Config(n_layer=1, n_embd=32, n_head=2), constrained_loss=True,
+    )
+    m.fit(df, device=device, n_critic=0)
+    assert len(m.sample(n_samples=5, gen_batch=5, device=device)) == 5
+
+
+def test_sensitivity_path_forwards_loss_related_fit_arguments(tmp_path, monkeypatch):
+    # The default (sensitivity) training path used to call `_fit_tabular` with only
+    # device/epochs, silently dropping every one of these.
+    import numpy as np
+    import pandas as pd
+
+    from realtabformer import REaLTabFormer
+    from realtabformer.rtf_analyze import SyntheticDataBench
+
+    class Stop(Exception):
+        pass
+
+    seen = {}
+
+    def fake_fit_tabular(self, df, **kwargs):
+        seen.update(kwargs)
+        raise Stop
+
+    monkeypatch.setattr(REaLTabFormer, "_fit_tabular", fake_fit_tabular)
+    monkeypatch.setattr(
+        SyntheticDataBench, "compute_sensitivity_threshold",
+        staticmethod(lambda *a, **k: np.array([0.1, 0.2, 0.3])),
+    )
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"a": rng.choice(list("xyz"), 60), "b": rng.integers(0, 40, 60)})
+    loss = lambda outputs, labels, num_items_in_batch=None: None
+    m = REaLTabFormer(model_type="tabular", epochs=2, checkpoints_dir=str(tmp_path / "c"))
+
+    with pytest.raises(Stop):
+        m.fit(
+            df, device="cpu", n_critic=5, num_bootstrap=3,
+            field_weights={"a": 2.0}, compute_loss_func=loss, predict_fields=["a"],
+            digit_entropy_weighting=True, digit_entropy_weight_floor=0.2,
+        )
+
+    assert seen["compute_loss_func"] is loss
+    assert seen["field_weights"] == {"a": 2.0}
+    assert seen["predict_fields"] == ["a"]
+    assert seen["digit_entropy_weighting"] is True
+    assert seen["digit_entropy_weight_floor"] == 0.2

@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "diabetes",
+  "arm": "default_cl",
+  "seed": 2,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/results/m6/diabetes__default_cl__s2.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/tmp/m6_diabetes_default_cl_2"
+ },
+ "fit_s": 126.9916684627533,
+ "stop_epoch": 26.31578947368421,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 15.789473684210526,
+   "ks_mean": 0.07145765472312704,
+   "tvd_mean": 0.01140065146579805,
+   "marg_mean": 0.0647846543612016,
+   "tail_err": 0.04517249139261434,
+   "assoc_diff": 0.0340959097275354,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.780835881753313,
+   "util_gap": -0.0008154943934760572,
+   "disc_auc": 0.5325653322581672,
+   "dcr_share": 0.564935064935065
+  },
+  "best_disc_model": {
+   "epoch": 15.789473684210526,
+   "ks_mean": 0.07145765472312704,
+   "tvd_mean": 0.01140065146579805,
+   "marg_mean": 0.0647846543612016,
+   "tail_err": 0.04517249139261434,
+   "assoc_diff": 0.0340959097275354,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.780835881753313,
+   "util_gap": -0.0008154943934760572,
+   "disc_auc": 0.5325653322581672,
+   "dcr_share": 0.564935064935065
+  },
+  "not_best_disc_model": {
+   "epoch": 21.05263157894737,
+   "ks_mean": 0.07797231270358307,
+   "tvd_mean": 0.0570032573289902,
+   "marg_mean": 0.07564241766196164,
+   "tail_err": 0.0601756696663104,
+   "assoc_diff": 0.03257589239231609,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.7221202854230376,
+   "util_gap": 0.057900101936799286,
+   "disc_auc": 0.4600977198697068,
+   "dcr_share": 0.6103896103896104
+  },
+  "last_epoch_model": {
+   "epoch": 26.31578947368421,
+   "ks_mean": 0.05313517915309446,
+   "tvd_mean": 0.10423452768729644,
+   "marg_mean": 0.05881288454578357,
+   "tail_err": 0.11353106389158271,
+   "assoc_diff": 0.02303503370132675,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.7898063200815495,
+   "util_gap": -0.009785932721712576,
+   "disc_auc": 0.40731201392057204,
+   "dcr_share": 0.6558441558441559
+  }
+ }
+}

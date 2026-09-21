@@ -48,6 +48,7 @@ from .rtf_cusum import (
     CUSUMTrainer,
 )
 from .rtf_datacollator import RelationalDataCollator, UnkDropoutCollator
+from .rtf_loss import build_constrained_loss
 from .rtf_exceptions import SampleEmptyLimitError
 from .rtf_shared import (
     SharedModelMixin,
@@ -86,6 +87,7 @@ class REaLTabFormer(SharedModelMixin):
         grokfast_args: Optional[Dict[str, Any]] = None,
         unk_dropout: float = 0.03,
         oov_strategy: str = "unk",
+        constrained_loss: bool = False,
         **training_args_kwargs,
     ) -> None:
         """Set up a REaLTabFormer instance.
@@ -138,6 +140,13 @@ class REaLTabFormer(SharedModelMixin):
                 category level): 0.03 costs nothing detectable on unseeded generation and captures
                 almost all of the benefit; 0.10 delays sensitivity stopping by ~9 epochs. `0`
                 turns it off. Ignored by relational models.
+            constrained_loss: Tabular models only. Train with cross-entropy normalised over just the
+                tokens valid for each position's column (the same constraint sampling applies)
+                instead of over the whole vocabulary. Much faster early learning (reference-level
+                marginal fidelity in about half the epochs; discriminator distance from 0.5 lower by
+                0.16 at epoch 10) with the same ceiling, but it overfits sooner, so use it with the
+                stopping rule. Ignored if `compute_loss_func` is passed explicitly. See
+                `rtf_loss.build_constrained_loss`. Off by default.
             oov_strategy: How a `seed_input` value that was never seen in training is encoded.
                 `"unk"` (default) maps it deterministically to [UNK]; the model then generates the
                 other columns as if that column were not given, and the returned table holds the
@@ -302,6 +311,7 @@ class REaLTabFormer(SharedModelMixin):
         assert 0.0 <= unk_dropout < 1.0, unk_dropout
         self.unk_dropout = unk_dropout
         self.oov_strategy = oov_strategy
+        self.constrained_loss = constrained_loss
 
         # A unique identifier for the experiment set after the
         # model is trained.
@@ -711,6 +721,11 @@ class REaLTabFormer(SharedModelMixin):
                     load_from_best_mean_sensitivity=load_from_best_mean_sensitivity,
                     save_full_every_epoch=save_full_every_epoch,
                     gen_kwargs=gen_kwargs,
+                    field_weights=field_weights,
+                    compute_loss_func=compute_loss_func,
+                    predict_fields=predict_fields,
+                    digit_entropy_weighting=digit_entropy_weighting,
+                    digit_entropy_weight_floor=digit_entropy_weight_floor,
                 )
 
             del self.dataset
@@ -766,7 +781,24 @@ class REaLTabFormer(SharedModelMixin):
         load_from_best_mean_sensitivity: bool = False,
         save_full_every_epoch: int = 0,
         gen_kwargs: Optional[Dict[str, Any]] = None,
+        field_weights: Optional[Dict[str, float]] = None,
+        compute_loss_func: Optional[Callable] = None,
+        predict_fields: Optional[List[str]] = None,
+        digit_entropy_weighting: bool = False,
+        digit_entropy_weight_floor: float = 0.1,
     ) -> Trainer:
+        # `fit()` accepts these on every path, but this one used to drop them
+        # silently (only the `n_critic=0` path forwarded them), so a custom loss,
+        # field weights, predict_fields or digit-entropy weighting had no effect
+        # under the default sensitivity regime.
+        loss_kwargs = dict(
+            field_weights=field_weights,
+            compute_loss_func=compute_loss_func,
+            predict_fields=predict_fields,
+            digit_entropy_weighting=digit_entropy_weighting,
+            digit_entropy_weight_floor=digit_entropy_weight_floor,
+        )
+
         assert gen_rounds >= 1
 
         if save_full_every_epoch > 0:
@@ -928,6 +960,7 @@ class REaLTabFormer(SharedModelMixin):
                     device=device,
                     num_train_epochs=last_epoch,
                     target_epochs=self.epochs,
+                    **loss_kwargs,
                 )
 
         np.random.seed(self.random_state)
@@ -957,6 +990,7 @@ class REaLTabFormer(SharedModelMixin):
                     device=device,
                     num_train_epochs=num_train_epochs,
                     target_epochs=self.epochs,
+                    **loss_kwargs,
                 )
                 trainer.train(resume_from_checkpoint=False)
             else:
@@ -1704,6 +1738,9 @@ class REaLTabFormer(SharedModelMixin):
                               SpecialTokens.RMASK, SpecialTokens.UNK)
                 ),
             )
+
+        if compute_loss_func is None and getattr(self, "constrained_loss", False):
+            compute_loss_func = build_constrained_loss(self)
 
         trainer_class = trainer_cls or ResumableTrainer
         trainer = trainer_class(

@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "wilt",
+  "arm": "default_cl",
+  "seed": 0,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/results/m6/wilt__default_cl__s0.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/tmp/m6_wilt_default_cl_0"
+ },
+ "fit_s": 583.6953325271606,
+ "stop_epoch": 30.25,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 10.083333333333334,
+   "ks_mean": 0.03570136915525704,
+   "tvd_mean": 0.014724877292689231,
+   "marg_mean": 0.03220528717816241,
+   "tail_err": 0.1516753561070428,
+   "assoc_diff": 0.012548354436947214,
+   "trtr": 0.9915412004988523,
+   "tstr": 0.9825943933341769,
+   "util_gap": 0.008946807164675441,
+   "disc_auc": 0.5997569444606647,
+   "dcr_share": 0.5072314049586777
+  },
+  "best_disc_model": {
+   "epoch": 20.166666666666668,
+   "ks_mean": 0.044691294239214675,
+   "tvd_mean": 0.016016533195556668,
+   "marg_mean": 0.03991216739860501,
+   "tail_err": 0.029146004355767124,
+   "assoc_diff": 0.011206644120496637,
+   "trtr": 0.9915412004988523,
+   "tstr": 0.9731776528638819,
+   "util_gap": 0.01836354763497039,
+   "disc_auc": 0.5714034457015019,
+   "dcr_share": 0.5454545454545454
+  },
+  "not_best_disc_model": {
+   "epoch": 25.208333333333332,
+   "ks_mean": 0.0699044174631878,
+   "tvd_mean": 0.004649961250322913,
+   "marg_mean": 0.059028674761043655,
+   "tail_err": 0.04891443124889924,
+   "assoc_diff": 0.008488845511960882,
+   "trtr": 0.9915412004988523,
+   "tstr": 0.988125146854158,
+   "util_gap": 0.003416053644694328,
+   "disc_auc": 0.5799423222751883,
+   "dcr_share": 0.5542355371900827
+  },
+  "last_epoch_model": {
+   "epoch": 30.25,
+   "ks_mean": 0.050322913975716865,
+   "tvd_mean": 0.012658227848101247,
+   "marg_mean": 0.04404546628778092,
+   "tail_err": 0.08791332613882274,
+   "assoc_diff": 0.013373405407192404,
+   "trtr": 0.9915412004988523,
+   "tstr": 0.9845283496303793,
+   "util_gap": 0.007012850868473031,
+   "disc_auc": 0.5534519312141012,
+   "dcr_share": 0.5625
+  }
+ }
+}
