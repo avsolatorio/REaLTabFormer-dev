@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "wilt",
+  "arm": "default_cl",
+  "seed": 2,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/results/m6/wilt__default_cl__s2.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/tmp/m6_wilt_default_cl_2"
+ },
+ "fit_s": 644.4320750236511,
+ "stop_epoch": 35.291666666666664,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 15.125,
+   "ks_mean": 0.04221131490570912,
+   "tvd_mean": 0.013691552570395293,
+   "marg_mean": 0.03745802118315681,
+   "tail_err": 0.06827071022454338,
+   "assoc_diff": 0.011517803362057813,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.985258152173913,
+   "util_gap": 0.0035099637681160756,
+   "disc_auc": 0.5544732102691016,
+   "dcr_share": 0.5526859504132231
+  },
+  "best_disc_model": {
+   "epoch": 25.208333333333332,
+   "ks_mean": 0.04267631103074141,
+   "tvd_mean": 0.02247481270989406,
+   "marg_mean": 0.03930939464393352,
+   "tail_err": 0.15868828981313457,
+   "assoc_diff": 0.02275720074645664,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.9874773550724638,
+   "util_gap": 0.001290760869565255,
+   "disc_auc": 0.5505787893083325,
+   "dcr_share": 0.5454545454545454
+  },
+  "not_best_disc_model": {
+   "epoch": 30.25,
+   "ks_mean": 0.03709635753035391,
+   "tvd_mean": 0.005683285972616907,
+   "marg_mean": 0.031860845604064415,
+   "tail_err": 0.1003401470548394,
+   "assoc_diff": 0.007994341196181644,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.9653306159420291,
+   "util_gap": 0.0234375,
+   "disc_auc": 0.5310849622623592,
+   "dcr_share": 0.5402892561983471
+  },
+  "last_epoch_model": {
+   "epoch": 35.291666666666664,
+   "ks_mean": 0.036269697752518724,
+   "tvd_mean": 0.018341513820718146,
+   "marg_mean": 0.03328166709721863,
+   "tail_err": 0.08673167697958294,
+   "assoc_diff": 0.021466904116852977,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.975294384057971,
+   "util_gap": 0.013473731884058093,
+   "disc_auc": 0.49436910100148546,
+   "dcr_share": 0.5340909090909091
+  }
+ }
+}

@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "insurance",
+  "arm": "default_cl",
+  "seed": 1,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/results/m6/insurance__default_cl__s1.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-cl/research/tmp/m6_insurance_default_cl_1"
+ },
+ "fit_s": 235.43313932418823,
+ "stop_epoch": 25.757575757575758,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 10.303030303030303,
+   "ks_mean": 0.07133956386292835,
+   "tvd_mean": 0.04999999999999999,
+   "marg_mean": 0.05914552736982643,
+   "tail_err": 0.016348935394412886,
+   "assoc_diff": 0.042351111852725054,
+   "trtr": 0.8575740557564262,
+   "tstr": 0.7993397061724811,
+   "util_gap": 0.05823434958394513,
+   "disc_auc": 0.6021870905755962,
+   "dcr_share": 0.5223880597014925
+  },
+  "best_disc_model": {
+   "epoch": 15.454545454545455,
+   "ks_mean": 0.05109034267912773,
+   "tvd_mean": 0.08364485981308412,
+   "marg_mean": 0.06969292389853136,
+   "tail_err": 0.010814141896335993,
+   "assoc_diff": 0.026922193605995418,
+   "trtr": 0.8575740557564262,
+   "tstr": 0.8219441628986163,
+   "util_gap": 0.03562989285780993,
+   "disc_auc": 0.5953122543453577,
+   "dcr_share": 0.503731343283582
+  },
+  "not_best_disc_model": {
+   "epoch": 20.606060606060606,
+   "ks_mean": 0.0632398753894081,
+   "tvd_mean": 0.04369158878504672,
+   "marg_mean": 0.0520694259012016,
+   "tail_err": 0.02856477679239999,
+   "assoc_diff": 0.032608107673725635,
+   "trtr": 0.8575740557564262,
+   "tstr": 0.8561979484659703,
+   "util_gap": 0.0013761072904558969,
+   "disc_auc": 0.5339427024194252,
+   "dcr_share": 0.5634328358208955
+  },
+  "last_epoch_model": {
+   "epoch": 25.757575757575758,
+   "ks_mean": 0.07663551401869158,
+   "tvd_mean": 0.06121495327102802,
+   "marg_mean": 0.0678237650200267,
+   "tail_err": 0.021141243337531316,
+   "assoc_diff": 0.033616598655589046,
+   "trtr": 0.8575740557564262,
+   "tstr": 0.8515550588580212,
+   "util_gap": 0.006018996898405016,
+   "disc_auc": 0.45998034762861384,
+   "dcr_share": 0.44402985074626866
+  }
+ }
+}
