@@ -168,7 +168,7 @@ arm, run under the same library version, so the changed library defaults
 (2026-09-20) cannot confound a comparison. Dev datasets: diabetes, insurance,
 abalone, adult5k; winners are confirmed on held-out wilt/churn2.
 
-### H11 -- Column order changes the autoregressive factorisation (data processing)
+### H11 -- Column order changes the autoregressive factorisation (data processing) -- NO EFFECT (c2)
 - **Why:** the model factorises p(x1) p(x2|x1) ...; the order is the file's column
   order and is otherwise arbitrary. A dependency-aware order should make the
   conditionals easier to learn; the target is already teacher-forced first.
@@ -178,7 +178,7 @@ abalone, adult5k; winners are confirmed on held-out wilt/churn2.
 - **Test:** `wk` with column order in {orig, reverse, entropy_asc, entropy_desc,
   hub_first, random}, dev x 3 seeds.
 
-### H12 -- Overconfidence: label smoothing / dropout / weight decay (regularisation)
+### H12 -- Overconfidence: label smoothing / dropout / weight decay (regularisation) -- no robust gain (c1, c2); dropout is a speed/overfit dial, weight decay null
 - **Why:** M1 hinted T=1.1 helps (over-confident model); label smoothing directly
   flattens the training target. Default GPT2 dropout is 0.1; no weight decay.
 - **Prediction:** label smoothing 0.05 improves `marg_mean`/discriminator distance
@@ -192,7 +192,7 @@ abalone, adult5k; winners are confirmed on held-out wilt/churn2.
 - **Prediction:** same quality within noise; >=1.5x steps/s. Measured in an
   interleaved micro-benchmark (matrix wall-clock is load-confounded on this box).
 
-### H14 -- Numeric representation with the new `top_k=0` default
+### H14 -- Numeric representation with the new `top_k=0` default -- REFUTED (c2: qenc / precision 3 / nparts 2 all worse at convergence)
 - **Why:** each quantile-encoded numeric column costs 4 tokens (precision 4,
   nparts 1); fewer/wider tokens mean fewer compounding autoregressive steps. The
   `numeric_nparts>=2` case was untestable before `top_k=0` (100-way chunks were

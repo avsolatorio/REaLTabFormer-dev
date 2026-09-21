@@ -1112,3 +1112,37 @@ measurable cost to utility or the privacy proxies. It is worth adopting; that is
 now, `ema_horizon=1.0`). The constraint-aware loss is a niche efficiency option (fewer epochs for the small model) with a small utility cost at
 `best_disc`; leave it opt-in. Untested: EMA together with the constrained loss; horizons other than ~1 epoch in the real regime (4 epochs lagged badly in c1 at epoch
 10); datasets above 10,000 rows; the wall-clock overhead (per-step cost is small, but matrix wall-clock is load-confounded, so no timing claim is made).
+
+---
+
+## 2026-09-21 01:41 UTC — c2 (117 runs) and M4 final (54 fits): column order, numeric representation and regularisation do not beat the defaults; EMA replicates across 14 training variants; the small model shows no detectable memorisation increase
+
+Code/data: `research/results/c2`, `research/results/m4` at `cae36fb` (all jobs complete; 5 `c2` jobs and 1 M4 job that had failed on GPU out-of-memory were rerun
+with identical arguments). `c2`: fixed-epoch learning-curve protocol (see the c1 entry), 13 arms x 3 datasets x 3 seeds, 100 epochs, every arm also records
+an EMA copy (horizon ~1 epoch); reference = c1's `wk` (same seeds, splits, LR schedule). M4: real sensitivity regime, `b0` (default GPT2) vs `tiny`
+(128d/3L) vs `tiny` at lr 3e-4, all six datasets x 3 seeds, legacy settings, scored with the calibrated `dcr_share`.
+
+**Result -- c2 raw arms vs `wk` at epoch 100 (9 units; mean +-s.e., wins/losses):**
+- **H11 column order (pre-registered: hub-first / entropy-ascending improve `assoc_diff`): not supported.** reverse, hub-first, entropy-ascending, random:
+  `marg_mean` within +-0.0025 of the original order (all not significant); `assoc_diff` +0.001 to +0.004 (hub-first +0.0034 +-0.0027, random +0.0042 +-0.0016, 2/7);
+  TSTR -0.008 to -0.018 (reverse -0.018 +-0.008, entropy-ascending -0.014 +-0.006, both 2 better/7 worse). No order helps; a few slightly hurt utility.
+- **H14 numeric representation (pre-registered: neutral-to-better): refuted.** quantile encoding: `marg_mean` +0.0060 +-0.0019 (0 better/9 worse), `assoc_diff` +0.0048
+  (2/7), TSTR -0.0215 +-0.0068 (2/7); precision 3: +0.0099 +-0.0021 (1/8), TSTR -0.0216; `numeric_nparts=2` (only reachable since `top_k=0`): +0.0117 +-0.0024 (0/9),
+  `assoc_diff` +0.0150 +-0.0029 (1/8), TSTR -0.0815 +-0.0310. `numeric_categorical_threshold=20`: no detectable effect (only 3 of 9 units have a column it changes).
+- **H12 regularisation:** weight decay 0.05: nothing (`marg_mean` +0.0001 +-0.0003). Dropout acts as a speed/overfitting dial: 0.0 learns faster (discriminator
+  distance -0.032 +-0.008 at epoch 30, 8/0) but ends worse (+0.040 +-0.009 at 100, 0/9); 0.2 is slower early (epoch 30: discriminator +0.051, TSTR -0.043, 0/8) and better
+  late (-0.027 +-0.008, 8/1, at 100; `marg_mean` +0.002). The default 0.1 is a sensible middle.
+- **H16 EMA, pooled over ALL 14 arms of c1+c2 (126 runs; EMA minus raw weights on the same trajectory):** `marg_mean` -0.0144 +-0.0009 at epoch 30 (better in 88% of runs) and
+  -0.0143 +-0.0009 at epoch 50 (92%); improves at epoch 30 in 14 of 14 arms (per-arm -0.006 to -0.025); discriminator distance -0.032 +-0.003 at epoch 30 (83% of runs);
+  no effect at epoch 100 (converged); `dcr_share` unchanged. The cost is confined to the first ~10 epochs, where the average lags: `assoc_diff` +0.0062 +-0.0007 and TSTR -0.042
+  +-0.008 at epoch 10.
+- **M4 final (18 paired fits, all six datasets), vs default:** `tiny`: `marg_mean` -0.0420 +-0.0057 (18/0), discriminator distance -0.1345 +-0.0153 (18/0), `assoc_diff`
+  -0.0043 +-0.0013 (13/5), TSTR +0.0082 +-0.0059 (13/5), `exact_dup` 0, **`dcr_share` 0.522 vs 0.518 (+0.0038 +-0.0079)**, stop epoch 296 vs 33, `fit_s` 3,613 vs 652 (load-confounded).
+  `tiny` at lr 3e-4: `marg_mean` -0.0269 (17/1), discriminator distance -0.0991 (17/1), `dcr_share` 0.531 vs 0.518 (+0.0125 +-0.0064, 1.9 s.e.), stop epoch 140, `fit_s` 2,184.
+
+**Implication:** Of everything tried in Program 2 except EMA, none of column order, numeric re-encoding, label smoothing, dropout, weight decay or the loss variants gives a robust gain over
+the defaults; several of my predictions (H11 hub-first, H14 neutral-to-better) were wrong, and quantile/coarser numeric encodings are worse at convergence on these datasets
+(consistent with M1's mixed quantile-encoding result). EMA is the exception and now replicates across every training variant tried. The memorisation caution about the small
+model is answered for the recipe's checkpoint: the calibrated direct measure shows no detectable increase (both readings within the 0.50-0.535 range fresh real data scores);
+M5 showed later checkpoints are closer, so that statement is about the recipe's checkpoint. Limits: fixed-epoch protocol with a small GPT2 on three small datasets; `c2` arms were
+not run in the real stopping regime.
