@@ -751,3 +751,175 @@ def test_ema_is_on_by_default_but_switched_off_where_unsupported(tmp_path, monke
     explicit = REaLTabFormer(model_type="tabular", ema_horizon=1.0, checkpoints_dir=str(tmp_path / "e"))
     with pytest.raises(NotImplementedError):
         explicit.fit(_ema_df(), device="cpu", overfitting_detection_method="cusum")
+
+
+# --- ema_horizon on the relational model (opt-in) ----------------------------
+
+
+@pytest.fixture(scope="module")
+def tiny_relational_setup(tmp_path_factory):
+    """A saved tiny parent model plus the parent/child frames, shared by the relational EMA tests."""
+    import numpy as np
+    import pandas as pd
+    from transformers import GPT2Config
+
+    from realtabformer import REaLTabFormer
+
+    tmp = tmp_path_factory.mktemp("rel_ema")
+    rng = np.random.default_rng(0)
+    parent = pd.DataFrame(
+        {"pid": np.arange(80), "grp": rng.choice(list("ab"), 80), "size": rng.integers(1, 4, 80)}
+    )
+    reps = parent["size"].to_numpy()
+    child = pd.DataFrame(
+        {
+            "pid": np.repeat(parent["pid"].to_numpy(), reps),
+            "k": rng.integers(0, 30, reps.sum()),
+            "t": rng.choice(["p", "q", "r"], reps.sum()),
+        }
+    )
+    tiny = GPT2Config(n_layer=1, n_embd=32, n_head=2)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    pm = REaLTabFormer(
+        model_type="tabular", epochs=1, batch_size=16, checkpoints_dir=str(tmp / "pckpt"), tabular_config=tiny
+    )
+    pm.fit(parent.drop(columns="pid"), device=device, n_critic=0)
+    pm.save(tmp / "parent")
+    ppath = sorted(p for p in (tmp / "parent").glob("id*") if p.is_dir())[-1]
+    return dict(tmp=tmp, parent=parent, child=child, ppath=ppath, tiny=tiny, device=device)
+
+
+def _fit_tiny_child(setup, name, **kwargs):
+    from transformers import GPT2Config
+    from transformers.models.encoder_decoder.configuration_encoder_decoder import EncoderDecoderConfig
+
+    from realtabformer import REaLTabFormer
+
+    tiny = GPT2Config(n_layer=1, n_embd=32, n_head=2)
+    init = dict(
+        model_type="relational",
+        parent_realtabformer_path=setup["ppath"],
+        relational_config=EncoderDecoderConfig(encoder=tiny.to_dict(), decoder=tiny.to_dict()),
+        output_max_length=None,
+        epochs=3,
+        batch_size=16,
+        train_size=0.8,
+        checkpoints_dir=str(setup["tmp"] / f"ckpt_{name}"),
+        logging_steps=2,
+        eval_steps=2,
+        save_steps=2,
+    )
+    init.update(kwargs)
+    model = REaLTabFormer(**init)
+    trainer = model.fit(
+        df=setup["child"], in_df=setup["parent"], join_on="pid", device=setup["device"]
+    )
+    return model, trainer
+
+
+def test_relational_ema_is_opt_in(tiny_relational_setup):
+    from transformers import Seq2SeqTrainer
+
+    from realtabformer.rtf_ema import EMASeq2SeqTrainer
+
+    m, t = _fit_tiny_child(tiny_relational_setup, "default")
+    assert not m._ema_on and type(t) is Seq2SeqTrainer  # not on unless asked for
+
+    m, t = _fit_tiny_child(tiny_relational_setup, "zero", ema_horizon=0.0)
+    assert not m._ema_on and type(t) is Seq2SeqTrainer
+
+    m, t = _fit_tiny_child(tiny_relational_setup, "on", ema_horizon=1.0)
+    assert m._ema_on and isinstance(t, EMASeq2SeqTrainer)
+    assert m._ema_state["ema"] is not None
+
+
+def test_relational_ema_evaluates_and_saves_with_the_average_and_restores_raw(
+    tiny_relational_setup, monkeypatch
+):
+    from transformers import Seq2SeqTrainer
+
+    from realtabformer.rtf_ema import EMASeq2SeqTrainer
+
+    def equal_to_average(trainer):
+        ema = trainer.ema_holder.get("ema")
+        return None if ema is None else all(
+            torch.equal(p, s) for p, s in zip(trainer.model.parameters(), ema.shadow)
+        )
+
+    inside_eval, inside_save, restored = [], [], []
+    base_eval, base_save = Seq2SeqTrainer.evaluate, Seq2SeqTrainer.save_model
+
+    def spy_eval(self, *a, **k):
+        inside_eval.append(equal_to_average(self))
+        return base_eval(self, *a, **k)
+
+    def spy_save(self, *a, **k):
+        inside_save.append(equal_to_average(self))
+        return base_save(self, *a, **k)
+
+    outer_eval = EMASeq2SeqTrainer.evaluate
+
+    def spy_outer(self, *a, **k):
+        before = [p.detach().clone() for p in self.model.parameters()]
+        out = outer_eval(self, *a, **k)
+        restored.append(all(torch.equal(b, p) for b, p in zip(before, self.model.parameters())))
+        return out
+
+    monkeypatch.setattr(Seq2SeqTrainer, "evaluate", spy_eval)
+    monkeypatch.setattr(Seq2SeqTrainer, "save_model", spy_save)
+    monkeypatch.setattr(EMASeq2SeqTrainer, "evaluate", spy_outer)
+    _fit_tiny_child(tiny_relational_setup, "spy", ema_horizon=1.0)
+
+    assert any(v is not None for v in inside_eval), "no evaluation ran with the average available"
+    assert all(v for v in inside_eval if v is not None)  # evaluated ON the average
+    assert all(v for v in inside_save if v is not None)  # every checkpoint saved from the average
+    assert restored and all(restored)  # and the raw training weights are put back afterwards
+
+
+def test_relational_ema_final_model_is_the_average_without_best_model_loading(
+    tiny_relational_setup, monkeypatch
+):
+    from realtabformer.rtf_ema import WeightEMA
+
+    seen = {}
+    copy_to = WeightEMA.copy_to
+
+    def spy(self, model):
+        seen["raw"] = [p.detach().clone() for p in model.parameters()]
+        copy_to(self, model)
+
+    monkeypatch.setattr(WeightEMA, "copy_to", spy)
+    m, t = _fit_tiny_child(
+        tiny_relational_setup, "fixed", ema_horizon=1.0, load_best_model_at_end=False, eval_strategy="no"
+    )
+    ema = m._ema_state["ema"]
+    assert "raw" in seen  # the average was copied in once training ended
+    assert all(torch.equal(p, s) for p, s in zip(m.model.parameters(), ema.shadow))
+    # ...and it is a genuinely different model from the raw last iterate.
+    assert not all(torch.equal(r, s) for r, s in zip(seen["raw"], ema.shadow))
+
+
+def test_ema_callback_counts_steps_per_epoch_from_the_data_when_max_steps_is_set():
+    import math
+    from types import SimpleNamespace
+
+    from realtabformer.rtf_ema import EMACallback, WeightEMA
+
+    model = torch.nn.Linear(2, 2)
+    # 752 batches, accumulation 4 -> 188 optimizer steps per epoch.
+    holder = {}
+    EMACallback(holder, 1.0).on_train_begin(
+        args=SimpleNamespace(max_steps=1500, gradient_accumulation_steps=4),
+        state=SimpleNamespace(max_steps=1500, num_train_epochs=100),  # 15 "steps/epoch": wrong
+        control=None, model=model, train_dataloader=[0] * 752,
+    )
+    assert math.isclose(holder["ema"].decay, WeightEMA.decay_for_horizon(1.0, 188))
+
+    # Epoch-driven training keeps the original formula.
+    holder = {}
+    EMACallback(holder, 1.0).on_train_begin(
+        args=SimpleNamespace(max_steps=-1, gradient_accumulation_steps=4),
+        state=SimpleNamespace(max_steps=1880, num_train_epochs=10),
+        control=None, model=model, train_dataloader=[0] * 752,
+    )
+    assert math.isclose(holder["ema"].decay, WeightEMA.decay_for_horizon(1.0, 188))

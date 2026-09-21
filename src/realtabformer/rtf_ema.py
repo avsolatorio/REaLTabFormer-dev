@@ -1,4 +1,4 @@
-"""Exponential moving average (EMA) of the model weights for the tabular model."""
+"""Exponential moving average (EMA) of the model weights (tabular and relational models)."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import math
 from contextlib import contextmanager
 
 import torch
-from transformers import TrainerCallback
+from transformers import Seq2SeqTrainer, TrainerCallback
 
 
 class WeightEMA:
@@ -84,9 +84,13 @@ class EMACallback(TrainerCallback):
         self.holder = holder
         self.horizon_epochs = horizon_epochs
 
-    def on_train_begin(self, args, state, control, model=None, **kwargs):
+    def on_train_begin(self, args, state, control, model=None, train_dataloader=None, **kwargs):
         if "ema" not in self.holder and model is not None:
             steps_per_epoch = state.max_steps / max(state.num_train_epochs, 1)
+            if args.max_steps > 0 and train_dataloader is not None:
+                # `max_steps` overrides the epoch count, so `state.max_steps / num_train_epochs`
+                # no longer means "steps per epoch"; count them from the data.
+                steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
             self.holder["ema"] = WeightEMA(
                 model, WeightEMA.decay_for_horizon(self.horizon_epochs, int(steps_per_epoch))
             )
@@ -95,3 +99,33 @@ class EMACallback(TrainerCallback):
         ema = self.holder.get("ema")
         if ema is not None and model is not None:
             ema.update(model)
+
+
+class EMASeq2SeqTrainer(Seq2SeqTrainer):
+    """A `Seq2SeqTrainer` (the relational model's trainer) that evaluates and checkpoints the AVERAGED weights.
+
+    The average is fed after every optimizer step by an `EMACallback`. Evaluation and every checkpoint save run with
+    the average swapped in (and the raw training weights restored afterwards), so eval-loss early stopping compares
+    averaged models and `load_best_model_at_end` returns averaged weights. Without `load_best_model_at_end` the
+    trained model is still the raw one when `train()` returns; the caller copies the average in (see
+    `REaLTabFormer.fit`).
+    """
+
+    def __init__(self, *args, ema_holder: dict, ema_horizon: float, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.ema_holder = ema_holder
+        self.add_callback(EMACallback(ema_holder, ema_horizon))
+
+    def evaluate(self, *args, **kwargs):
+        ema = self.ema_holder.get("ema")
+        if ema is None:  # before the first training step (or EMA not started yet)
+            return super().evaluate(*args, **kwargs)
+        with ema.averaged(self.model):
+            return super().evaluate(*args, **kwargs)
+
+    def save_model(self, *args, **kwargs):
+        ema = self.ema_holder.get("ema")
+        if ema is None:
+            return super().save_model(*args, **kwargs)
+        with ema.averaged(self.model):
+            return super().save_model(*args, **kwargs)

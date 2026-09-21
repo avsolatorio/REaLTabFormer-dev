@@ -49,7 +49,7 @@ from .rtf_cusum import (
 )
 from .rtf_datacollator import RelationalDataCollator, UnkDropoutCollator
 from .rtf_loss import build_constrained_loss
-from .rtf_ema import EMACallback
+from .rtf_ema import EMACallback, EMASeq2SeqTrainer
 from .rtf_exceptions import SampleEmptyLimitError
 from .rtf_shared import (
     SharedModelMixin,
@@ -162,17 +162,22 @@ class REaLTabFormer(SharedModelMixin):
                 column, which silently conditions the output on an arbitrary unrelated value
                 (measured: worse than ignoring the seed on 5 of 5 seeds). The choice is stored
                 with the vocab, so models saved before this option existed keep `"random"`.
-            ema_horizon: Tabular models only. Defaults to 1.0 (on). If > 0, keep an exponential moving average of the
-                weights with an averaging time constant of this many epochs (1.0 is a good value)
-                and use the AVERAGE wherever a model is sampled or saved -- the critic's samples,
-                every checkpoint artefact, and the final model. Costs no extra training. On
-                fixed-epoch curves (9 dataset x seed units) the averaged weights had ~0.018 lower
-                marginal error at epochs 30-50 than the raw weights at the same step (8/9, 9/9
-                units better) and reached the raw weights' final marginal error at epoch 30
-                instead of 100; long horizons (~4 epochs) lag early in training. `0` (default)
-                turns it off. Supported on the sensitivity and `n_critic=0` paths; with
+            ema_horizon: If > 0, keep an exponential moving average of the weights with an averaging
+                time constant of this many epochs (1.0 is a good value) and use the AVERAGE wherever a
+                model is sampled or saved. Costs no extra training. `0` turns it off.
+                Tabular models: defaults to 1.0 (on). The critic's samples, every checkpoint artefact
+                and the final model use the average. On fixed-epoch curves (9 dataset x seed units)
+                the averaged weights had ~0.018 lower marginal error at epochs 30-50 than the raw
+                weights at the same step (8/9, 9/9 units better) and reached the raw weights' final
+                marginal error at epoch 30 instead of 100; long horizons (~4 epochs) lag early in
+                training. Supported on the sensitivity and `n_critic=0` paths; with
                 `overfitting_detection_method="cusum"` or an `objective_callback` it is switched
                 off automatically unless you asked for it explicitly, in which case it raises.
+                Relational models: OFF unless you pass `ema_horizon` explicitly (not yet measured
+                across enough datasets to be a default). Evaluation and every checkpoint use the
+                average, so eval-loss early stopping compares averaged models and
+                `load_best_model_at_end` returns averaged weights; without it the final model is
+                the average.
             numeric_quantile_encoding: Beta. If True, numeric columns are represented by their
                 quantile position under the column's own empirical distribution (`q = F(x)`,
                 uniform on `[0, 1)` for any continuous shape by the probability integral
@@ -654,6 +659,11 @@ class REaLTabFormer(SharedModelMixin):
             self.ema_horizon > 0
             and self.model_type == ModelType.tabular
             and ema_supported
+        ) or bool(
+            # The relational model is opt-in: only when `ema_horizon` was passed explicitly.
+            self.ema_horizon > 0
+            and self.model_type == ModelType.relational
+            and self._ema_explicit
         )
 
         if trainer_kwargs is not None:
@@ -794,6 +804,11 @@ class REaLTabFormer(SharedModelMixin):
 
             trainer = self._fit_relational(df, in_df, join_on=join_on, device=device)
             trainer.train(resume_from_checkpoint=resume_from_checkpoint)
+            ema = self._ema_state.get("ema")
+            if ema is not None and not trainer.args.load_best_model_at_end:
+                # With load_best_model_at_end the best checkpoint (saved with the average) is already
+                # loaded; otherwise the model still holds the raw weights.
+                ema.copy_to(self.model)
         else:
             self._invalid_model_type(self.model_type)
 
@@ -1621,13 +1636,19 @@ class REaLTabFormer(SharedModelMixin):
             ]
 
         # instantiate trainer
-        trainer = Seq2SeqTrainer(
+        trainer_kwargs = dict(
             model=self.model,
             args=_build_training_args(Seq2SeqTrainingArguments, training_args_kwargs),
             callbacks=callbacks,
             data_collator=RelationalDataCollator(),
             **dataset,
         )
+        if self._ema_on:
+            trainer = EMASeq2SeqTrainer(
+                ema_holder=self._ema_state, ema_horizon=self.ema_horizon, **trainer_kwargs
+            )
+        else:
+            trainer = Seq2SeqTrainer(**trainer_kwargs)
 
         return trainer
 
