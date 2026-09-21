@@ -1201,3 +1201,44 @@ provenance note in `research/HYPOTHESES.md`). Behaviour change for users: models
 tabular per-step memory is ~4x higher.
 
 **Known limits:** the evidence covers datasets up to 10,000 rows and single-GPU training; EMA together with the constrained loss is untested; `torch.compile`/`bf16` were measured but not adopted.
+
+---
+
+## 2026-09-21 12:25 UTC — M9, the cumulative before/after: the tool as it was when this work started vs the current defaults, on all seven datasets (21 paired units)
+
+Code/data: `research/results/m9a`, `m9b` at `b88aec5`; the "old" arms run the ACTUAL session-start code (commit `e9e6c96`, checked out as a separate worktree and selected per job via
+`RTF_SRC`), the "new" arms the current `feat` (`f02ffc4`). Each arm is called with ITS OWN defaults (old: batch 8 x 4, no EMA, HF `top_k=50`, random OOV, per-row constrained decoding; new:
+batch 32 x 1, EMA on, `top_k=0`, [UNK] dropout + `unk` OOV, vectorised decoding, the sensitivity-path fix). Two checkpoint rules for each: `_default` = the library's own default
+(`load_from_best_mean_sensitivity=False`, i.e. the `best_disc` checkpoint) and `_recipe` = the previously recommended `True`. 7 datasets (diabetes, insurance, abalone, hicard, wilt, churn2, adult5k) x seeds
+0-2 x 4 arms = 84 fits, paired on identical splits; the four arms of a (dataset, seed) group ran together on ONE GPU so wall-clock ratios share the same load. Three jobs were lost to transient GPU
+out-of-memory (shared box) and rerun with identical arguments. Teacher-forced target, sensitivity regime, 300-epoch ceiling. NOT run: the full 45,000-row Adult (hours per fit).
+
+**Question:** Did the individual changes add up? How does the tool called with its defaults now compare with the tool called with its defaults at the start, on every available dataset?
+
+**Result (new_default - old_default, paired over 21 units; mean +-s.e.; wins/losses; means old -> new):**
+- `marg_mean` 0.0647 -> 0.0285: **-0.0362 +-0.0044, better in 21 of 21 units** (a 56% reduction; never worse in any unit).
+- Discriminator distance from 0.5: 0.1057 -> 0.0287: -0.0771 +-0.0112 (19 better/2 worse) (AUC ~0.61 -> ~0.53). `assoc_diff` 0.0244 -> 0.0180: -0.0063 +-0.0021 (16/5).
+  `tail_err` 0.0942 -> 0.0327: -0.0615 +-0.0457 (13/8, not significant).
+- **Utility unchanged:** TSTR 0.8408 -> 0.8393 (-0.0015 +-0.0027, 11/10); |TRTR-TSTR| 0.0146 -> 0.0126.
+- **Privacy proxies:** `dcr_share` (0.5 = no memorisation) 0.5415 -> 0.5143 (-0.0272 +-0.0072, i.e. closer to 0.5); `frac_suspicious` 0.0741 -> 0.0756 (+0.0015 +-0.0029, 10/10);
+  `exact_dup` 0.0008 -> 0.0004; `dcr_ratio` 0.895 -> 0.917. (An early read on four small datasets suggested exact duplicates might have risen; with all 21 units they are lower, not higher.)
+- **Wall-clock (fit time):** 1,591 s -> 184 s mean; **geometric-mean ratio 7.6x** (median 8.6x, range 1.5-21.3x, 21 pairs); total over all units 33,408 s -> 3,861 s (**8.7x**). Stopping epoch 30.9 -> 29.7 (-1.2 +-1.4).
+  Most of this is the vectorised decoding on the critic's sampling (the old per-row decoding dominated the sensitivity path); batch 32 x 1 contributes the 1.9-2.7x measured in M8.
+- **Held-out datasets alone (wilt, churn2; 6 units):** `marg_mean` -0.0254 +-0.0041 (6/0), `assoc_diff` -0.0050 +-0.0011 (6/0), discriminator distance -0.0899 +-0.0064 (6/0), TSTR +0.002, `dcr_share` -0.004.
+- **Per dataset (old -> new, means of 3 seeds), `marg_mean` / discriminator distance / `assoc_diff` / TSTR / `dcr_share` / fit time:** abalone 0.059->0.021 / 0.139->0.027 / 0.013->0.018 (worse) /
+  0.499->0.499 / 0.537->0.550 (higher) / 1449->157 s; adult5k 0.052->0.023 / 0.112->0.025 / 0.017->0.009 / 0.878->0.880 / 0.547->0.514 / 1540->106 s (14.5x); churn2 0.043->0.013 / 0.100->0.005 /
+  0.017->0.014 / 0.849->0.854 / 0.512->0.511 / 3299->338 s (10.0x); diabetes 0.085->0.052 / 0.075->0.059 / 0.030->0.023 / 0.827->0.806 (lower) / 0.600->0.541 / 272->57 s; hicard 0.103->0.033 / 0.136->0.041 /
+  0.038->0.014 / 0.999->1.000 / 0.498->0.437 / 502->97 s; insurance 0.068->0.035 / 0.083->0.033 / 0.036->0.036 / 0.847->0.851 / 0.555->0.512 / 739->87 s; wilt 0.043->0.023 / 0.095->0.011 / 0.020->0.013 /
+  0.986->0.985 / 0.543->0.535 / 3335->446 s. Marginal error and discriminator distance improved on all seven datasets; the exceptions are `assoc_diff` on abalone (0.013 -> 0.018), TSTR on diabetes
+  (0.827 -> 0.806) and `dcr_share` on abalone (0.537 -> 0.550).
+- **Against the previously RECOMMENDED usage (old_recipe = flag True, old code), new_default - old_recipe (21 units):** `marg_mean` -0.0454 +-0.0048 (21/0), discriminator distance -0.1283 +-0.0116
+  (21/0), `assoc_diff` -0.0049 +-0.0024 (14/7), TSTR +0.0059 +-0.0047, `dcr_share` -0.0045 +-0.0098 (equal), but `frac_suspicious` **+0.0239 +-0.0040 (1 better/20 worse)** -- the old recipe's early checkpoint has
+  the lowest closeness proxy, and the new default does not match it on that measure. The `_recipe` arms on the new code (means over 21 units): `marg_mean` 0.0310, discriminator distance 0.0405, TSTR 0.8346,
+  `dcr_share` 0.5108, `frac_suspicious` 0.0529 -- i.e. the OLD recipe's privacy profile (0.0516) with fidelity close to the new default; fit-time ratio old_recipe/new_recipe 8.4x.
+
+**Implication:** The changes add up: on every dataset available, the tool's defaults now give data that is closer to the real distribution (marginal error roughly halved, never worse in any of 21 units;
+discriminator distance -73%), at unchanged downstream utility and without a rise in the direct memorisation measure, in about an eighth of the time. Two honest limits: (1) if the lowest-closeness
+operating point matters most (the old recipe's), the new default is not it on `frac_suspicious` (+0.024 vs old_recipe); passing `load_from_best_mean_sensitivity=True` to the new code recovers that profile
+(0.0529) while keeping most of the fidelity gain; (2) a few dataset-specific regressions exist (abalone `assoc_diff`, diabetes TSTR, abalone `dcr_share`), and everything is <= 10,000 rows, 3 seeds, one GPU.
+The gain is a bundle -- I did not re-ablate each component inside this matrix; the earlier entries attribute the quality gain mainly to weight averaging and the speed mainly to vectorised decoding
+and batch 32 x 1.
