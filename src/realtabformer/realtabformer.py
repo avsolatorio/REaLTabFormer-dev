@@ -72,7 +72,7 @@ class REaLTabFormer(SharedModelMixin):
         samples_save_dir: str = "rtf_samples",
         full_save_dir: str = "rtf_full_save",
         epochs: int = 1000,
-        batch_size: int = 8,
+        batch_size: Optional[int] = None,
         random_state: int = 1029,
         train_size: float = 1,
         output_max_length: int = 512,
@@ -89,7 +89,7 @@ class REaLTabFormer(SharedModelMixin):
         unk_dropout: float = 0.03,
         oov_strategy: str = "unk",
         constrained_loss: bool = False,
-        ema_horizon: float = 0.0,
+        ema_horizon: Optional[float] = None,
         **training_args_kwargs,
     ) -> None:
         """Set up a REaLTabFormer instance.
@@ -111,8 +111,14 @@ class REaLTabFormer(SharedModelMixin):
             full_save_dir: Save the full model in this directory every `save_full_every_epoch` epochs set during training.
             epochs: Number of epochs for training the GPT2LM model. Use a large number of epochs to take advantage of the framework's optimal termination feature for the non-relational tabular data model. Defaults to 1000.
             batch_size: Batch size used for training. Must be adjusted based on the available
-                compute resource. TrainingArguments is set to use `gradient_accumulation_steps=4`
-                which will have an effective batch_size of 32 for the default value.
+                compute resource. Defaults to 32 for tabular models and 8 for relational models.
+                `gradient_accumulation_steps` defaults to `max(1, round(32 / batch_size))`, so
+                the effective batch size stays ~32 whatever you pass: the tabular default is
+                32 x 1 (measured 1.9x faster fits than 8 x 4 for the default GPT2 and 2.7x for a
+                small one, with no consistent quality difference), and `batch_size=8` gives 8 x 4
+                as before. A batch of 32 needs ~4x the per-step activation memory of 8: lower
+                `batch_size` if you run out of GPU memory. Pass `gradient_accumulation_steps` in
+                `training_args_kwargs` to set it yourself.
             train_size: Fraction of the data that will be passed to the `.fit` method that will
                   be used for training. The remaining will be used as validation data.
             output_max_length: Truncation length for the number of output token ids in the
@@ -156,7 +162,7 @@ class REaLTabFormer(SharedModelMixin):
                 column, which silently conditions the output on an arbitrary unrelated value
                 (measured: worse than ignoring the seed on 5 of 5 seeds). The choice is stored
                 with the vocab, so models saved before this option existed keep `"random"`.
-            ema_horizon: Tabular models only. If > 0, keep an exponential moving average of the
+            ema_horizon: Tabular models only. Defaults to 1.0 (on). If > 0, keep an exponential moving average of the
                 weights with an averaging time constant of this many epochs (1.0 is a good value)
                 and use the AVERAGE wherever a model is sampled or saved -- the critic's samples,
                 every checkpoint artefact, and the final model. Costs no extra training. On
@@ -164,8 +170,9 @@ class REaLTabFormer(SharedModelMixin):
                 marginal error at epochs 30-50 than the raw weights at the same step (8/9, 9/9
                 units better) and reached the raw weights' final marginal error at epoch 30
                 instead of 100; long horizons (~4 epochs) lag early in training. `0` (default)
-                turns it off. Supported on the sensitivity and `n_critic=0` paths; raises with
-                `overfitting_detection_method="cusum"` or an `objective_callback`.
+                turns it off. Supported on the sensitivity and `n_critic=0` paths; with
+                `overfitting_detection_method="cusum"` or an `objective_callback` it is switched
+                off automatically unless you asked for it explicitly, in which case it raises.
             numeric_quantile_encoding: Beta. If True, numeric columns are represented by their
                 quantile position under the column's own empirical distribution (`q = F(x)`,
                 uniform on `[0, 1)` for any continuous shape by the probability integral
@@ -240,7 +247,18 @@ class REaLTabFormer(SharedModelMixin):
         self.samples_save_dir = Path(samples_save_dir)
         self.full_save_dir = Path(full_save_dir)
         self.epochs = epochs
+        if batch_size is None:
+            # Tabular models train ~1.9x (default GPT2) to ~2.7x (small GPT2) faster end to
+            # end at batch 32 x accumulation 1 than at 8 x 4 (same effective batch, same
+            # optimizer steps per epoch; no consistent quality difference, 16 paired fits).
+            # The relational encoder-decoder sees much longer sequences and was not
+            # measured, so it keeps 8.
+            batch_size = 32 if model_type == "tabular" else 8
         self.batch_size = batch_size
+        # Accumulate just enough to keep the effective batch at ~32 (the documented
+        # behaviour), so an explicit batch_size=8 still gives 8 x 4 as before.
+        # An explicit `gradient_accumulation_steps` in **training_args_kwargs overrides.
+        self._default_accumulation = max(1, round(32 / batch_size))
 
         self.early_stopping_patience = early_stopping_patience
         self.early_stopping_threshold = early_stopping_threshold
@@ -253,7 +271,7 @@ class REaLTabFormer(SharedModelMixin):
             num_train_epochs=self.epochs,
             per_device_train_batch_size=self.batch_size,
             per_device_eval_batch_size=self.batch_size,
-            gradient_accumulation_steps=4,
+            gradient_accumulation_steps=self._default_accumulation,
             remove_unused_columns=True,
             logging_steps=100,
             save_steps=100,
@@ -324,8 +342,12 @@ class REaLTabFormer(SharedModelMixin):
         self.unk_dropout = unk_dropout
         self.oov_strategy = oov_strategy
         self.constrained_loss = constrained_loss
-        assert ema_horizon >= 0.0, ema_horizon
-        self.ema_horizon = ema_horizon
+        # None = the default (1.0 epoch for tabular models), used unless the training
+        # path does not support it; an explicit value is honoured or raises.
+        self._ema_explicit = ema_horizon is not None
+        assert ema_horizon is None or ema_horizon >= 0.0, ema_horizon
+        self.ema_horizon = 1.0 if ema_horizon is None else float(ema_horizon)
+        self._ema_on = False
         self._ema_state: Dict[str, Any] = {}
 
         # A unique identifier for the experiment set after the
@@ -618,13 +640,21 @@ class REaLTabFormer(SharedModelMixin):
 
         self.trainer_kwargs = {}
         self._ema_state = {}
-        if self.ema_horizon > 0 and (
+        ema_supported = not (
             overfitting_detection_method == "cusum" or objective_callback is not None
-        ):
-            raise NotImplementedError(
-                "ema_horizon is supported on the sensitivity and n_critic=0 paths only, "
-                "not with overfitting_detection_method='cusum' or an objective_callback."
-            )
+        )
+        if self.ema_horizon > 0 and self.model_type == ModelType.tabular and not ema_supported:
+            if self._ema_explicit:
+                raise NotImplementedError(
+                    "ema_horizon is supported on the sensitivity and n_critic=0 paths only, "
+                    "not with overfitting_detection_method='cusum' or an objective_callback."
+                )
+            logging.info("Weight averaging is off for this training path.")
+        self._ema_on = bool(
+            self.ema_horizon > 0
+            and self.model_type == ModelType.tabular
+            and ema_supported
+        )
 
         if trainer_kwargs is not None:
             self.trainer_kwargs.update(trainer_kwargs)
@@ -1809,7 +1839,7 @@ class REaLTabFormer(SharedModelMixin):
             **self.trainer_kwargs,
         )
 
-        if getattr(self, "ema_horizon", 0.0) > 0:
+        if getattr(self, "_ema_on", False):
             trainer.add_callback(EMACallback(self._ema_state, self.ema_horizon))
 
         return trainer

@@ -45,7 +45,7 @@ CONFIGS = {
     # no longer reproduces the earlier matrices. `b0` keeps its historical
     # meaning explicitly; a sampling variant of `{}` now means top_k=0 (use
     # "topk50" for HF's old implicit default).
-    "b0": {"init": {"unk_dropout": 0.0, "oov_strategy": "random"}},
+    "b0": {"init": {"unk_dropout": 0.0, "oov_strategy": "random", "ema_horizon": 0.0}},
     "tiny_e30": {"epochs": 30, "gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3}},
     "tiny_e600": {"epochs": 600, "gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3}},
     "micro_e600": {"epochs": 600, "gpt2": {"n_embd": 64, "n_head": 2, "n_layer": 2}},
@@ -61,13 +61,13 @@ CONFIGS = {
     # interesting. Legacy settings are spelled out so these mean the same thing
     # whatever the library defaults are (see the provenance note in
     # HYPOTHESES.md); sampling uses HF's old top_k=50 like M1-M3.
-    "m4_b0": {"init": {"unk_dropout": 0.0, "oov_strategy": "random"},
+    "m4_b0": {"init": {"unk_dropout": 0.0, "oov_strategy": "random", "ema_horizon": 0.0},
               "sample_variants": {"default": {"top_k": 50}}},
     "m4_tiny": {"gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3},
-                "init": {"unk_dropout": 0.0, "oov_strategy": "random"},
+                "init": {"unk_dropout": 0.0, "oov_strategy": "random", "ema_horizon": 0.0},
                 "sample_variants": {"default": {"top_k": 50}}},
     "m4_tiny_lr3e4": {"gpt2": {"n_embd": 128, "n_head": 4, "n_layer": 3},
-                      "init": {"unk_dropout": 0.0, "oov_strategy": "random"},
+                      "init": {"unk_dropout": 0.0, "oov_strategy": "random", "ema_horizon": 0.0},
                       "train_args": {"learning_rate": 3e-4, "warmup_steps": 0.05},
                       "sample_variants": {"default": {"top_k": 50}}},
 }

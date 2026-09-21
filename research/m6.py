@@ -48,7 +48,7 @@ def run_one(job):
     for k, v in arm["gpt2"].items(): setattr(g, k, v)
     tmp = Path(job["tmp"]); tmp.mkdir(parents=True, exist_ok=True)
     m = REaLTabFormer(model_type="tabular", tabular_config=g, epochs=300, batch_size=8, random_state=seed,
-                      checkpoints_dir=str(tmp / "ckpt"), unk_dropout=0.0, oov_strategy="random", **arm["init"])
+                      checkpoints_dir=str(tmp / "ckpt"), unk_dropout=0.0, oov_strategy="random", ema_horizon=0.0, **arm["init"])
     m.training_args_kwargs.update(arm["train_args"])
     spe = max(1, len(train) // (8 * 4)); t0 = time.time()
     tr = m.fit(train, device="cuda", n_critic=5, n_critic_stop=2, num_bootstrap=rx.default_sensitivity_num_bootstrap(len(train)),

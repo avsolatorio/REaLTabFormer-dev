@@ -20,7 +20,7 @@ bn = SyntheticDataBench(data=df, target_col=target, categorical=is_cls, target_p
 train, test = bn.train_df.reset_index(drop=True), bn.test_df.reset_index(drop=True); bn.train_df = train
 torch.manual_seed(seed); np.random.seed(seed)
 m = REaLTabFormer(model_type="tabular", tabular_config=GPT2Config(n_layer=6), epochs=300, batch_size=8, random_state=seed,
-                  checkpoints_dir=f"/tmp/le_{ds}_{seed}", unk_dropout=0.0, oov_strategy="random")
+                  checkpoints_dir=f"/tmp/le_{ds}_{seed}", unk_dropout=0.0, oov_strategy="random", ema_horizon=0.0)
 spe = max(1, len(train) // (8 * 4))
 tr = m.fit(train, device="cuda", n_critic=5, n_critic_stop=2, num_bootstrap=rx.default_sensitivity_num_bootstrap(len(train)),
            sensitivity_cache_dir=str(REPO / "research" / "cache"), sensitivity_bootstrap_n_jobs=8,

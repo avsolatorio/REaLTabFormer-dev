@@ -45,7 +45,7 @@ def test_default_init():
         assert rtf_model.epochs == 100
         model_vars_tested.add("epochs")
 
-        assert rtf_model.batch_size == 8
+        assert rtf_model.batch_size == (32 if model_type == ModelType.tabular else 8)
         model_vars_tested.add("batch_size")
 
         assert rtf_model.random_state == 1029
@@ -131,7 +131,9 @@ def test_default_init():
             == rtf_model.batch_size
         )
 
-        assert rtf_model.training_args_kwargs["gradient_accumulation_steps"] == 4
+        assert rtf_model.training_args_kwargs["gradient_accumulation_steps"] == (
+            1 if model_type == ModelType.tabular else 4
+        )
         assert rtf_model.training_args_kwargs["remove_unused_columns"] is True
         assert rtf_model.training_args_kwargs["logging_steps"] == 100
         assert rtf_model.training_args_kwargs["save_steps"] == 100
@@ -631,17 +633,17 @@ def _ema_df():
 def test_ema_horizon_final_model_is_the_average_on_the_plain_path(tmp_path):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def fit(**kw):
+    def fit(name, **kw):
         torch.manual_seed(3)
         m = REaLTabFormer(
             model_type="tabular", epochs=3, batch_size=8, random_state=3,
-            checkpoints_dir=str(tmp_path / f"c{len(kw)}"),
+            checkpoints_dir=str(tmp_path / name),
             tabular_config=GPT2Config(n_layer=1, n_embd=32, n_head=2), **kw,
         )
         m.fit(_ema_df(), device=device, n_critic=0)
         return m
 
-    plain, avg = fit(), fit(ema_horizon=1.0)
+    plain, avg = fit("plain", ema_horizon=0.0), fit("avg", ema_horizon=1.0)
     shadow = avg._ema_state["ema"].shadow
     assert all(torch.allclose(p.detach().cpu(), s.cpu()) for p, s in zip(avg.model.parameters(), shadow))
     assert not all(
@@ -704,3 +706,48 @@ def test_ema_weights_are_used_by_the_critic_and_restored_for_training(tmp_path, 
     # The model that fit() loaded back is one of the saved averaged snapshots.
     final = next(m.model.parameters()).detach().cpu()
     assert any(torch.equal(final, s) for s in seen["avg_snapshots"])
+
+
+# --- defaults: batch 32 x accumulation 1 (tabular) and EMA on -------------------
+
+
+def test_default_batch_size_and_accumulation_keep_the_effective_batch():
+    tab = REaLTabFormer(model_type="tabular")
+    assert (tab.batch_size, tab.training_args_kwargs["gradient_accumulation_steps"]) == (32, 1)
+    assert tab.training_args_kwargs["per_device_train_batch_size"] == 32
+
+    # The relational model was not measured: unchanged.
+    rel = REaLTabFormer(model_type="relational")
+    assert (rel.batch_size, rel.training_args_kwargs["gradient_accumulation_steps"]) == (8, 4)
+
+    # Explicit batch sizes keep the ~32 effective batch they always had.
+    for bs, ga in [(8, 4), (16, 2), (32, 1), (64, 1)]:
+        m = REaLTabFormer(model_type="tabular", batch_size=bs)
+        assert m.training_args_kwargs["gradient_accumulation_steps"] == ga, (bs, ga)
+
+    # An explicit accumulation always wins.
+    m = REaLTabFormer(model_type="tabular", gradient_accumulation_steps=2)
+    assert m.training_args_kwargs["gradient_accumulation_steps"] == 2
+
+
+def test_ema_is_on_by_default_but_switched_off_where_unsupported(tmp_path, monkeypatch):
+    class Stop(Exception):
+        pass
+
+    m = REaLTabFormer(model_type="tabular", checkpoints_dir=str(tmp_path / "c"))
+    assert m.ema_horizon == 1.0 and m._ema_explicit is False
+    assert REaLTabFormer(model_type="tabular", ema_horizon=0.0).ema_horizon == 0.0
+
+    def stop(self, *a, **k):
+        raise Stop
+
+    # The default must not break a path that cannot use it: it is just disabled.
+    monkeypatch.setattr(REaLTabFormer, "_train_with_cusum", stop)
+    with pytest.raises(Stop):
+        m.fit(_ema_df(), device="cpu", overfitting_detection_method="cusum")
+    assert m._ema_on is False
+
+    # ...whereas an explicit request for it there is an error, not a silent no-op.
+    explicit = REaLTabFormer(model_type="tabular", ema_horizon=1.0, checkpoints_dir=str(tmp_path / "e"))
+    with pytest.raises(NotImplementedError):
+        explicit.fit(_ema_df(), device="cpu", overfitting_detection_method="cusum")
