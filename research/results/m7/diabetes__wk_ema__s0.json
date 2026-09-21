@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "diabetes",
+  "arm": "wk_ema",
+  "seed": 0,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/results/m7/diabetes__wk_ema__s0.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/tmp/m7_diabetes_wk_ema_0"
+ },
+ "fit_s": 257.28874158859253,
+ "stop_epoch": 105.26315789473684,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 47.36842105263158,
+   "ks_mean": 0.03990228013029316,
+   "tvd_mean": 0.026058631921824116,
+   "marg_mean": 0.03836409699601882,
+   "tail_err": 0.048890029278086194,
+   "assoc_diff": 0.019002247064782676,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.7965798369457148,
+   "util_gap": 0.025253529528733498,
+   "disc_auc": 0.5015039947373447,
+   "dcr_share": 0.5
+  },
+  "best_disc_model": {
+   "epoch": 94.73684210526316,
+   "ks_mean": 0.048045602605863186,
+   "tvd_mean": 0.0456026058631922,
+   "marg_mean": 0.047774158523344185,
+   "tail_err": 0.024690570518062636,
+   "assoc_diff": 0.02090302285233098,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.8021475442433883,
+   "util_gap": 0.01968582223105997,
+   "disc_auc": 0.41648983013082364,
+   "dcr_share": 0.5714285714285714
+  },
+  "not_best_disc_model": {
+   "epoch": 105.26315789473684,
+   "ks_mean": 0.04723127035830618,
+   "tvd_mean": 0.03420195439739415,
+   "marg_mean": 0.04578356858487151,
+   "tail_err": 0.02564358565151048,
+   "assoc_diff": 0.02448924007193463,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.786438655796381,
+   "util_gap": 0.03539471067806732,
+   "disc_auc": 0.3881659221848508,
+   "dcr_share": 0.551948051948052
+  },
+  "last_epoch_model": {
+   "epoch": 105.26315789473684,
+   "ks_mean": 0.04723127035830618,
+   "tvd_mean": 0.03420195439739415,
+   "marg_mean": 0.04578356858487151,
+   "tail_err": 0.02564358565151048,
+   "assoc_diff": 0.02448924007193463,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.786438655796381,
+   "util_gap": 0.03539471067806732,
+   "disc_auc": 0.3881659221848508,
+   "dcr_share": 0.551948051948052
+  }
+ }
+}

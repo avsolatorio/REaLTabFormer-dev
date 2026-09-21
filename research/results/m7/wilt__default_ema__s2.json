@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "wilt",
+  "arm": "default_ema",
+  "seed": 2,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/results/m7/wilt__default_ema__s2.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/tmp/m7_wilt_default_ema_2"
+ },
+ "fit_s": 620.3229782581329,
+ "stop_epoch": 40.333333333333336,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 20.166666666666668,
+   "ks_mean": 0.028468096099199175,
+   "tvd_mean": 0.008524928958925385,
+   "marg_mean": 0.025144234909153546,
+   "tail_err": 0.0788226351268042,
+   "assoc_diff": 0.017200942438148785,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.9776947463768116,
+   "util_gap": 0.011073369565217428,
+   "disc_auc": 0.5175797338087713,
+   "dcr_share": 0.53099173553719
+  },
+  "best_disc_model": {
+   "epoch": 30.25,
+   "ks_mean": 0.030121415654869543,
+   "tvd_mean": 0.007491604236631394,
+   "marg_mean": 0.02634978041849652,
+   "tail_err": 0.09343628579005483,
+   "assoc_diff": 0.015752270957293892,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.9858016304347826,
+   "util_gap": 0.0029664855072464302,
+   "disc_auc": 0.4836924688419295,
+   "dcr_share": 0.5392561983471075
+  },
+  "not_best_disc_model": {
+   "epoch": 35.291666666666664,
+   "ks_mean": 0.02851976233531387,
+   "tvd_mean": 0.006974941875484395,
+   "marg_mean": 0.02492895892534229,
+   "tail_err": 0.0862055366048996,
+   "assoc_diff": 0.017061643692992012,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.9880661231884058,
+   "util_gap": 0.0007019927536232595,
+   "disc_auc": 0.4724021416328893,
+   "dcr_share": 0.53150826446281
+  },
+  "last_epoch_model": {
+   "epoch": 40.333333333333336,
+   "ks_mean": 0.030224748127098945,
+   "tvd_mean": 0.009558253681219323,
+   "marg_mean": 0.026780332386119005,
+   "tail_err": 0.12484775256629246,
+   "assoc_diff": 0.014609320441163424,
+   "trtr": 0.9887681159420291,
+   "tstr": 0.988383152173913,
+   "util_gap": 0.00038496376811603117,
+   "disc_auc": 0.44262188196567404,
+   "dcr_share": 0.5599173553719008
+  }
+ }
+}

@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "diabetes",
+  "arm": "default_ema",
+  "seed": 2,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/results/m7/diabetes__default_ema__s2.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-ema/research/tmp/m7_diabetes_default_ema_2"
+ },
+ "fit_s": 130.63251066207886,
+ "stop_epoch": 31.57894736842105,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 5.2631578947368425,
+   "ks_mean": 0.05150651465798045,
+   "tvd_mean": 0.009771986970684043,
+   "marg_mean": 0.046869344914947514,
+   "tail_err": 0.09460140944677417,
+   "assoc_diff": 0.026487040978134566,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.8110091743119265,
+   "util_gap": -0.03098878695208962,
+   "disc_auc": 0.5485204087046016,
+   "dcr_share": 0.525974025974026
+  },
+  "best_disc_model": {
+   "epoch": 21.05263157894737,
+   "ks_mean": 0.04784201954397395,
+   "tvd_mean": 0.0016286644951140072,
+   "marg_mean": 0.04270720231632284,
+   "tail_err": 0.06825958447286705,
+   "assoc_diff": 0.028084241303286597,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.8228338430173293,
+   "util_gap": -0.042813455657492394,
+   "disc_auc": 0.43327250156500335,
+   "dcr_share": 0.5584415584415584
+  },
+  "not_best_disc_model": {
+   "epoch": 26.31578947368421,
+   "ks_mean": 0.044788273615635185,
+   "tvd_mean": 0.013029315960912058,
+   "marg_mean": 0.04125950054288817,
+   "tail_err": 0.08746659513417208,
+   "assoc_diff": 0.03512644828468635,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.801019367991845,
+   "util_gap": -0.020998980632008113,
+   "disc_auc": 0.36775987013124806,
+   "dcr_share": 0.6558441558441559
+  },
+  "last_epoch_model": {
+   "epoch": 31.57894736842105,
+   "ks_mean": 0.044177524429967426,
+   "tvd_mean": 0.014657980456026065,
+   "marg_mean": 0.040897575099529494,
+   "tail_err": 0.0723371283193358,
+   "assoc_diff": 0.03084672483357394,
+   "trtr": 0.7800203873598369,
+   "tstr": 0.7904179408766564,
+   "util_gap": -0.01039755351681948,
+   "disc_auc": 0.3653526827870853,
+   "dcr_share": 0.5454545454545454
+  }
+ }
+}
