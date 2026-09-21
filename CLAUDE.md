@@ -92,9 +92,11 @@ comparisons were shown to mislead in this project. Two rules learned the hard
 way: never edit `src/` or `research/bench.py`/`configs.py` in a worktree while a
 matrix launched from it is still starting jobs (each job re-imports them), and
 when matching processes with `pkill -f`, use a pattern that cannot match your own
-shell command. Library defaults changed on 2026-09-20 (see the provenance note
-in `research/HYPOTHESES.md`) -- an old config name may not mean what its old
-results meant.
+shell command. Library defaults changed on 2026-09-20 and again on 2026-09-21 (weight averaging on,
+tabular batch 32 x 1; see the provenance notes in `research/HYPOTHESES.md`) -- an old config
+name may not mean what its old results meant. Also: never run two drivers into one results
+directory (their `.job_N.json` specs collide), smoke-test a new matrix script in the worktree it will
+run from before launching it, and count only successful result files when reporting progress.
 
 ## Ultra/cloud code review on this branch
 

@@ -150,6 +150,16 @@ the current status of each idea and points at the raw data.
   DCR computed on rank-transformed values, and a nearest-neighbour check that
   ignores the snapped columns, should show no excess.
 
+## Provenance: library defaults changed AGAIN on 2026-09-21 (weight averaging on; tabular batch 32 x 1)
+
+On top of the 2026-09-20 changes below, `REaLTabFormer(model_type="tabular")` now defaults to `ema_horizon=1.0`
+(the AVERAGED weights are what is sampled, saved and returned) and to `batch_size=32` with
+`gradient_accumulation_steps=1` (relational stays 8 x 4; an explicit `batch_size=8` still gives 8 x 4). Every matrix
+before this change ran with EMA off and 8 x 4. The research scripts (`configs.py` `b0`/`m4_*`, `m5.py`, `m6.py`, `m8.py`,
+`loaded_epoch.py`) now pin `ema_horizon=0.0` explicitly; `bench.py` already passes `batch_size=8`. Named configs that do not
+say otherwise (`base`, `qenc`, `small`, `tiny`, ...) mean "the current defaults" -- to reproduce an earlier number, pass
+`ema_horizon: 0.0` in `init`. `curves.py` and `signals.py` drive `_fit_tabular` directly and are unaffected.
+
 ## Provenance: library defaults changed on 2026-09-20 (`933e95c`)
 
 Results before that date were produced with `unk_dropout=0`,

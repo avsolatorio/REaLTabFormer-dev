@@ -1178,3 +1178,26 @@ excluded), CUDA-synchronised timing, on a quiet box. (b) M8: the real sensitivit
 memory (so a smaller GPU may need the old split), which is why it is a user setting and not a silent change. `bf16` and fused AdamW add ~10-20% each on top. `torch.compile` gives the largest
 extra gain in the micro-benchmark but is NOT recommended without care: the critic loop rebuilds the Trainer every `n_critic` epochs and may recompile each time (untested end to end), and the
 compile warm-up was excluded from the timing. Not measured: datasets above 10,000 rows, multi-GPU, and the load-free absolute times (M8 groups shared a busy box, so only ratios are meaningful).
+
+---
+
+## 2026-09-21 02:39 UTC — Adopted on `feat/support-seed-input`: weight averaging on by default, tabular batch 32 x 1, the sensitivity-path fix, opt-in constrained loss, and the research harness (owner: "merge all that improves the solution")
+
+Code: merges of `exp/utility-optimization`, `exp/constrained-loss` (`a0f20e9`) and `exp/ema-weights` (`f1da71c`), then the default changes. Full suite on the result: 189 passed, 2 failed
+(`test_default_init`, whose assertions were already stale -- `evaluation_strategy` was renamed `eval_strategy` and it expects 100 epochs -- and `test_TabularSampler`'s NaN failure).
+The owner approved the merges, EMA as the default, and batch 32 x 1 as the default, explicitly.
+
+**What changed and why (evidence in the entries above):**
+1. **Sensitivity-path fix (bug):** `fit()` forwards `field_weights`, `compute_loss_func`, `predict_fields`, `digit_entropy_weighting` to the default training path (they were silently dropped unless
+   `n_critic=0`); a test fails with `KeyError` on the old code. Anyone who passed those arguments under the default regime got no effect before this.
+2. **`ema_horizon` defaults to 1.0 for tabular models** (M7: `marg_mean` -0.027 to -0.039 at every checkpoint rule on the default GPT2, 18/0; held-out 6/0; no utility or privacy-proxy change;
+   c1/c2: 14 of 14 training variants). Safeguards: switched off automatically with `overfitting_detection_method="cusum"` or an `objective_callback`, and only an EXPLICIT request there raises.
+3. **Tabular `batch_size` defaults to 32 with `gradient_accumulation_steps=max(1, round(32/batch_size))`** (M8: 1.85x-2.71x faster fits, no consistent quality difference). Effective batch stays ~32:
+   an explicit `batch_size=8` still gives 8 x 4; relational keeps 8 x 4 (not measured); `REaLTabFormer2` is unchanged. Needs ~4x the per-step activation memory -- lower `batch_size` on a small GPU.
+4. **Opt-in `constrained_loss`** (a minor lever; off by default) and the research harness, notebook and raw results.
+
+**Provenance / what this does to earlier numbers:** all results above this entry were produced with weight averaging OFF and batch 8 x 4; the research scripts now pin those explicitly (see the
+provenance note in `research/HYPOTHESES.md`). Behaviour change for users: models trained with the defaults now return the AVERAGED weights (a different model from before), and the default
+tabular per-step memory is ~4x higher.
+
+**Known limits:** the evidence covers datasets up to 10,000 rows and single-GPU training; EMA together with the constrained loss is untested; `torch.compile`/`bf16` were measured but not adopted.
