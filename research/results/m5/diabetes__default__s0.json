@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "diabetes",
+  "arm": "default",
+  "seed": 0,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/results/m5/diabetes__default__s0.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/tmp/m5_diabetes_default_0"
+ },
+ "fit_s": 128.1897382736206,
+ "stop_epoch": 31.57894736842105,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 5.2631578947368425,
+   "ks_mean": 0.11787459283387622,
+   "tvd_mean": 0.0570032573289902,
+   "marg_mean": 0.1111111111111111,
+   "tail_err": 0.09629208581393361,
+   "assoc_diff": 0.023055804120911353,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.8363491747862398,
+   "util_gap": -0.014515808311791556,
+   "disc_auc": 0.7680028435314963,
+   "dcr_share": 0.5324675324675324
+  },
+  "best_disc_model": {
+   "epoch": 21.05263157894737,
+   "ks_mean": 0.07145765472312704,
+   "tvd_mean": 0.0732899022801303,
+   "marg_mean": 0.07166123778501629,
+   "tail_err": 0.030890154440643178,
+   "assoc_diff": 0.023237714355662423,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.8443030423543447,
+   "util_gap": -0.022469675879896456,
+   "disc_auc": 0.5485920275016181,
+   "dcr_share": 0.525974025974026
+  },
+  "not_best_disc_model": {
+   "epoch": 15.789473684210526,
+   "ks_mean": 0.09894136807817588,
+   "tvd_mean": 0.11074918566775246,
+   "marg_mean": 0.10025334781035106,
+   "tail_err": 0.09785748242470384,
+   "assoc_diff": 0.023007699018556697,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.7530324120103401,
+   "util_gap": 0.06880095446410817,
+   "disc_auc": 0.636677842735732,
+   "dcr_share": 0.5844155844155844
+  },
+  "last_epoch_model": {
+   "epoch": 31.57894736842105,
+   "ks_mean": 0.07227198697068404,
+   "tvd_mean": 0.04234527687296419,
+   "marg_mean": 0.06894679695982628,
+   "tail_err": 0.03427125364028399,
+   "assoc_diff": 0.03127090047921954,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.8321733943129848,
+   "util_gap": -0.010340027838536492,
+   "disc_auc": 0.4771323833674628,
+   "dcr_share": 0.6168831168831169
+  }
+ }
+}

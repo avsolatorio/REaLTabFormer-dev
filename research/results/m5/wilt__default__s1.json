@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "wilt",
+  "arm": "default",
+  "seed": 1,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/results/m5/wilt__default__s1.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/tmp/m5_wilt_default_1"
+ },
+ "fit_s": 659.259482383728,
+ "stop_epoch": 35.291666666666664,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 15.125,
+   "ks_mean": 0.05667786101782485,
+   "tvd_mean": 0.029966416946525458,
+   "marg_mean": 0.05222595367260829,
+   "tail_err": 0.0559774790465334,
+   "assoc_diff": 0.022339067902336508,
+   "trtr": 0.9890185590404409,
+   "tstr": 0.9766998946430019,
+   "util_gap": 0.012318664397439005,
+   "disc_auc": 0.6253058715253839,
+   "dcr_share": 0.5165289256198347
+  },
+  "best_disc_model": {
+   "epoch": 25.208333333333332,
+   "ks_mean": 0.039783001808318265,
+   "tvd_mean": 0.020924825626453127,
+   "marg_mean": 0.036639972444674075,
+   "tail_err": 0.1039721917287244,
+   "assoc_diff": 0.02157518593886892,
+   "trtr": 0.9890185590404409,
+   "tstr": 0.9814004376367615,
+   "util_gap": 0.007618121403679345,
+   "disc_auc": 0.5826891348281216,
+   "dcr_share": 0.5092975206611571
+  },
+  "not_best_disc_model": {
+   "epoch": 30.25,
+   "ks_mean": 0.06261947817101524,
+   "tvd_mean": 0.0005166623611469953,
+   "marg_mean": 0.05226900886937053,
+   "tail_err": 0.1502931147608361,
+   "assoc_diff": 0.01502922726485653,
+   "trtr": 0.9890185590404409,
+   "tstr": 0.9777737255855419,
+   "util_gap": 0.011244833454899017,
+   "disc_auc": 0.6094214068925642,
+   "dcr_share": 0.518595041322314
+  },
+  "last_epoch_model": {
+   "epoch": 35.291666666666664,
+   "ks_mean": 0.053939550503745805,
+   "tvd_mean": 0.011366571945233807,
+   "marg_mean": 0.04684405407732714,
+   "tail_err": 0.10407856282872745,
+   "assoc_diff": 0.019730851230373166,
+   "trtr": 0.9890185590404409,
+   "tstr": 0.9835683604830213,
+   "util_gap": 0.005450198557419572,
+   "disc_auc": 0.597231625368936,
+   "dcr_share": 0.5371900826446281
+  }
+ }
+}
