@@ -991,3 +991,43 @@ untested in combination and untested in the real sensitivity regime, where the c
 correction) matters more than the training length. Next: c2 (the remaining Program-2 ideas, each arm with its EMA copy),
 and the real-regime M6 for the loss. Caveats: 3 small datasets; marginal error is the metric that moves, associations and
 TSTR mostly do not; EMA at very early epochs is harmful for long horizons.
+
+---
+
+## 2026-09-21 00:04 UTC — M5 (final, 36 fits): model size and checkpoint rule are separate levers; the recipe's checkpoint rule costs a lot of fidelity; the small model's advantage is real but modest and costs 2-4x training time
+
+Code/data: `research/m5.py`, `research/results/m5` at `639c476`. Same protocol as the 21:01 UTC correction: real sensitivity
+regime, one fit leaves four checkpoints, each scored on the same sample protocol. Default GPT2 vs small GPT2
+(128d/4h/3L, lr 3e-4), all six datasets x seeds 0-2 (18 paired fits; wilt and churn2 held-out). Legacy settings
+(unk_dropout 0, oov random, top_k 50), teacher-forced target. Deterministic: the default arm reproduced the earlier
+six-run comparison exactly for the same seeds.
+
+**Question:** Once each model is taken at a sensible checkpoint, how much of M2/M3's small-model advantage remains,
+and how much is the recipe's own checkpoint rule?
+
+**Result (paired on 18 fits; mean +-s.e., wins/losses; lower better except TSTR; `dcr_share` 0.5 = no memorisation):**
+- **Checkpoint rule, default model, vs the recipe's `mean_best` (loaded epoch ~12):** `last_epoch` (~33): discriminator
+  distance -0.098 +-0.019 (16 better/2), `marg_mean` -0.016 +-0.006 (12/6), TSTR +0.010 +-0.004 (13/5), `assoc_diff`
+  +0.004 +-0.002 (5 better/13 worse), `dcr_share` +0.031 +-0.010. `best_disc` (~23; what `load_from_best_mean_sensitivity=False`,
+  the library default, loads): discriminator distance -0.066 +-0.015 (15/2), TSTR +0.011 +-0.004 (15/2), `marg_mean` -0.010
+  +-0.005 (11/6), `dcr_share` +0.022 +-0.008. Mean `dcr_share`: 0.520 (`mean_best`), 0.542 (`best_disc`), 0.551 (`last_epoch`)
+  -- fresh real data scores 0.50-0.535. So it is a trade: later checkpoints buy fidelity and utility at a modest, measurable rise in the
+  closeness proxy. The small model shows the same direction with smaller sizes.
+- **Model size (small - default) at each rule:** `marg_mean` -0.025 +-0.005 (18/0) at `mean_best`, -0.025 +-0.004 (17/1) at
+  `best_disc`, -0.019 +-0.004 (15/3) at `last_epoch`; `assoc_diff` -0.004 to -0.006 (13/5 to 16/2); discriminator distance
+  -0.098 +-0.014 (18/0) at `mean_best`, -0.068 +-0.009 (18/0) at `best_disc`, -0.029 +-0.011 (12/6) at `last_epoch`; TSTR ~0 at every
+  rule; `dcr_share` within +-0.015. On the two held-out datasets alone (6 fits) every rule gives `marg_mean` -0.016 to -0.030 (all
+  better), `assoc_diff` -0.006 (6/0), discriminator distance -0.06 (6/0).
+- **Cost:** stopping epoch 32 vs 120 (median); wall-clock median 559 s vs 1,301 s on all datasets, 1,337 s vs 5,179 s on the
+  held-out pair (load-confounded, but 2-4x).
+
+**Implication:** (1) M2/M3's discriminator headline (-0.15) was mostly the recipe's checkpoint rule; against a fair checkpoint
+the small model's discriminator advantage is -0.03 to -0.07, and it disappears for some datasets at the last epoch. (2) What survives,
+including on held-out data, is a consistent modest gain in marginal error (~-0.02) and association error (~-0.005) at no change
+in downstream utility or in the privacy proxies, for 2-4x more training. That supports an OPT-IN small-model preset for users who
+want the fidelity and can pay the time; it does not support a default change. (3) The checkpoint rule is the larger lever, and it is a
+fidelity-vs-closeness trade the owner should choose knowingly: DECISION_LOG recommends `load_from_best_mean_sensitivity=True`
+(lowest closeness, lowest fidelity); the library default (`False`) gives ~-0.07 discriminator distance and +0.011 TSTR for
++0.022 `dcr_share`. (4) M4's calibrated memorisation check (with the recipe's checkpoint) found no detectable increase for the
+small model (`dcr_share` 0.531 vs 0.523, +0.006 +-0.009, 14 units); M5 shows later checkpoints of it are closer (+0.027 vs
+`mean_best`), so that reassurance applies to the recipe's checkpoint. Not tested: larger datasets than 10,000 rows.
