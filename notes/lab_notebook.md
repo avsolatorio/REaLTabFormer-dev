@@ -1146,3 +1146,35 @@ the defaults; several of my predictions (H11 hub-first, H14 neutral-to-better) w
 model is answered for the recipe's checkpoint: the calibrated direct measure shows no detectable increase (both readings within the 0.50-0.535 range fresh real data scores);
 M5 showed later checkpoints are closer, so that statement is about the recipe's checkpoint. Limits: fixed-epoch protocol with a small GPT2 on three small datasets; `c2` arms were
 not run in the real stopping regime.
+
+---
+
+## 2026-09-21 02:14 UTC — H13 confirmed: batch 32 x accumulation 1 trains 3.2-3.5x faster and fits 1.9-2.7x faster end to end, with no consistent quality difference
+
+Code/data: `research/bench_train_speed.py` (log `research/speed_bench.log`), `research/m8.py`, `research/results/m8` (32 fits, none failed) at `827fea0`; quality
+also from c1 (`wk_bs32`, 9 units). All at the SAME effective batch (32) and the same number of optimizer steps per epoch; only the split between per-step batch and
+accumulation differs.
+
+**Question:** The default trains with batch 8 x gradient accumulation 4 (effective 32) on a GPU these models under-fill. Does batch 32 x accumulation 1 give the same
+model faster, and how much of a whole fit does that save?
+
+**What was done:** (a) Controlled training-throughput micro-benchmark on adult5k: 7 configurations interleaved round-robin, 3 repetitions each, 60 optimizer steps (first 15
+excluded), CUDA-synchronised timing, on a quiet box. (b) M8: the real sensitivity regime end to end, 4 datasets x 2 seeds x {default, small} x {8x4, 32x1}; the four arms of each
+(dataset, seed) group ran together on ONE GPU so they shared the same contention, and the comparison is within groups (16 paired groups).
+
+**Result:**
+- **Training throughput (rows/s; small / default GPT2):** 8x4 fp16 (current) 715 / 558; **32x1 fp16 2,473 (3.46x) / 1,781 (3.19x)**; 32x1 bf16 3.59x / 3.11x; 32x1 fp16 + fused AdamW
+  3.83x / 3.30x; 32x1 bf16 + fused AdamW 4.20x / 3.61x; 32x1 bf16 + `torch.compile` 6.20x / 5.26x; batch 64 (a different effective batch) 7.51x / 6.23x. Repetition ranges are tight
+  (e.g. 2,444-2,498 for 32x1 fp16 small).
+- **End to end (M8), fit time 8x4 / 32x1 (geometric mean over paired groups):** default model **1.85x** (n=8, range 1.52-2.30); small model **2.71x** (n=8, range 2.53-3.04);
+  all groups 2.24x; total wall-clock 4,485 s vs 1,882 s (2.38x). Below the training-only 3.2-3.5x because the critic rounds (sampling + bootstrap) are unchanged.
+- **Quality, 32x1 minus 8x4 (mean +-s.e. over 16 groups; better/worse for 32x1):** `marg_mean` at the recipe's checkpoint -0.0055 +-0.0040 (10/6), at `best_disc` +0.0023 +-0.0030 (7/9), at the last
+  epoch +0.0043 +-0.0024 (6/10); discriminator distance -0.0189 +-0.0099 (9/7) / +0.0029 +-0.0073 (7/9) / -0.0076 +-0.0051 (9/7); TSTR -0.0009 (9/7) / -0.0067 +-0.0037 (10/6); `dcr_share` -0.0059 +-0.0076.
+  Mixed signs, all within ~2 s.e.: no consistent difference. The stopping epoch differs by +2.1 epochs on average and is identical in 50% of groups -- the two settings are not numerically
+  identical (different RNG streams and reduction order), so the noisy critic sometimes stops at a different round, in either direction. c1's fixed-epoch curves (9 units, no stopping rule) agree:
+  `wk_bs32` within +-0.001 on `marg_mean` at every epoch.
+
+**Implication:** `batch_size=32` with `gradient_accumulation_steps=1` is a free 1.9-2.7x wall-clock reduction for a fit, with no measurable quality change; it needs ~4x the per-step activation
+memory (so a smaller GPU may need the old split), which is why it is a user setting and not a silent change. `bf16` and fused AdamW add ~10-20% each on top. `torch.compile` gives the largest
+extra gain in the micro-benchmark but is NOT recommended without care: the critic loop rebuilds the Trainer every `n_critic` epochs and may recompile each time (untested end to end), and the
+compile warm-up was excluded from the timing. Not measured: datasets above 10,000 rows, multi-GPU, and the load-free absolute times (M8 groups shared a busy box, so only ratios are meaningful).

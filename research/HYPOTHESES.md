@@ -186,7 +186,7 @@ abalone, adult5k; winners are confirmed on held-out wilt/churn2.
   weight decay 0.01 neutral.
 - **Test:** `wk` + {ls0.05, ls0.10, drop0, drop0.2, wd0.01}.
 
-### H13 -- Efficiency: batch 32 x accum 1 equals batch 8 x accum 4, faster
+### H13 -- Efficiency: batch 32 x accum 1 equals batch 8 x accum 4, faster -- CONFIRMED (3.2-3.5x training throughput; 1.85x / 2.71x end to end; no consistent quality difference)
 - **Why:** identical effective batch and update count, 4x fewer kernel launches on
   a GPU these models under-fill; also bf16 / fused AdamW / torch.compile.
 - **Prediction:** same quality within noise; >=1.5x steps/s. Measured in an
