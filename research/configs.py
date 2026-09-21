@@ -70,4 +70,15 @@ CONFIGS = {
                       "init": {"unk_dropout": 0.0, "oov_strategy": "random", "ema_horizon": 0.0},
                       "train_args": {"learning_rate": 3e-4, "warmup_steps": 0.05},
                       "sample_variants": {"default": {"top_k": 50}}},
+
+    # ---- Before/after: the tool exactly as it was at the start of the utility-optimisation work
+    # (commit e9e6c96, checked out as a separate worktree) vs. the current code, each called with ITS
+    # OWN defaults. `_default` uses the library's default checkpoint rule (load_from_best_mean_sensitivity=False);
+    # `_recipe` uses the previously recommended True. The new arms pass batch_size=None so the new
+    # tabular default (32 x 1) applies; the old arms pass the old default 8 (accumulation 4).
+    "old_default": {"src": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-base/src",
+                    "fit": {"load_from_best_mean_sensitivity": False}},
+    "old_recipe": {"src": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-base/src"},
+    "new_default": {"batch_size": None, "fit": {"load_from_best_mean_sensitivity": False}},
+    "new_recipe": {"batch_size": None},
 }

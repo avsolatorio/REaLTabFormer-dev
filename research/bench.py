@@ -37,7 +37,9 @@ import pandas as pd
 
 REPO = Path(__file__).resolve().parents[1]
 EXP = REPO / "research"
-sys.path.insert(0, str(REPO / "src"))
+# RTF_SRC lets a job run against a different checkout of the library (see the `src` key in configs.py),
+# e.g. the code as it was before a change, for a true before/after comparison.
+sys.path.insert(0, os.environ.get("RTF_SRC") or str(REPO / "src"))
 sys.path.insert(0, str(REPO / "cusum_validation"))
 sys.path.insert(0, str(EXP))
 
@@ -411,6 +413,8 @@ def run_matrix(args) -> None:
     for w in range(args.workers):
         slots.put(args.gpus[w % len(args.gpus)])
 
+    import configs as cfgmod
+
     def work(i_job):
         i, job = i_job
         gpu = slots.get()
@@ -418,6 +422,9 @@ def run_matrix(args) -> None:
         jp.write_text(json.dumps(job))
         env = dict(os.environ, CUDA_VISIBLE_DEVICES=str(gpu),
                    OMP_NUM_THREADS="8", TOKENIZERS_PARALLELISM="false")
+        src = cfgmod.CONFIGS.get(job["config"], {}).get("src")
+        if src:
+            env["RTF_SRC"] = src
         t0 = time.time()
         log = out / "logs"
         log.mkdir(exist_ok=True)
