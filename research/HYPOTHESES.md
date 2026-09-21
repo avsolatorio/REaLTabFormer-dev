@@ -201,7 +201,7 @@ abalone, adult5k; winners are confirmed on held-out wilt/churn2.
   clearly faster per row; `numeric_categorical_threshold=20` helps low-cardinality
   numeric columns and is neutral elsewhere.
 
-### H15 -- A label-free overfitting signal: the self-referential likelihood gap (SRLG)
+### H15 -- A label-free overfitting signal: the self-referential likelihood gap (SRLG) -- FALSIFIED (see the notebook, H15/H15b closed)
 - **Idea:** for the trained model q, compare the per-row negative log-likelihood of
   (a) the training rows and (b) the model's OWN samples, both under q (constrained
   to valid column tokens). If q generalises, the two NLL distributions agree; if q
@@ -227,7 +227,7 @@ abalone, adult5k; winners are confirmed on held-out wilt/churn2.
   gives lower `marg_mean` and discriminator distance than the raw weights at the
   same step, with no privacy change. (Cheap, standard for generative models.)
 
-### H15b -- A fixed label-free stopping rule, tested out of sample (pre-registered 2026-09-20 21:52 UTC)
+### H15b -- A fixed label-free stopping rule, tested out of sample (pre-registered 2026-09-20 21:52 UTC) -- FALSIFIED on held-out data (criteria (ii),(iii-a),(iv) failed; see the notebook for the run-length flaw in the pre-registration)
 - **Rule R\*:** stop at the first checkpoint where `srlg_ks` >= (its running minimum) + 0.25.
   delta was chosen by scanning {0.05,0.1,0.2,0.3,0.5} on the 20 dev runs of `s1`
   (diabetes, insurance, abalone, adult5k), so dev numbers for it are optimistic; the

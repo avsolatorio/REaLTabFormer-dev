@@ -1031,3 +1031,47 @@ fidelity-vs-closeness trade the owner should choose knowingly: DECISION_LOG reco
 +0.022 `dcr_share`. (4) M4's calibrated memorisation check (with the recipe's checkpoint) found no detectable increase for the
 small model (`dcr_share` 0.531 vs 0.523, +0.006 +-0.009, 14 units); M5 shows later checkpoints of it are closer (+0.027 vs
 `mean_best`), so that reassurance applies to the recipe's checkpoint. Not tested: larger datasets than 10,000 rows.
+
+---
+
+## 2026-09-21 00:09 UTC — H15 / H15b closed: the self-referential likelihood-gap signals do not track overfitting as predicted, and the pre-registered stopping rule R* is FALSIFIED on held-out data
+
+Code/data: `research/signals.py`, `signals_analyze.py`, `signals_rules.py`, `signals_prereg.py`; raw curves in
+`research/results/{s1,s1h_d,s1h_w}` at `8696004`. Plain training with NO stopping rule, checkpoint every 5 (default) / 10 (small)
+epochs; dev = 4 datasets x 3 seeds x {default, small GPT2} (24 runs, 120 / 300 epochs); held-out = wilt, churn2 x 3 seeds x 2 arms
+(12 runs, 60 / 150 epochs -- shortened to save compute, see the flaw below). No teacher forcing, legacy settings.
+
+**Question:** Can overfitting be detected WITHOUT held-out data by comparing, under the model itself, the per-row NLL of its training
+rows with that of its own samples (`srlg_mean`, `srlg_ks`, `srlg_tail`), and can that drive a stopping rule?
+
+**Result:**
+- **The pre-registered H15 prediction is false.** Within-run Spearman of each signal with the TRUE generalisation gap (held-out minus
+  train NLL) was predicted > 0.6 in most runs. Observed (dev, median [q25,q75]): `srlg_ks` -0.50 [-0.59,-0.39] for the default model
+  (0% of runs > 0.6) and +0.47 [+0.43,+0.60] for the small model (25% > 0.6); `srlg_mean` -0.28 / +0.45; `srlg_tail` -0.01 / -0.28.
+  With memorisation (`dcr_share`): `srlg_ks` -0.21 / +0.41. The sign flips between models, so it is not a usable monotone signal.
+- **Why (a hypothesis, not tested):** once the model collapses onto its training rows its samples ARE training rows, so "training rows vs
+  samples" shows no difference exactly when memorisation is worst; the signals rise then fall (e.g. diabetes default: `srlg_ks` 0.07 at
+  epoch 5, 0.88 at 30, 0.11 at 120, while the true gap grew to 76 nats).
+- **Retracted:** an early observation that `srlg_ks`'s minimum falls at the same epoch as held-out NLL's did not replicate on a second dataset.
+- **Held-out likelihood is the wrong thing to stop on for synthetic data.** Its minimum is at epoch 5-8 (default) / ~40 (small); sample
+  quality is best much later: discriminator-optimal epoch ~35-52 (default) / ~100 (small); marginal error is still improving at the end of
+  every run. Stopping at the held-out-NLL minimum gave discriminator distance ~0.20 (dev, default) / ~0.12 (held-out, default).
+- **H15b: R\* (stop when `srlg_ks` >= running min + 0.25) is FALSIFIED by its own pre-registered criteria** (held-out, 12 runs): (i) fires
+  12/12 PASS; (ii) stop within x2 of the discriminator-optimal epoch in 50% (needed 75%) FAIL; (iii-a) mean discriminator distance at stop
+  0.043 vs 0.024 at the last epoch FAIL; (iii-b) 0.043 vs 0.086 at the held-out-NLL minimum PASS; (iv) `dcr_share` 0.517 at stop vs 0.525 at
+  last (needed >= 0.03 lower) FAIL. Falsification condition "(iii) fails" is met. By arm: default stops at a median epoch 20 vs a
+  discriminator-optimal ~52 (ratios 0.36-0.45: too early), discriminator distance 0.065 at stop vs 0.031 at last vs 0.117 at the NLL minimum;
+  small model stops at 80 vs ~115, distance 0.021 vs 0.017 vs 0.054, `dcr_share` 0.511 vs 0.510.
+- **A flaw in my pre-registration that limits how (iii-a) and (iv) should be read:** I shortened the held-out runs (60 / 150 epochs), so
+  "last epoch" there is close to the optimum, whereas on the 120 / 300-epoch dev runs it had already degraded (discriminator distance 0.13-0.14).
+  The criteria were therefore easier for "last" than they were on dev. This does not rescue R\*: (ii) is a criterion about R\* itself and it also
+  failed, and R\* stops early for the default model; it only means the comparison with "last epoch" was less informative than intended.
+  Also: delta was tuned on the dev runs (scan over 0.05-0.5), and the dev advantage (e.g. discriminator distance 0.056 vs a hindsight-chosen fixed
+  epoch's 0.050) did not carry over.
+
+**Implication:** The label-free likelihood-gap idea does not deliver a stopping rule better than what exists, and I do not recommend it. What the
+study did establish, on both dev and held-out data: (1) held-out-likelihood early stopping is inappropriate for synthetic data; (2) likelihood
+overfitting, sample-quality overfitting and memorisation begin at very different epochs (5-8, ~35-100, and later), so "overfitting" has to be
+specified before a detector can be judged; (3) the checkpoint the tool loads matters more than where it stops (M5). The tool's existing
+label-free-of-held-out-data mechanisms (bootstrap sensitivity, CUSUM) remain the baselines; I have not compared R* with them in the real trainer
+and no longer plan to. A new rule would need fresh seeds for validation, since all 36 curves have now been seen.
