@@ -1,0 +1,65 @@
+{
+ "job": {
+  "dataset": "diabetes",
+  "arm": "wk_b32",
+  "seed": 0,
+  "out_json": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/results/m8/diabetes__wk_b32__s0.json",
+  "tmp": "/home/jupyter-wb536061/WBG/REaLTabFormer-dev-exp/research/tmp/m8_diabetes_wk_b32_0"
+ },
+ "fit_s": 40.08336687088013,
+ "stop_epoch": 100.0,
+ "checkpoints": {
+  "mean_best_disc_model": {
+   "epoch": 47.36842105263158,
+   "ks_mean": 0.06942182410423453,
+   "tvd_mean": 0.03420195439739415,
+   "marg_mean": 0.06550850524791893,
+   "tail_err": 0.06166081788660269,
+   "assoc_diff": 0.021581612836580548,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.8055279379598329,
+   "util_gap": 0.01630542851461536,
+   "disc_auc": 0.5345335229020998,
+   "dcr_share": 0.461038961038961
+  },
+  "best_disc_model": {
+   "epoch": 89.47368421052632,
+   "ks_mean": 0.04030944625407166,
+   "tvd_mean": 0.057003257328990226,
+   "marg_mean": 0.042164314151284826,
+   "tail_err": 0.03409227740769956,
+   "assoc_diff": 0.017621291110610875,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.7774905547822629,
+   "util_gap": 0.04434281169218535,
+   "disc_auc": 0.4479808804337447,
+   "dcr_share": 0.5324675324675324
+  },
+  "not_best_disc_model": {
+   "epoch": 94.73684210526316,
+   "ks_mean": 0.06412866449511401,
+   "tvd_mean": 0.06188925081433225,
+   "marg_mean": 0.06387984075280492,
+   "tail_err": 0.05741655196073392,
+   "assoc_diff": 0.02410068180079997,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.7981706104593359,
+   "util_gap": 0.023662756015112363,
+   "disc_auc": 0.4597449309807001,
+   "dcr_share": 0.551948051948052
+  },
+  "last_epoch_model": {
+   "epoch": 100.0,
+   "ks_mean": 0.07105048859934854,
+   "tvd_mean": 0.10912052117263846,
+   "marg_mean": 0.07528049221860297,
+   "tail_err": 0.11152154634947986,
+   "assoc_diff": 0.016714262632484087,
+   "trtr": 0.8218333664744483,
+   "tstr": 0.8021475442433883,
+   "util_gap": 0.01968582223105997,
+   "disc_auc": 0.4826231578053879,
+   "dcr_share": 0.5909090909090909
+  }
+ }
+}
