@@ -222,7 +222,7 @@ abalone, adult5k; winners are confirmed on held-out wilt/churn2.
 - **Falsified if:** within-run correlation with the true gap is weak or the sign is
   inconsistent across datasets even after baselining.
 
-### H16 -- Weight averaging (EMA) improves the stopped model
+### H16 -- Weight averaging (EMA) improves the stopped model -- CONFIRMED (c1 fixed-epoch; M7 real regime, 18 units, held-out 6/0)
 - **Prediction:** an EMA of the weights (decay ~0.999) sampled at the stopping point
   gives lower `marg_mean` and discriminator distance than the raw weights at the
   same step, with no privacy change. (Cheap, standard for generative models.)

@@ -1075,3 +1075,40 @@ overfitting, sample-quality overfitting and memorisation begin at very different
 specified before a detector can be judged; (3) the checkpoint the tool loads matters more than where it stops (M5). The tool's existing
 label-free-of-held-out-data mechanisms (bootstrap sensitivity, CUSUM) remain the baselines; I have not compared R* with them in the real trainer
 and no longer plan to. A new rule would need fresh seeds for validation, since all 36 curves have now been seen.
+
+---
+
+## 2026-09-21 01:34 UTC — M6 + M7 (real regime, 18 paired units each): weight averaging (EMA) is a robust, free improvement that matches the small model's fidelity gain; the constraint-aware loss is a minor lever
+
+Code/data: M6 raw results at `429dc8d` on `exp/constrained-loss` (library `a0f20e9`); M7 at `e777d8d` on `exp/ema-weights` (library `f1da71c`, 183 tests
+passed / 2 known failures). Protocol = M5: real sensitivity regime, four checkpoints per fit, all six datasets x seeds 0-2, default and small GPT2, legacy
+settings, teacher-forced target; each arm paired with M5's identical-seed run of the same model without the option (the default arm reproduced earlier runs
+exactly, so the baseline is deterministic). M6 = `constrained_loss=True`; M7 = `ema_horizon=1.0`. (Two earlier problems: a first M6 attempt crashed after
+training because its worktree lacked a metric -- fixed and smoke-tested before the rerun -- and some jobs were lost to GPU out-of-memory from over-subscription.)
+
+**Question:** Do the two fixed-epoch efficiency findings (c1: constrained loss ~2x faster to the same ceiling; EMA reaches the raw weights' final marginal error
+~3x sooner) survive the real stopping regime and the checkpoint the tool actually loads?
+
+**Result (paired on 18 units; mean +-s.e., wins/losses; lower better except TSTR):**
+- **M7 EMA, default model, vs no EMA:** `marg_mean` improves at EVERY checkpoint rule: `mean_best` -0.039 +-0.005 (18/0), `best_disc` -0.029 +-0.004 (16/0),
+  `not_best` -0.030 +-0.003 (18/0), `last_epoch` -0.027 +-0.003 (18/0). Discriminator distance: -0.128 +-0.012 (18/0) at `mean_best`, -0.072 +-0.012 (16/0) at
+  `best_disc`, -0.052 (14/4) at `not_best`, -0.015 +-0.017 (11/7, not significant) at `last_epoch`. `assoc_diff` -0.002 to -0.004 (10-14 of 16-18 better); TSTR within
+  +-0.010; `dcr_share` within +-0.010; stopping epoch 30 vs 32. **Held-out wilt + churn2 (6 fits): `marg_mean` -0.021 to -0.031 (6/0 at every rule), discriminator
+  distance -0.074 to -0.092 (6/0 at every rule), `assoc_diff` -0.002 to -0.005.**
+- **M7, small model:** `marg_mean` -0.011 to -0.020 (16-18 better at every rule), discriminator distance -0.036 +-0.009 (16/2) at `mean_best` but +0.009 to +0.011
+  (not significant, 6/12) at later checkpoints; TSTR and `dcr_share` unchanged. (An earlier read at n=7 suggested EMA hurts the late-checkpoint discriminator score;
+  at n=18 that is not supported for the default model and only a non-significant trend for the small one.)
+- **Default+EMA vs the small model without EMA:** `marg_mean` -0.013 +-0.004 (15/3) at `mean_best`, -0.005 (11/5) at `best_disc`, -0.005 (13/3) at `not_best`, -0.008
+  (14/4) at `last_epoch` -- i.e. the big model with free averaging is as good or better on marginals than a model that needs 2-4x the training; the small
+  model keeps a slight association-error edge (`assoc_diff` +0.001 to +0.003 for default+EMA). **Small+EMA vs default:** `marg_mean` -0.030 to -0.045 (18/0 at every
+  rule), `assoc_diff` -0.003 to -0.007 (13-16 of 17-18), discriminator distance -0.058 +-0.013 (15/3) at `best_disc`; TSTR and `dcr_share` unchanged.
+- **M6 constrained loss, default model:** `mean_best` `marg_mean` -0.022 +-0.005 (17/1), discriminator distance -0.072 +-0.011 (17/1); `best_disc` -0.014 (15/3),
+  -0.031 (14/4) but TSTR -0.013 +-0.005 (3 better/15 worse); `last_epoch` `marg_mean` -0.009 (14/4), `assoc_diff` -0.004 (13/5), others n.s. Stopping epoch 30 vs 32.
+  Small model: `marg_mean` -0.003 to -0.008, TSTR -0.005 to -0.008 (4-8 better of 16-18), stops at epoch 82 vs 120 (~30% fewer epochs).
+
+**Implication:** EMA is the strongest cost-benefit finding of the program: one line of configuration, no extra training (stopping epoch unchanged; per-step
+overhead is one fused multiply-add over the parameters), a consistent marginal-fidelity gain at every checkpoint rule that replicates on held-out data, and no
+measurable cost to utility or the privacy proxies. It is worth adopting; that is a change to a default and is the owner's call (`exp/ema-weights`, opt-in for
+now, `ema_horizon=1.0`). The constraint-aware loss is a niche efficiency option (fewer epochs for the small model) with a small utility cost at
+`best_disc`; leave it opt-in. Untested: EMA together with the constrained loss; horizons other than ~1 epoch in the real regime (4 epochs lagged badly in c1 at epoch
+10); datasets above 10,000 rows; the wall-clock overhead (per-step cost is small, but matrix wall-clock is load-confounded, so no timing claim is made).
