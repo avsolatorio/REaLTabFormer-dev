@@ -105,17 +105,22 @@ class REaLSurveyFormer(REaLTabFormer2):
         super().__init__(model_type=model_type, any_order=any_order,
                           shared_numeric_vocab=shared_numeric_vocab, **kwargs)
 
-    def fit_weighted(self, df: pd.DataFrame, weight_col: str, **fit_kwargs):
+    def fit_weighted(self, df: pd.DataFrame, weight_col: str, drop_weight_col: bool = False, **fit_kwargs):
         """Fits with each row's contribution to the MLE loss scaled by `df[weight_col]` (e.g. a
         survey design or population weight), via the library's existing `token_weights`/
         `WeightedLabelSmoother` mechanism (rtf_trainer.py) -- this method only builds and injects
         the per-row weight column; the weighted-loss math itself is unchanged, already-tested
-        library code used identically for any other reason to weight rows. `weight_col` is
-        dropped from the data actually passed to `.fit()`.
+        library code used identically for any other reason to weight rows.
+
+        `weight_col` stays in the data passed to `.fit()` by default (`drop_weight_col=False`): a
+        survey weight is typically a real, meaningful column in its own right (e.g. needed later to
+        reproduce population shares from a SYNTHETIC table, not just the real one), so this method
+        does not assume it should be excluded from what the model learns to synthesize -- it is
+        used BOTH as the loss weight AND as an ordinary column, unless `drop_weight_col=True`.
         """
-        weight = df[weight_col]
-        fit_df = df.drop(columns=[weight_col]).reset_index(drop=True)
-        weight = weight.reset_index(drop=True)
+        weight = df[weight_col].reset_index(drop=True)
+        fit_df = df.drop(columns=[weight_col]) if drop_weight_col else df
+        fit_df = fit_df.reset_index(drop=True)
         with _weighted_fit(weight):
             return self.fit(fit_df, **fit_kwargs)
 

@@ -87,6 +87,29 @@ def test_fit_weighted_assigns_token_weights_through_a_real_fit(monkeypatch):
     )
 
 
+def test_fit_weighted_keeps_the_weight_column_in_the_schema_by_default():
+    """A survey weight is often a real column worth synthesizing too (e.g. needed to reproduce
+    population shares from the SYNTHETIC table later), so fit_weighted must not silently drop it
+    from what the model learns, unless the caller explicitly asks via drop_weight_col=True."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    df = _toy_parent_schema(n=60, seed=4)
+    with tempfile.TemporaryDirectory() as d:
+        model = _tiny_model(device, checkpoints_dir=str(Path(d) / "ckpt"))
+        model.fit_weighted(df, weight_col="weight", device=device, n_critic=0)
+        samples = model.sample(n_samples=5, gen_batch=5, device=device)
+    assert "weight" in samples.columns
+
+
+def test_fit_weighted_drop_weight_col_excludes_it_from_the_schema():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    df = _toy_parent_schema(n=60, seed=5)
+    with tempfile.TemporaryDirectory() as d:
+        model = _tiny_model(device, checkpoints_dir=str(Path(d) / "ckpt"))
+        model.fit_weighted(df, weight_col="weight", drop_weight_col=True, device=device, n_critic=0)
+        samples = model.sample(n_samples=5, gen_batch=5, device=device)
+    assert "weight" not in samples.columns
+
+
 def test_fit_weighted_restores_the_patched_functions_even_if_fit_raises():
     import realtabformer.realtabformer2 as rtf2_mod
     before = (rtf2_mod.make_dataset, rtf2_mod.make_relational_dataset,
