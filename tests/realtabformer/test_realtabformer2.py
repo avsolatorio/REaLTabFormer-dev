@@ -823,3 +823,29 @@ def test_any_order_vectorized_constraint_matches_callback():
             finally:
                 TabularSampler.vectorized_constraint = True
         pd.testing.assert_frame_equal(got[True], got[False])
+
+
+# --- defaults: batch_size/gradient_accumulation_steps must match V1 (regression for a bug where
+# REaLTabFormer2 hardcoded batch_size=8 regardless of model_type and gradient_accumulation_steps=4
+# regardless of batch_size: a tabular model defaulted to 8x4=32 effective instead of V1's measured-
+# faster 32x1=32, and any explicit batch_size left accumulation stuck at 4, e.g. batch_size=32 gave
+# an effective batch of 128 instead of 32) --------------------------------------------------
+
+
+def test_default_batch_size_and_accumulation_keep_the_effective_batch():
+    tab = REaLTabFormer2(model_type="tabular")
+    assert (tab.batch_size, tab.training_args_kwargs["gradient_accumulation_steps"]) == (32, 1)
+    assert tab.training_args_kwargs["per_device_train_batch_size"] == 32
+
+    # The relational model was not measured (V1's own docstring): unchanged, stays at 8 x 4.
+    rel = REaLTabFormer2(model_type="relational")
+    assert (rel.batch_size, rel.training_args_kwargs["gradient_accumulation_steps"]) == (8, 4)
+
+    # Explicit batch sizes keep the ~32 effective batch, exactly matching V1.
+    for bs, ga in [(8, 4), (16, 2), (32, 1), (64, 1)]:
+        m = REaLTabFormer2(model_type="tabular", batch_size=bs)
+        assert m.training_args_kwargs["gradient_accumulation_steps"] == ga, (bs, ga)
+
+    # An explicit accumulation always wins.
+    m = REaLTabFormer2(model_type="tabular", gradient_accumulation_steps=2)
+    assert m.training_args_kwargs["gradient_accumulation_steps"] == 2
