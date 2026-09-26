@@ -1048,7 +1048,8 @@ class TabularSampler(REaLSampler):
         return pd.DataFrame(realigned)[target_processed_order]
 
     def _process_seed_input(
-        self, seed_input: Union[pd.DataFrame, Dict[str, Any]]
+        self, seed_input: Union[pd.DataFrame, Dict[str, Any]],
+        target_col: Optional[str] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[Dict[int, list]],
@@ -1061,6 +1062,15 @@ class TabularSampler(REaLSampler):
         pass them straight into `_generate`/`_processes_sample` and their
         `None` default there reproduces today's canonical-order behavior
         exactly, so a non-any-order model sees zero behavior change.
+
+        `target_col` (default None, no behaviour change): an any_order-only
+        column NOT in `seed_input`, placed immediately after `seed_input`'s
+        own columns in the generation order instead of wherever it would
+        otherwise fall among the canonically-ordered remaining columns. Lets
+        a caller (`predict_column_distribution`) query the model's own
+        next-token distribution for ONE specific column right after the
+        seed, without needing to generate/condition on any other column
+        first.
         """
         # TODO: The heuristic of choosing the valid columns shouldn't contradict
         # with the `first_col_type` argument of `data_utils.process_data`.`
@@ -1085,7 +1095,14 @@ class TabularSampler(REaLSampler):
             # specified); the remaining, ungiven columns are appended in
             # their canonical relative order.
             valid_cols = [c for c in input_cols if c in self.columns]
-            remaining_cols = [c for c in self.columns if c not in valid_cols]
+            if target_col is not None:
+                assert target_col in self.columns, f"{target_col!r} is not one of this model's columns"
+                assert target_col not in valid_cols, f"{target_col!r} must not be one of seed_input's own columns"
+                remaining_cols = [target_col] + [
+                    c for c in self.columns if c not in valid_cols and c != target_col
+                ]
+            else:
+                remaining_cols = [c for c in self.columns if c not in valid_cols]
             full_order = valid_cols + remaining_cols
 
             col_idx_ids_override, token_type_ids_override, processed_column_order = (
@@ -1159,6 +1176,61 @@ class TabularSampler(REaLSampler):
             token_type_ids_override,
             processed_column_order,
         )
+
+    def predict_column_distribution(
+        self,
+        seed_input: Union[pd.DataFrame, Dict[str, Any]],
+        target_col: str,
+        device: Optional[Union[str, torch.device]] = None,
+    ) -> Tuple[np.ndarray, List[Any]]:
+        """Returns `(probs, values)`: the model's OWN calibrated distribution over `target_col`'s
+        valid values, given each row of `seed_input`, from a SINGLE forward pass -- not a sample.
+        `probs` is `(n_rows, n_options)`; `values` is that column's option values (decoded from
+        `self.vocab`, not assumed from the training data) in the SAME order as `probs`'s columns.
+
+        Requires an any_order model (`self.column_blocks is not None`). Reuses `seed_input`'s own
+        arbitrary-subset conditioning (see `_process_seed_input`), placing `target_col` immediately
+        after the seed in the generation order (`target_col=` there) -- so the next-token logits
+        right after the seeded prefix ALREADY ARE the full conditional distribution over
+        `target_col` given `seed_input`, with no need to generate (or condition on) any other
+        column first. This is the piece `sample_tabular`/`sample_tabular_with_seed` never needed:
+        they only ever had to draw ONE realization, never report the model's own belief over every
+        possible value of a specific column.
+
+        Verified against an EXACT, falsifiable property before anything is built on top of it,
+        the same discipline `rtf_rl.log_prob_of_sequences` got: enumerate a tiny toy schema
+        completely and check the extracted distribution both sums to 1 and matches the empirical
+        frequency of a large resample under the same seed (see `tests/realtabformer/test_rtf_sampler.py`).
+        """
+        device = torch.device(device) if device is not None else self.device
+        generated, col_idx_ids_override, token_type_ids_override, _ = self._process_seed_input(
+            seed_input, target_col=target_col
+        )
+        generated = generated.to(device)
+        step = generated.shape[1] - 1
+        target_ids = col_idx_ids_override[step]
+
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            with torch.no_grad():
+                model_kwargs = {}
+                if token_type_ids_override is not None:
+                    seq_len = generated.shape[1]
+                    tt = torch.tensor(
+                        token_type_ids_override[:seq_len], device=device, dtype=torch.long
+                    ).unsqueeze(0).expand(generated.shape[0], -1)
+                    model_kwargs["token_type_ids"] = tt
+                logits = self.model(input_ids=generated, **model_kwargs).logits[:, -1, :]
+        finally:
+            self.model.train(was_training)
+
+        target_logits = logits[:, target_ids]
+        probs = torch.softmax(target_logits, dim=-1).cpu().numpy()
+
+        id2token = self.vocab["id2token"]
+        values = decode_column_values(pd.Series([id2token[tid] for tid in target_ids])).tolist()
+        return probs, values
 
     def sample_tabular(
         self,
