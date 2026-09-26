@@ -418,12 +418,14 @@ def _tail_bin_weights(tgt: dict, tail_boost: float, tail_freq_cutoff: float) -> 
 
 
 def _ols_fit(X: np.ndarray, y: np.ndarray):
-    """OLS with an intercept, plain normal-equations solution. Returns (coef, resid); coef[0] is
-    the intercept. No external dependency -- a small, generic helper for `regression_influence_reward`."""
+    """OLS with an intercept, plain normal-equations solution. Returns (coef, resid, Xc) -- coef[0]
+    is the intercept, Xc is the intercept-augmented design matrix (returned so callers needing it
+    too, e.g. `regression_influence_reward`, don't rebuild it a second time). No external
+    dependency -- a small, generic helper for `regression_influence_reward`."""
     Xc = np.column_stack([np.ones(len(X)), X])
     beta, *_ = np.linalg.lstsq(Xc, y, rcond=None)
     resid = y - Xc @ beta
-    return beta, resid
+    return beta, resid, Xc
 
 
 def regression_influence_reward(
@@ -453,8 +455,7 @@ def regression_influence_reward(
     `weight_intercept=False` (default) zeroes the intercept's contribution to the reward, since the
     intercept is rarely a real "relationship" worth optimising toward on its own.
     """
-    Xc = np.column_stack([np.ones(len(X)), X])
-    beta_batch, resid = _ols_fit(X, y)
+    beta_batch, resid, Xc = _ols_fit(X, y)
     xtx_inv = np.linalg.pinv(Xc.T @ Xc)
     infl = (Xc @ xtx_inv) * resid[:, None]  # (n, K): row i = (X'X)^-1 x_i * resid_i
     gap = beta_batch - np.asarray(target_beta, dtype=float)

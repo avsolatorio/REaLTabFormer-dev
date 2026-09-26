@@ -33,19 +33,26 @@ from .rtf_validators import ObservationValidator, ValidatorBase
 def _add_token_weights(ds, per_row_weight: np.ndarray):
     """Broadcasts each row's own weight uniformly across all of that row's tokens. Asserts the
     row count matches -- a silent length mismatch would misalign weights to the wrong rows, which
-    is a far worse failure than not weighting at all, so this fails loudly instead."""
+    is a far worse failure than not weighting at all, so this fails loudly instead.
+
+    Uses a BATCHED `.map()` (Arrow-batch granularity, not one Python call per row) -- a per-row
+    `.map()` here was measured to cost real, avoidable wall-clock time on realistic dataset sizes
+    (thousands of rows) purely from HuggingFace `Dataset.map`'s per-call Python overhead, with
+    nothing about the actual computation (a length-matched list broadcast) requiring row-at-a-time
+    processing.
+    """
     n = len(ds)
     assert n == len(per_row_weight), (
         f"row-count mismatch: dataset has {n} rows, weight array has {len(per_row_weight)} -- "
         "per-row weights would silently misalign to the wrong rows if this proceeded."
     )
-    w = per_row_weight
+    w = np.asarray(per_row_weight, dtype=float)
 
-    def _assign(example, idx):
-        example["token_weights"] = [float(w[idx])] * len(example["input_ids"])
-        return example
+    def _assign_batch(batch, indices):
+        batch["token_weights"] = [[float(w[i])] * len(ids) for i, ids in zip(indices, batch["input_ids"])]
+        return batch
 
-    return ds.map(_assign, with_indices=True)
+    return ds.map(_assign_batch, with_indices=True, batched=True)
 
 
 @contextlib.contextmanager
