@@ -344,6 +344,193 @@ def test_regression_influence_reward_causally_shifts_coefficient_toward_target()
     assert gap_top < gap_bottom
 
 
+def _sample_sequences(sampler, model, device, n, seed):
+    t2i = model.vocab["token2id"]
+    torch.manual_seed(seed)
+    raw = sampler._generate(
+        device=torch.device(device), as_numpy=False, constrain_tokens_gen=True,
+        inputs=torch.tensor([[t2i[SpecialTokens.BOS]]], device=device), do_sample=True,
+        max_length=model.tabular_max_length, num_return_sequences=n,
+        bos_token_id=t2i[SpecialTokens.BOS], pad_token_id=t2i[SpecialTokens.PAD],
+        eos_token_id=t2i[SpecialTokens.EOS], suppress_tokens=None, forced_decoder_ids=None,
+    )
+    return raw[:, : model.tabular_max_length]
+
+
+def test_leave_one_out_reward_grpo_end_to_end_corrects_a_known_marginal_miscalibration():
+    """Same falsifiable end-to-end shape `test_marginal_joint_reward`'s own end-to-end test uses
+    (see the ported gmd_rl_selftest.py history this module was promoted from): fit a tiny,
+    deliberately undertrained model on data where column "a" is EXACTLY 50/50, run real GRPO rounds
+    using `leave_one_out_marginal_reward` (not `marginal_joint_reward`) as the reward, and confirm
+    the full mechanism -- sample, reward, `group_relative_advantage`, KL-regularised `grpo_loss`,
+    optimizer step -- moves the generated marginal toward the true 50/50 split. Proves the new
+    reward works correctly plugged into the SAME verified GRPO loop, not just correct in isolation.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        rng = np.random.default_rng(5)
+        df = pd.DataFrame({"a": rng.choice(list("xy"), 40), "b": rng.choice(list("pqr"), 40)})
+        target = rtf_rl.compute_target_stats(df, columns=["a", "b"], pairs=[("a", "b")])
+
+        model = REaLTabFormer(
+            model_type="tabular", epochs=1, batch_size=8, checkpoints_dir=str(Path(tmp) / "ckpt"),
+            tabular_config=GPT2Config(n_layer=1, n_embd=16, n_head=2), random_state=5,
+        )
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model.fit(df, device=device, n_critic=0)
+        sampler = TabularSampler.sampler_from_model(model, device=device)
+        t2i = model.vocab["token2id"]
+        eos = t2i[SpecialTokens.EOS]
+        vocab_size = model.model.config.vocab_size
+        max_steps = max(model.tabular_max_length, len(model.col_idx_ids))
+        col0_ids = model.col_idx_ids[0]
+
+        def decode_col_a(seqs_np):
+            return pd.Series(["x" if v == col0_ids[0] else "y" for v in seqs_np[:, 1]])
+
+        def p_a_x(n=4000, seed=999):
+            seqs = _sample_sequences(sampler, model, device, n, seed).cpu().numpy()
+            return (decode_col_a(seqs) == "x").mean()
+
+        pre_p = p_a_x()
+
+        import copy
+
+        ref_net = copy.deepcopy(model.model).to(device)
+        ref_net.eval()
+        for p in ref_net.parameters():
+            p.requires_grad_(False)
+
+        optimizer = torch.optim.Adam(model.model.parameters(), lr=1e-3)
+        torch.manual_seed(44)
+        for round_ in range(30):
+            seqs_t = torch.as_tensor(_sample_sequences(sampler, model, device, 64, seed=3000 + round_), device=device)
+            seqs_np = seqs_t.cpu().numpy()
+            batch_df = pd.DataFrame({
+                "a": decode_col_a(seqs_np),
+                "b": ["p" if v == model.col_idx_ids[1][0] else ("q" if v == model.col_idx_ids[1][1] else "r")
+                      for v in seqs_np[:, 2]],
+            })
+            reward = rtf_rl.leave_one_out_marginal_reward(batch_df, target, columns=["a", "b"], pairs=[("a", "b")])
+            reward_t = torch.as_tensor(reward, device=device, dtype=torch.float32)
+
+            new_logp = rtf_rl.log_prob_of_sequences(
+                model.model, seqs_t, model.col_idx_ids, eos, vocab_size, max_steps, requires_grad=True
+            )
+            with torch.no_grad():
+                ref_logp = rtf_rl.log_prob_of_sequences(ref_net, seqs_t, model.col_idx_ids, eos, vocab_size, max_steps)
+            advantage = rtf_rl.group_relative_advantage(reward_t)
+            out = rtf_rl.grpo_loss(new_logp, ref_logp, advantage, kl_coef=0.02)
+            optimizer.zero_grad()
+            out["loss"].backward()
+            optimizer.step()
+
+        post_p = p_a_x()
+        true_p = target["col"]["a"].get("x", 0)
+        assert abs(post_p - true_p) < abs(pre_p - true_p), (
+            f"leave_one_out_marginal_reward did not move the marginal closer to the true training "
+            f"distribution (pre={pre_p:.4f}, post={post_p:.4f}, true={true_p:.4f})"
+        )
+
+
+def _brute_force_loo_reward(labels: pd.Series, tgt: dict) -> np.ndarray:
+    """Recomputes the leave-one-out reward the SLOW, obviously-correct way: for every row, drop it,
+    rebuild the frequency table from scratch, recompute the squared-error loss, and diff against
+    the full-batch loss -- used only to cross-check `rtf_rl._loo_categorical_reward`'s closed form,
+    never as the real implementation."""
+    n = len(labels)
+
+    def sq_loss(sub: pd.Series) -> float:
+        m = len(sub)
+        counts = sub.value_counts().to_dict()
+        values = set(counts) | set(tgt)
+        return sum((tgt.get(v, 0.0) - counts.get(v, 0) / m) ** 2 for v in values)
+
+    full = sq_loss(labels)
+    out = np.zeros(n)
+    for i in range(n):
+        without_i = labels.drop(labels.index[i])
+        out[i] = sq_loss(without_i) - full
+    return out
+
+
+def test_leave_one_out_marginal_reward_matches_brute_force_recomputation():
+    rng = np.random.default_rng(3)
+    cats = ["a", "b", "c", "d"]
+    labels = pd.Series(rng.choice(cats, size=60, p=[0.5, 0.3, 0.15, 0.05]))
+    tgt = {"a": 0.4, "b": 0.3, "c": 0.2, "d": 0.1}
+    fast = rtf_rl._loo_categorical_reward(labels, tgt)
+    slow = _brute_force_loo_reward(labels, tgt)
+    assert np.allclose(fast, slow, atol=1e-9), f"max diff {np.max(np.abs(fast - slow))}"
+
+
+def test_leave_one_out_marginal_reward_hand_computed():
+    # target 50/50 x/y; batch is 3 x's and 1 y -- see test file history for the by-hand derivation.
+    labels = pd.Series(["x", "x", "x", "y"])
+    tgt = {"x": 0.5, "y": 0.5}
+    reward = rtf_rl._loo_categorical_reward(labels, tgt)
+    assert np.allclose(reward[:3], -5.0 / 72.0, atol=1e-12)
+    assert np.isclose(reward[3], 3.0 / 8.0, atol=1e-12)
+
+
+def test_leave_one_out_marginal_reward_pairs_matches_brute_force():
+    rng = np.random.default_rng(4)
+    a = rng.choice(["p", "q"], size=50)
+    b = rng.choice(["1", "2", "3"], size=50)
+    batch = pd.DataFrame({"a": a, "b": b})
+    target = dict(
+        col={}, edges={"a": None, "b": None},
+        pair={("a", "b"): {("p", "1"): 0.3, ("p", "2"): 0.1, ("p", "3"): 0.1,
+                           ("q", "1"): 0.1, ("q", "2"): 0.2, ("q", "3"): 0.2}},
+    )
+    fast = rtf_rl.leave_one_out_marginal_reward(batch, target, columns=[], pairs=[("a", "b")])
+    labels = pd.Series(list(zip(batch["a"], batch["b"])))
+    slow = _brute_force_loo_reward(labels, target["pair"][("a", "b")])
+    assert np.allclose(fast, slow, atol=1e-9)
+
+
+def test_leave_one_out_marginal_reward_causally_favors_the_underrepresented_value():
+    """Mirrors regression_influence_reward's own causal (not just algebraic) verification: build a
+    batch skewed away from the target (80/20 x/y vs a 50/50 target), then check that duplicating
+    the rows this reward ranks HIGHEST (the minority, under-represented value) moves the resulting
+    batch's own frequency closer to the target than duplicating the rows it ranks LOWEST."""
+    labels = pd.Series(["x"] * 80 + ["y"] * 20)
+    tgt = {"x": 0.5, "y": 0.5}
+    reward = rtf_rl._loo_categorical_reward(labels, tgt)
+    assert reward[labels == "y"][0] > reward[labels == "x"][0], (
+        "the under-represented value ('y') must score higher than the over-represented one ('x')"
+    )
+
+    def freq_gap_after_duplicating(value: str, k: int) -> float:
+        boosted = pd.concat([labels, pd.Series([value] * k)], ignore_index=True)
+        freq = boosted.value_counts(normalize=True)
+        return abs(freq.get("x", 0.0) - tgt["x"]) + abs(freq.get("y", 0.0) - tgt["y"])
+
+    gap_before = freq_gap_after_duplicating("x", 0)
+    gap_top = freq_gap_after_duplicating("y", 30)  # duplicating the highest-reward (minority) value
+    gap_bottom = freq_gap_after_duplicating("x", 30)  # duplicating the lowest-reward (majority) value
+    assert gap_top < gap_before
+    assert gap_top < gap_bottom
+
+
+def test_privacy_penalty_zero_at_or_above_threshold():
+    d = np.array([0.5, 1.0, 2.0])
+    assert np.allclose(rtf_rl.privacy_penalty(d, threshold=0.5), 0.0)
+
+
+def test_privacy_penalty_hand_computed_below_threshold():
+    d = np.array([0.0, 0.2, 0.5, 1.0])
+    penalty = rtf_rl.privacy_penalty(d, threshold=0.5, scale=2.0)
+    # shortfall = threshold - d, clipped at 0, times -scale
+    assert np.allclose(penalty, [-1.0, -0.6, 0.0, 0.0])
+
+
+def test_privacy_penalty_scale_is_linear():
+    d = np.array([0.0, 0.1, 0.3])
+    base = rtf_rl.privacy_penalty(d, threshold=0.4, scale=1.0)
+    scaled = rtf_rl.privacy_penalty(d, threshold=0.4, scale=5.0)
+    assert np.allclose(scaled, base * 5.0)
+
+
 def test_detect_heavy_tailed_columns():
     rng = np.random.default_rng(0)
     df = pd.DataFrame({

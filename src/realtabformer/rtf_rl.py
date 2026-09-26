@@ -508,3 +508,115 @@ def marginal_joint_reward(
         contrib = pairs_series.map(lambda v: tgt.get(v, 0.0) - batch_freq.get(v, 0.0))
         reward += pair_weight * contrib.to_numpy()
     return reward
+
+
+def _loo_categorical_reward(labels: pd.Series, tgt: dict) -> np.ndarray:
+    """EXACT (not first-order-approximate) leave-one-out contribution of each row to how well
+    `labels`' own frequency table matches `tgt`, under squared error: `L = sum_v (p_v - c_v/n)^2`
+    where `p_v = tgt.get(v, 0.0)` and `c_v` is `v`'s raw count in `labels`. Each row's reward is
+    `L(without that row) - L(with it)` -- positive when removing the row would make the fit WORSE
+    (the row is pulling its own value's frequency toward the target, so it should be encouraged),
+    negative when removing it would make the fit BETTER (the row is on the over-represented side of
+    its value's frequency).
+
+    Computed in closed form, not by literally rebuilding the frequency table `n` times: the three
+    category-level sums `S1 = sum_v p_v^2`, `S2 = sum_v p_v*c_v`, `S3 = sum_v c_v^2` fully
+    determine `L(B)` at ANY sample size (`L = S1 - 2*S2/m + S3/m^2` for `m` rows), computed ONCE in
+    O(number of distinct values); a specific row's own leave-one-out score then only needs
+    correcting the ONE category-level term its own value contributes, an O(1) lookup after that.
+    `tests/realtabformer/test_rtf_rl.py` cross-checks this closed form against literally dropping
+    each row and rebuilding the frequency table from scratch, on a random batch -- not just
+    algebra that looks right.
+    """
+    n = len(labels)
+    if n <= 1:
+        return np.zeros(n)  # no leave-one-out is meaningful with 0 rows left behind
+    counts = labels.value_counts().to_dict()
+    values = set(counts) | set(tgt)
+    p = {v: tgt.get(v, 0.0) for v in values}
+    c = {v: counts.get(v, 0) for v in values}
+    s1 = sum(p[v] ** 2 for v in values)
+    s2 = sum(p[v] * c[v] for v in values)
+    s3 = sum(c[v] ** 2 for v in values)
+
+    def loss(m: float) -> float:
+        return s1 - 2.0 * s2 / m + s3 / (m ** 2)
+
+    l_full = loss(n)
+    m = n - 1
+    l0 = loss(m)  # every category's term computed at the LEFT-OUT sample size, before per-value correction
+
+    def loo_reward(v) -> float:
+        p_v, c_v = p[v], c[v]
+        old_term = (p_v - c_v / m) ** 2
+        new_term = (p_v - (c_v - 1) / m) ** 2
+        l_excl = l0 - old_term + new_term  # correct only the one category this row actually belongs to
+        return l_excl - l_full
+
+    cache = {v: loo_reward(v) for v in values}
+    return labels.map(cache).to_numpy()
+
+
+def leave_one_out_marginal_reward(
+    batch_df: pd.DataFrame, target: dict, columns: Sequence[str], pairs: Sequence[Tuple[str, str]] = (),
+    col_weight: float = 1.0, pair_weight: float = 1.0,
+) -> np.ndarray:
+    """Per-row reward from each row's own EXACT leave-one-out contribution to marginal/joint
+    fidelity (see `_loo_categorical_reward`), as an alternative to `marginal_joint_reward`'s pooled,
+    LINEAR `target_freq - batch_freq`.
+
+    Honest about what this does and does not change: for a SINGLE targeted column or pair, every
+    row sharing the same discretised value still gets the IDENTICAL reward here too -- a categorical
+    bin's count has no notion of "this particular row's" contribution beyond which bin it landed in,
+    so there is no finer-than-the-bin signal to extract for either reward. The actual difference is
+    the FUNCTIONAL FORM: this is the exact leave-one-out effect on a squared-error fit statistic
+    (nonlinear in the bin's own count and the batch size `n`), not a value linearly proportional to
+    `target_freq - batch_freq` -- e.g. removing one row from a bin that already has very few members
+    moves that bin's frequency proportionally much further than removing one from a large bin, an
+    effect the pooled linear reward does not capture at all. When SUMMED across several targeted
+    columns/pairs (the realistic multi-target case), each row's TOTAL reward is still genuinely
+    row-specific, exactly as it already is for the pooled reward -- summing several per-column
+    scalars that depend on that row's own combination of values.
+
+    Combines with `marginal_joint_reward`/`regression_influence_reward`/a privacy term (see
+    `privacy_penalty`) by simple addition -- callers choosing between the pooled and leave-one-out
+    marginal reward, or blending both, do so at the call site, not inside either function.
+    """
+    n = len(batch_df)
+    reward = np.zeros(n)
+    for c in columns:
+        labels, _ = _discretise(batch_df[c], target["edges"].get(c))
+        reward += col_weight * _loo_categorical_reward(labels, target["col"][c])
+    for a, b in pairs:
+        la, _ = _discretise(batch_df[a], target["edges"].get(a))
+        lb, _ = _discretise(batch_df[b], target["edges"].get(b))
+        pairs_series = pd.Series(list(zip(la, lb)))
+        reward += pair_weight * _loo_categorical_reward(pairs_series, target["pair"][(a, b)])
+    return reward
+
+
+def privacy_penalty(nearest_real_distance: np.ndarray, threshold: float, scale: float = 1.0) -> np.ndarray:
+    """Per-row reward PENALTY (always <= 0) for a synthetic row that sits too close to its nearest
+    real training row -- a cheap proxy for memorization risk, meant to be ADDED to a fidelity
+    reward (e.g. `marginal_joint_reward`/`leave_one_out_marginal_reward`) so an RL fine-tuning loop
+    optimizing distributional fidelity cannot freely trade privacy away for it. Motivated directly
+    by a real, measured failure elsewhere in this library's own use: embedding enough distributional
+    signal as an explicit generation target once produced synthetic rows a large fraction of which
+    were near-exact duplicates of real training rows -- fidelity metrics alone never would have
+    caught that; only a distance-to-real-data check did.
+
+    `nearest_real_distance`: each synthetic row's OWN distance to its closest real training row, in
+    whatever metric/units the caller already trusts (e.g. a normalized Euclidean or Gower distance,
+    or an existing project's own validated DCR-style computation) -- this function deliberately only
+    turns an already-computed distance into a reward signal, it does not compute the distance
+    itself, so any already-validated nearest-neighbor implementation can be reused directly rather
+    than re-derived (and re-verified) here.
+
+    `threshold`: distances at or above this are safe (penalty 0); distances below it are penalized
+    LINEARLY in the shortfall (`threshold - distance`), scaled by `scale`. A hard cutoff rather than
+    a smooth one is a deliberate choice for interpretability: the reward can be read directly as
+    "how far into unsafe territory is this row", not squashed through an arbitrary nonlinearity.
+    """
+    d = np.asarray(nearest_real_distance, dtype=float)
+    gap = np.clip(threshold - d, 0.0, None)
+    return -scale * gap
